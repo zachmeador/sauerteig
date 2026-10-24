@@ -10,7 +10,7 @@ use std::{
 };
 
 const MAX_AUXILIARY_BYTES: usize = 1024 * 1024;
-const MAX_WORLD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_WORLD_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() {
     if let Err(error) = run() {
@@ -100,7 +100,7 @@ fn run() -> Result<(), String> {
         .as_ref()
         .is_some_and(|(_, bytes)| bytes.len() > MAX_WORLD_BYTES)
     {
-        return Err("world JSON exceeds server 256 MiB save-file limit".into());
+        return Err("world JSON exceeds server 64 MiB save-file limit".into());
     }
     let report_bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
     if let Some(path) = args.report {

@@ -12,6 +12,8 @@ cargo run -p sauerteig-server -- --bind 127.0.0.1:3002 --world .local/imported/m
 
 Input maps and existing output files are never overwritten. A companion `my-map.cfg`, or an explicit `--cfg FILE`, is inspected for literal asset references only. Scripts, aliases, includes, filesystem paths and shader commands are never executed or followed.
 
+To keep the converted map in the native app's **Saved worlds**, open **Import an existing world**, enter the generated JSON path and a world name, then choose **Import copy**. This creates a separate editable save; the OGZ and converted JSON remain unchanged.
+
 ## Geometry and scale
 
 The default is **8 legacy Cube units per metre**. Legacy Z-up coordinates become Y-up with the rotation `(x,y,z) → (x,z,-y)`. `--center X,Y,Z` puts that source point at Sauerteig `[0,24,0]`; `--center spawn` uses the first playerstart, rounding only the region's center onto the import grid. Without a center argument the original map center is used.
@@ -22,7 +24,7 @@ The default conversion retains the whole map at its original scale in compact au
 
 Large original leaves retain their eight authored corners and triangle diagonals, stored once rather than expanded into one-metre cells. Local edits mask the authored base and supply exact clipped replacements. The core accepts authored fragment sources up to 65,536 eighths (8,192 metres), with checked coordinates. Rendering, rays, collisions, copy/paste and blueprints use the same geometry. Imported partial slopes can be carved, painted, copied and transformed; corner deformation of only a clipped part is still rejected by the editor rather than silently altering the original slope. Individual editing operations remain bounded; supporting a large world does not make a whole-world copy unlimited.
 
-Unsupported degenerate or non-manifold solids cause an error. `--skip-unsupported` is an explicit optional recovery mode and records the source position, size and reason for each omitted leaf. A conversion cannot exceed 250,000 authored regions or the server's 786,432-fragment, 1,024-object and 256 MiB save-file budgets. The server also enforces a 64 MiB encoded snapshot budget when opening or editing a world, so both native and browser clients can join it.
+Unsupported degenerate or non-manifold solids cause an error. `--skip-unsupported` is an explicit optional recovery mode and records the source position, size and reason for each omitted leaf. A conversion cannot exceed 400,000 authored regions or the server's 786,432-fragment, 1,024-object and 64 MiB save-file budgets. The server also enforces a 64 MiB encoded snapshot budget when opening or editing a world, so both native and browser clients can join it.
 
 ## Appearance and entities
 
