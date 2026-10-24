@@ -2,6 +2,8 @@ use crate::render::GpuVertex;
 use glam::{Mat3, Vec3};
 use sauerteig_core::{ObjectKind, Player, WorldObject};
 
+pub const LIGHT_GUIDE_RADIUS: f32 = 0.18;
+
 #[derive(Default)]
 pub struct Geometry {
     pub vertices: Vec<GpuVertex>,
@@ -183,59 +185,10 @@ impl Geometry {
                 | ObjectKind::HangingLamp
                 | ObjectKind::UtilityBox
                 | ObjectKind::Pipe
-                | ObjectKind::Rock => {}
-                ObjectKind::Light => {
-                    let r = Mat3::from_rotation_y(o.rotation);
-                    let steel = [0.065, 0.075, 0.085];
-                    // Suspended industrial strip light: housing, warm lens,
-                    // protective cage, and a short mounting stem.
-                    mesh.cuboid(
-                        o.position + Vec3::Y * 0.12,
-                        Vec3::new(1.6, 0.24, 0.50),
-                        o.rotation,
-                        steel,
-                        0.0,
-                    );
-                    mesh.cuboid(
-                        o.position - Vec3::Y * 0.055,
-                        Vec3::new(1.35, 0.12, 0.34),
-                        o.rotation,
-                        [1.0, 0.57, 0.18],
-                        1.0,
-                    );
-                    mesh.cuboid(
-                        o.position + Vec3::Y * 0.72,
-                        Vec3::new(0.065, 1.16, 0.065),
-                        o.rotation,
-                        steel,
-                        0.0,
-                    );
-                    mesh.cuboid(
-                        o.position + Vec3::Y * 1.28,
-                        Vec3::new(0.32, 0.08, 0.32),
-                        o.rotation,
-                        steel,
-                        0.0,
-                    );
-                    for x in [-0.52, 0.0, 0.52] {
-                        mesh.cuboid(
-                            o.position + r * Vec3::new(x, -0.09, 0.0),
-                            Vec3::new(0.035, 0.25, 0.43),
-                            o.rotation,
-                            steel,
-                            0.0,
-                        );
-                    }
-                    for x in [-0.76, 0.76] {
-                        mesh.cuboid(
-                            o.position + r * Vec3::new(x, 0.0, 0.0),
-                            Vec3::new(0.08, 0.32, 0.48),
-                            o.rotation,
-                            steel,
-                            0.0,
-                        );
-                    }
-                }
+                | ObjectKind::Rock
+                // Light nodes have no physical model. Their editor guides are
+                // appended to dynamic geometry after its shadow-casting prefix.
+                | ObjectKind::Light => {}
                 ObjectKind::Spawn => {
                     mesh.cuboid(
                         o.position + Vec3::Y * 0.025,
@@ -263,6 +216,37 @@ impl Geometry {
             }
         }
         mesh
+    }
+    pub fn light_guide(&mut self, position: Vec3) {
+        let color = [1.0, 0.73, 0.22];
+        let radius = LIGHT_GUIDE_RADIUS * 0.55;
+        let points = [Vec3::X, Vec3::Z, -Vec3::X, -Vec3::Z].map(|v| position + v * radius);
+        for i in 0..4 {
+            let next = (i + 1) % 4;
+            self.triangle(
+                position + Vec3::Y * radius,
+                points[next],
+                points[i],
+                color,
+                1.0,
+            );
+            self.triangle(
+                position - Vec3::Y * radius,
+                points[i],
+                points[next],
+                color,
+                1.0,
+            );
+        }
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            self.beam(
+                position - axis * LIGHT_GUIDE_RADIUS,
+                position + axis * LIGHT_GUIDE_RADIUS,
+                0.016,
+                color,
+                1.0,
+            );
+        }
     }
     pub fn player(&mut self, player: &Player, time: f32) {
         let p = player.position;
@@ -320,3 +304,50 @@ impl Geometry {
     }
 }
 use glam::Vec3Swizzles;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_nodes_have_no_physical_mesh() {
+        assert!(crate::props::definition(ObjectKind::Light).is_none());
+        let node = WorldObject {
+            id: 1,
+            kind: ObjectKind::Light,
+            position: Vec3::new(17.0, 8.0, -20.0),
+            rotation: 0.7,
+        };
+        let mesh = Geometry::objects(std::slice::from_ref(&node));
+        assert!(mesh.vertices.is_empty());
+        assert!(mesh.indices.is_empty());
+
+        let spawn = WorldObject {
+            kind: ObjectKind::Spawn,
+            ..node.clone()
+        };
+        let spawn_mesh = Geometry::objects(std::slice::from_ref(&spawn));
+        let combined = Geometry::objects(&[node, spawn]);
+        assert!(!spawn_mesh.indices.is_empty());
+        assert_eq!(combined.vertices.len(), spawn_mesh.vertices.len());
+        assert_eq!(combined.indices, spawn_mesh.indices);
+    }
+
+    #[test]
+    fn light_guide_is_small_and_centered_on_the_stored_position() {
+        let position = Vec3::new(4321.5, 927.25, -3210.5);
+        let mut mesh = Geometry::default();
+        mesh.light_guide(position);
+        assert!(!mesh.indices.is_empty());
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for vertex in &mesh.vertices {
+            let p = Vec3::from_array(vertex.position);
+            min = min.min(p);
+            max = max.max(p);
+            assert!((p - position).abs().max_element() <= LIGHT_GUIDE_RADIUS + 0.001);
+            assert_eq!(vertex.emission, 1.0);
+        }
+        assert!(((min + max) * 0.5).abs_diff_eq(position, 0.001));
+    }
+}

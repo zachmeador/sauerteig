@@ -17,7 +17,9 @@ cargo run -p sauerteig-client
 ```
 
 Choose **New world**, **Continue**, or **Join server**. Opening a local world
-starts its server automatically; **Save and leave** stops it after saving.
+starts its server automatically. **Main menu** returns to the world picker while
+the session keeps running; **Resume** returns to it. Choosing another world saves
+and closes the previous local session before opening the next one.
 Named worlds, player name, and the last server are remembered. Local hosting
 accepts players on this computer; enable LAN hosting to let other computers join.
 
@@ -60,10 +62,17 @@ blueprints, and **F2** opens settings, including scroll inversion.
 - [Editor controls, selections, and blueprints](docs/editor.md)
 - [Importing Sauerbraten and older Tesseract maps](crates/importer/README.md)
 - [Development, hosting, and performance checks](docs/development.md)
+- [Project tracking: complete, active, and unfinished work](docs/tracking/README.md)
 - [Geometry and multiplayer invariants](crates/core/CONTRACT.md)
 - [Materials](assets/materials/README.md), [props](assets/props/README.md), and [art direction](research/assets.md)
 
-Sauerteig is under development. Rooms support up to 16 players and the editor
+Sauerteig is a playable prototype. **Legacy import is partial:** supported cube
+geometry and light/spawn positions can be loaded, but original textures, models,
+light properties, and gameplay entities are not restored. A map opening
+successfully is not evidence of visual or gameplay fidelity. See the
+[importer's limitations](crates/importer/README.md#appearance-and-entities).
+
+Rooms support up to 16 players and the editor
 grid reaches 1/8 metre. Imported worlds use compact geometry and their own bounds,
 up to 8,192 metres per axis. Props and lights support editing, undo, and blueprints;
 props currently have no gameplay collision.

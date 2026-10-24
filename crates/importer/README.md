@@ -1,6 +1,6 @@
 # Legacy OGZ import
 
-`sauerteig-import` reads Cube 2 **OCTA versions 29–33**, including older Tesseract maps saved in that format. It produces an editable Sauerteig world plus an import report. This is a command-line import path; it is not yet an in-game file picker. Newer Tesseract `MAPZ` files and earlier Cube formats are rejected explicitly.
+`sauerteig-import` reads Cube 2 **OCTA versions 29–33**, including older Tesseract maps saved in that format. **Import is partial, not a faithful map restoration.** It converts supported solid geometry and light/spawn positions into an editable Sauerteig world, plus a report of source data and omissions. Original textures, models, lighting properties, and gameplay entities are not restored. This is a command-line import path; it is not yet an in-game OGZ file picker. Newer Tesseract `MAPZ` files and earlier Cube formats are rejected explicitly.
 
 ```sh
 . ./scripts/env.sh
@@ -26,13 +26,15 @@ Large original leaves retain their eight authored corners and triangle diagonals
 
 Unsupported degenerate or non-manifold solids cause an error. `--skip-unsupported` is an explicit optional recovery mode and records the source position, size and reason for each omitted leaf. A conversion cannot exceed 400,000 authored regions or the server's 786,432-fragment, 1,024-object and 64 MiB save-file budgets. The server also enforces a 64 MiB encoded snapshot budget when opening or editing a world, so both native and browser clients can join it.
 
+Zero-thickness sheets are one unsupported case. They can be visible in the source engine, so skipping them can remove surfaces even though they enclose no volume. Recovery output is lossy; keep its report and label the saved copy accordingly. A successful server open/save check validates loadability, not a comparison with the original map.
+
 ## Appearance and entities
 
 OGZ contains **texture slot numbers, virtual-slot overrides and model entity indices**, not the texture images or model files. Their meaning comes from the companion map config and the original installation's default texture/model configs. Missing configs or a different game version can change the slot-to-file mapping.
 
 The report retains texture usage, virtual-slot metadata, map variables, entity positions/attributes, and literal config references. `--material-map FILE` accepts a JSON object such as `{"7":0,"12":2}` to select current Sauerteig materials for legacy slots. Each face is mapped independently and rotated into Sauerteig's coordinate system. Unmapped slots use neutral material 0. **Original texture images, UV overrides and external asset loading are not implemented.**
 
-Light and playerstart positions are imported. Light radius/color, spotlight parameters and spawn yaw remain in the report; imported lights use the current defaults and does not reproduce those attributes. Mapmodels, sounds, pickups, triggers, water/lava/clip volumes, blend maps and skyboxes need separate adapters. Source geometry still imports when its texture or model is missing. Old lightmaps, merged render caches and PVS are discarded in favor of current geometry meshing and dynamic lighting.
+Light and playerstart positions are imported. Light radius/color, spotlight parameters and spawn yaw remain in the report; imported lights do not reproduce those attributes. They become independent light nodes with no fixture model, currently rendered as fixed warm downward spotlights with a 12 metre range. Only eight nearby nodes illuminate the scene at a time. This changes the original lighting substantially; source point lights and sun/environment settings are not reproduced. Mapmodels, sounds, pickups, triggers, water/lava/clip volumes, blend maps and skyboxes need separate adapters. Source geometry still imports when its texture or model is missing. Old lightmaps, merged render caches and PVS are discarded in favor of current geometry meshing and dynamic lighting.
 
 ## Asset licenses
 

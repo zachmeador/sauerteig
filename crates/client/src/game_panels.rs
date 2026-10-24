@@ -1,5 +1,58 @@
 use super::*;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_switch_retries_failed_documents_after_the_error_was_seen_and_cancelled() {
+        use crate::user_data::{
+            flush_pending,
+            tests::{storage_at, QUEUE_TEST},
+        };
+        let _serial = QUEUE_TEST.lock().unwrap();
+        let _ = flush_pending();
+        let directory = std::env::temp_dir().join(format!(
+            "sauerteig-switch-storage-retry-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut game = Game::new(String::new(), "storage switch test".into());
+        game.storage = storage_at(&directory);
+        flush_pending().unwrap();
+        game.poll_storage();
+        game.preferences.invert_scroll = true;
+        // Turn a valid destination into a file so both document writes fail.
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, b"temporarily unavailable").unwrap();
+        game.persist_settings();
+        game.persist_library();
+        let error = flush_pending().unwrap_err();
+        assert!(error.contains("Could not save settings"));
+        assert!(error.contains("Could not save blueprints"));
+        game.poll_storage();
+        assert!(game.settings_status.starts_with("Local storage failed"));
+        assert!(game.library_status.starts_with("Local storage failed"));
+        // The switch surfaced and consumed the error, then was cancelled.
+        assert!(crate::user_data::take_write_error().is_none());
+        std::fs::remove_file(&directory).unwrap();
+        // This is also called by every fresh switch, so cancellation cannot
+        // let the next world discard these still-unsaved in-memory values.
+        game.retry_local_saves();
+        flush_pending().unwrap();
+        game.poll_storage();
+        let saved: Preferences =
+            serde_json::from_slice(&std::fs::read(directory.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(saved.invert_scroll);
+        assert!(directory.join("blueprints.json").is_file());
+        assert_eq!(game.settings_status, "Saved locally");
+        assert_eq!(game.library_status, "Saved locally");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 impl Game {
     pub(super) fn poll_storage(&mut self) {
         for event in self.storage.poll() {
@@ -49,6 +102,17 @@ impl Game {
             }
         }
     }
+
+    pub(crate) fn retry_local_saves(&mut self) {
+        self.poll_storage();
+        if self.settings_ready && self.settings_status.starts_with("Local storage failed") {
+            self.persist_settings();
+        }
+        if self.library_ready && self.library_status.starts_with("Local storage failed") {
+            self.persist_library();
+        }
+    }
+
     fn persist_library(&mut self) {
         match self.library.to_json() {
             Ok(json) => {

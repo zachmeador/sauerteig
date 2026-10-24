@@ -111,6 +111,7 @@ omit the version and new fields, as well as cell `shape`, `diagonal`, and
 Loading validates geometry, limits, and unique positions/object IDs before
 starting a session.
 
-Spawn objects affect respawn locations. Lamps provide dynamic lighting. Other
+Spawn objects affect respawn locations. Light nodes provide dynamic lighting,
+independently of decorative lamp models. Other
 props are currently decorative and have no gameplay collision. Object changes
 are shared, saved, undoable, and included in volume copy/paste and blueprints.

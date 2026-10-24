@@ -482,12 +482,12 @@ mod browser {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    static QUEUE_TEST: Mutex<()> = Mutex::new(());
+    pub(crate) static QUEUE_TEST: Mutex<()> = Mutex::new(());
 
-    fn storage_at(directory: &std::path::Path) -> Storage {
+    pub(crate) fn storage_at(directory: &std::path::Path) -> Storage {
         let mut storage = Storage::empty();
         storage.directory = Ok(directory.to_owned());
         storage.initial_loads();

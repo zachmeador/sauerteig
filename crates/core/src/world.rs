@@ -635,8 +635,8 @@ pub fn spawn_point(index: u32) -> Vec3 {
 pub fn arena_objects() -> Vec<crate::WorldObject> {
     use crate::{ObjectKind, WorldObject};
     let mut objects = Vec::new();
-    // Suspended utility fixtures in each enclosed bay. All eight fit the
-    // renderer's fixture-light budget and remain shared editable objects.
+    // Independent light nodes in each enclosed bay. All eight fit the
+    // renderer's local-light budget and remain shared editable objects.
     for (i, [x, y, z]) in [
         [-19.0, 6.8, -12.0],
         [-19.0, 6.8, 12.0],

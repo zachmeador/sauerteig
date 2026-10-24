@@ -41,7 +41,7 @@ fn label(kind: ObjectKind) -> &'static str {
     crate::props::definition(kind).map_or(
         match kind {
             ObjectKind::Tree => "Tree",
-            ObjectKind::Light => "Light",
+            ObjectKind::Light => "Light node",
             ObjectKind::Spawn => "Spawn",
             _ => "Object",
         },
@@ -58,7 +58,10 @@ fn bounds(kind: ObjectKind) -> (Vec3, Vec3) {
     }
     match kind {
         ObjectKind::Tree => (Vec3::new(-1.8, 0.0, -1.8), Vec3::new(1.8, 5.6, 1.8)),
-        ObjectKind::Light => (Vec3::new(-0.8, -0.22, -0.25), Vec3::new(0.8, 1.32, 0.25)),
+        ObjectKind::Light => (
+            Vec3::splat(-crate::scene::LIGHT_GUIDE_RADIUS),
+            Vec3::splat(crate::scene::LIGHT_GUIDE_RADIUS),
+        ),
         _ => (Vec3::new(-0.43, 0.0, -0.43), Vec3::new(0.43, 0.08, 0.43)),
     }
 }
@@ -74,7 +77,11 @@ fn ray_distance(object: &WorldObject, origin: Vec3, direction: Vec3) -> Option<f
         )
         .filter(|distance| *distance <= 60.0);
     }
-    let rotation = glam::Mat3::from_rotation_y(-object.rotation);
+    let rotation = if object.kind == ObjectKind::Light {
+        glam::Mat3::IDENTITY
+    } else {
+        glam::Mat3::from_rotation_y(-object.rotation)
+    };
     let origin = rotation * (origin - object.position);
     let direction = rotation * direction;
     let (min, max) = bounds(object.kind);
@@ -122,7 +129,10 @@ fn surface_placement(kind: ObjectKind, hit: &RayHit, yaw: f32) -> ObjectPlacemen
             hit.point + Vec3::Y * if hit.normal.y > 0.5 { 2.0 } else { -0.02 },
             yaw,
         ),
-        ObjectKind::Light => (hit.point + Vec3::Y * 1.5, yaw),
+        ObjectKind::Light => (
+            hit.point + hit.normal * (crate::scene::LIGHT_GUIDE_RADIUS + 0.02),
+            yaw,
+        ),
         _ => (hit.point + Vec3::Y * 0.02, yaw),
     };
     ObjectPlacement {
@@ -286,7 +296,11 @@ impl Game {
 
     pub(super) fn draw_object_outline(mesh: &mut Geometry, object: &WorldObject, color: [f32; 3]) {
         let (min, max) = bounds(object.kind);
-        let rotation = glam::Mat3::from_rotation_y(object.rotation);
+        let rotation = if object.kind == ObjectKind::Light {
+            glam::Mat3::IDENTITY
+        } else {
+            glam::Mat3::from_rotation_y(object.rotation)
+        };
         let corners: [Vec3; 8] = std::array::from_fn(|index| {
             object.position
                 + rotation
@@ -305,6 +319,11 @@ impl Game {
                     mesh.beam(corners[i], corners[j], 0.018, color, 0.9);
                 }
             }
+        }
+        // Light nodes have no model-facing direction; their emitter points down
+        // in the current renderer regardless of the retained protocol yaw.
+        if object.kind == ObjectKind::Light {
+            return;
         }
         // Direction is visible even for rotationally symmetric props and spawns.
         mesh.beam(
@@ -441,6 +460,39 @@ mod tests {
         let spawn = surface_placement(ObjectKind::Spawn, &hit, -0.25);
         assert!((0.0..std::f32::consts::TAU).contains(&spawn.rotation));
         assert!((spawn.rotation - (std::f32::consts::TAU - 0.25)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn light_placement_and_picking_use_the_guide_center_without_fixture_offsets() {
+        for (origin, direction) in [
+            (Vec3::new(0.5, 5.0, 0.5), -Vec3::Y),
+            (Vec3::new(3.0, 2.5, 0.5), -Vec3::X),
+            (Vec3::new(0.5, 0.0, 0.5), Vec3::Y),
+        ] {
+            let mut world = World::empty();
+            world.set([0, 2, 0], Some(Cell::solid(0)));
+            let hit = world.raycast(origin, direction, 8.0).unwrap();
+            let placed = surface_placement(ObjectKind::Light, &hit, 0.7);
+            let object = WorldObject {
+                id: 10,
+                kind: placed.kind,
+                position: placed.position,
+                rotation: placed.rotation,
+            };
+            assert!(placed.position.abs_diff_eq(
+                hit.point + hit.normal * (crate::scene::LIGHT_GUIDE_RADIUS + 0.02),
+                1e-5
+            ));
+            assert_eq!(
+                pick(std::slice::from_ref(&object), &world, origin, direction),
+                Some(object.id)
+            );
+            let (min, max) = bounds(ObjectKind::Light);
+            assert_eq!((min + max) * 0.5, Vec3::ZERO);
+            // The former hanging fixture's mounting stem is not selectable.
+            let away = object.position + Vec3::Y + Vec3::Z * 3.0;
+            assert!(ray_distance(&object, away, -Vec3::Z).is_none());
+        }
     }
 
     #[test]

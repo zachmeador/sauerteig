@@ -6,7 +6,6 @@ pub const LOCAL_SHADOW_SIZE: u32 = 512;
 pub const LIGHT_RANGE: f32 = 12.0;
 pub const LIGHT_NEAR: f32 = 0.12;
 pub const LIGHT_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_3;
-const LAMP_OFFSET: f32 = 0.28;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalLight {
@@ -15,10 +14,9 @@ pub struct LocalLight {
 }
 
 impl LocalLight {
-    fn from_fixture(position: Vec3) -> Self {
-        // The emitter sits below the lens and cage, so the fixture does not
-        // immediately occlude its own downward light.
-        let position = position - Vec3::Y * LAMP_OFFSET;
+    fn from_node(position: Vec3) -> Self {
+        // The current renderer still uses a downward shadowed spotlight.
+        // Its origin is the light node itself, independent of decorative props.
         let view = Mat4::look_to_rh(position, -Vec3::Y, Vec3::Z);
         let projection = Mat4::perspective_rh(LIGHT_HALF_ANGLE * 2.0, 1.0, LIGHT_NEAR, LIGHT_RANGE);
         Self {
@@ -36,23 +34,10 @@ pub fn closest_lights(objects: &[WorldObject], eye: Vec3) -> [Option<LocalLight>
         return [None; LOCAL_LIGHTS];
     }
     for object in objects {
-        if !matches!(
-            object.kind,
-            ObjectKind::Light | ObjectKind::WallLamp | ObjectKind::HangingLamp
-        ) || !object.position.is_finite()
-        {
+        if object.kind != ObjectKind::Light || !object.position.is_finite() {
             continue;
         }
-        let offset = match object.kind {
-            ObjectKind::WallLamp => Vec3::new(
-                object.rotation.sin() * 0.19,
-                LAMP_OFFSET,
-                object.rotation.cos() * 0.19,
-            ),
-            ObjectKind::HangingLamp => Vec3::Y * (-1.40 + LAMP_OFFSET),
-            _ => Vec3::ZERO,
-        };
-        let light = LocalLight::from_fixture(object.position + offset);
+        let light = LocalLight::from_node(object.position);
         let distance = light.position.distance_squared(eye);
         if let Some(slot) = nearby.iter().position(|entry| {
             entry.is_none_or(|(d, id, _)| {
@@ -132,7 +117,7 @@ mod tests {
         );
     }
 
-    fn fixture(id: u32, position: Vec3) -> WorldObject {
+    fn node(id: u32, position: Vec3) -> WorldObject {
         WorldObject {
             id,
             position,
@@ -148,8 +133,8 @@ mod tests {
 
     #[test]
     fn spotlight_center_edges_and_depth_match_webgpu_clip_space() {
-        let light = LocalLight::from_fixture(Vec3::new(3.0, 9.0, -2.0));
-        assert!((light.position.y - 8.72).abs() < 1.0e-5);
+        let light = LocalLight::from_node(Vec3::new(3.0, 9.0, -2.0));
+        assert_eq!(light.position, Vec3::new(3.0, 9.0, -2.0));
         for (depth, expected_z) in [(LIGHT_NEAR, 0.0), (LIGHT_RANGE, 1.0)] {
             let p = ndc(light.view_proj, light.position - Vec3::Y * depth);
             assert!(p.x.abs() < 1.0e-5 && p.y.abs() < 1.0e-5);
@@ -170,13 +155,13 @@ mod tests {
     #[test]
     fn closest_lights_respects_budget_and_breaks_ties_by_id() {
         let mut objects = vec![
-            fixture(20, Vec3::new(2.0, 2.0, 0.0)),
-            fixture(10, Vec3::new(-2.0, 2.0, 0.0)),
+            node(20, Vec3::new(2.0, 2.0, 0.0)),
+            node(10, Vec3::new(-2.0, 2.0, 0.0)),
         ];
         for i in 0..10 {
-            objects.push(fixture(30 + i, Vec3::new(4.0 + i as f32, 2.0, 0.0)));
+            objects.push(node(30 + i, Vec3::new(4.0 + i as f32, 2.0, 0.0)));
         }
-        let mut tree = fixture(1, Vec3::ZERO);
+        let mut tree = node(1, Vec3::ZERO);
         tree.kind = ObjectKind::Tree;
         objects.push(tree);
         let selected = closest_lights(&objects, Vec3::ZERO);
@@ -193,8 +178,42 @@ mod tests {
     }
 
     #[test]
+    fn only_light_nodes_emit_at_their_stored_position() {
+        let position = Vec3::new(-12.5, 9.25, 17.75);
+        let emitter = node(1, position);
+        let wall_lamp = WorldObject {
+            id: 2,
+            kind: ObjectKind::WallLamp,
+            position: Vec3::ZERO,
+            rotation: 1.2,
+        };
+        let hanging_lamp = WorldObject {
+            id: 3,
+            kind: ObjectKind::HangingLamp,
+            ..wall_lamp.clone()
+        };
+        let decorative = [wall_lamp, hanging_lamp];
+        assert!(closest_lights(&decorative, Vec3::ZERO)
+            .iter()
+            .all(Option::is_none));
+        let selected = closest_lights(&[emitter, decorative[0].clone()], Vec3::ZERO);
+        assert_eq!(selected[0].unwrap().position, position);
+        assert!(selected[1..].iter().all(Option::is_none));
+
+        // Both optional lamp models still load through the ordinary prop path.
+        let assets = crate::props::load().unwrap();
+        for kind in [ObjectKind::WallLamp, ObjectKind::HangingLamp] {
+            let asset = assets
+                .iter()
+                .find(|asset| asset.definition.kind == kind)
+                .unwrap();
+            assert!(!asset.near.indices.is_empty());
+        }
+    }
+
+    #[test]
     fn chunk_culling_keeps_near_plane_crossings_and_rejects_distant_or_above_chunks() {
-        let light = LocalLight::from_fixture(Vec3::new(4.0, 12.28, 4.0));
+        let light = LocalLight::from_node(Vec3::new(4.0, 12.28, 4.0));
         assert!(chunk_in_light([0, 1, 0], &light), "chunk contains emitter");
         assert!(chunk_in_light([0, 0, 0], &light), "floor beneath emitter");
         assert!(!chunk_in_light([0, 2, 0], &light), "entirely above emitter");
@@ -205,7 +224,7 @@ mod tests {
     fn every_sampled_illuminated_point_retains_its_chunk() {
         // Exercise negative chunk coordinates and cone/range boundaries. A
         // caster touching an illuminated point must never disappear via culling.
-        let light = LocalLight::from_fixture(Vec3::new(-7.7, 17.58, 3.8));
+        let light = LocalLight::from_node(Vec3::new(-7.7, 17.58, 3.8));
         for depth in [LIGHT_NEAR, 0.5, 1.0, 2.0, 4.0, 7.0, 11.0] {
             for x in -4..=4 {
                 for z in -4..=4 {

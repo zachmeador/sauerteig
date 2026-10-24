@@ -18,15 +18,16 @@ mod web_text;
 mod world_saves;
 
 use game::Game;
-use launcher::{LaunchAction, LaunchOptions, Launcher};
+use launcher::{ActiveSession, LaunchAction, LaunchOptions, Launcher, MenuAction};
 use render::Renderer;
 use std::sync::Arc;
 use web_time::Instant;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{DeviceEvent, DeviceId, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -36,12 +37,8 @@ struct Runtime {
     game: Game,
     launcher: Launcher,
     session: Option<Session>,
-    stopping: bool,
-    leaving_since: Option<Instant>,
-    leave_needs_sync: bool,
-    leave_sync: Option<u64>,
-    leave_unconfirmed: bool,
-    close_after_stop: bool,
+    menu_open: bool,
+    change: Option<SessionChange>,
     exit_requested: bool,
     #[cfg(not(target_arch = "wasm32"))]
     host: Option<hosting::HostedServer>,
@@ -59,10 +56,109 @@ struct Session {
     lan_port: Option<u16>,
 }
 enum SessionAction {
-    Leave,
-    LeaveUnconfirmed,
+    MainMenu,
     Rejoin,
 }
+
+enum Destination {
+    Launch(LaunchAction),
+    Close,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChangePhase {
+    Draining,
+    SavingHost,
+    Blocked { unconfirmed: bool },
+}
+
+struct SessionChange {
+    destination: Destination,
+    phase: ChangePhase,
+    since: Instant,
+    needs_sync: bool,
+    sync: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DrainProgress {
+    Waiting,
+    Ready,
+    Blocked(String),
+}
+
+impl SessionChange {
+    fn new(destination: Destination, needs_sync: bool) -> Self {
+        Self {
+            destination,
+            phase: ChangePhase::Draining,
+            since: Instant::now(),
+            needs_sync,
+            sync: None,
+        }
+    }
+
+    fn retry(&mut self, connected: bool) {
+        // A failed connection cannot turn an unconfirmed switch into a safe
+        // one. Only an explicit override may skip the server barrier.
+        self.needs_sync |= connected;
+        self.sync = None;
+        self.since = Instant::now();
+        self.phase = ChangePhase::Draining;
+    }
+
+    fn needs_sync_request(&self, connected: bool, edits_pending: bool) -> bool {
+        self.phase == ChangePhase::Draining
+            && self.needs_sync
+            && self.sync.is_none()
+            && connected
+            && !edits_pending
+    }
+
+    fn poll_drain(
+        &mut self,
+        connected: bool,
+        synced: bool,
+        writes_pending: bool,
+        now: Instant,
+        write_error: impl FnOnce() -> Option<String>,
+    ) -> DrainProgress {
+        if self.phase != ChangePhase::Draining {
+            return DrainProgress::Waiting;
+        }
+        let network_ready = !self.needs_sync || (self.sync.is_some() && synced);
+        let connection_lost = self.needs_sync && !connected;
+        if connection_lost || (!network_ready && (now - self.since).as_secs() >= 15) {
+            self.phase = ChangePhase::Blocked { unconfirmed: true };
+            return DrainProgress::Blocked(if connection_lost {
+                "Connection lost before your edits were confirmed. Reconnect and retry, or continue without confirmation."
+            } else {
+                "The server has not confirmed your edits. Retry to wait again, or continue without confirmation."
+            }.into());
+        }
+        if !network_ready || writes_pending {
+            return DrainProgress::Waiting;
+        }
+        if let Some(error) = write_error() {
+            self.phase = ChangePhase::Blocked { unconfirmed: false };
+            return DrainProgress::Blocked(format!("Local changes could not be saved: {error}"));
+        }
+        self.phase = ChangePhase::SavingHost;
+        DrainProgress::Ready
+    }
+
+    fn finish(self, saved: Result<(), String>) -> Result<Destination, String> {
+        debug_assert_eq!(self.phase, ChangePhase::SavingHost);
+        saved.map(|()| self.destination)
+    }
+}
+
+enum ChangeAction {
+    Cancel,
+    Retry,
+    ContinueUnconfirmed,
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.game.release(&self.window);
@@ -104,12 +200,8 @@ impl Runtime {
             game,
             launcher,
             session: None,
-            stopping: false,
-            leaving_since: None,
-            leave_needs_sync: false,
-            leave_sync: None,
-            leave_unconfirmed: false,
-            close_after_stop: false,
+            menu_open: true,
+            change: None,
             exit_requested: false,
             #[cfg(not(target_arch = "wasm32"))]
             host: None,
@@ -136,7 +228,7 @@ impl Runtime {
     }
 
     fn launch(&mut self, action: LaunchAction) {
-        if self.session.is_some() || self.stopping {
+        if self.session.is_some() || self.change.is_some() {
             return;
         }
         let session = match action {
@@ -173,27 +265,63 @@ impl Runtime {
         };
         self.replace_game(session.endpoint.clone(), session.name.clone());
         self.session = Some(session);
-        self.leave_unconfirmed = false;
+        self.menu_open = false;
     }
 
-    fn leave(&mut self, close: bool) {
-        self.close_after_stop |= close;
-        if self.stopping {
+    fn main_menu(&mut self) {
+        self.game.release(&self.window);
+        self.game.close_text_panel();
+        self.menu_open = true;
+        self.launcher.open();
+    }
+
+    fn resume(&mut self) {
+        if self.session.is_some() && self.change.is_none() {
+            self.menu_open = false;
+            self.game.capture(&self.window);
+        }
+    }
+
+    fn accepts_game_input(&self) -> bool {
+        self.session.is_some() && !self.menu_open && self.change.is_none()
+    }
+
+    fn begin_change(&mut self, destination: Destination) {
+        self.main_menu();
+        if let Some(change) = &mut self.change {
+            // A window close overrides a queued world, including while the
+            // old host's final save is in progress.
+            if matches!(destination, Destination::Close) {
+                change.destination = destination;
+            }
             return;
         }
-        self.game.release(&self.window);
-        if self.leaving_since.is_none() {
-            self.leaving_since = Some(Instant::now());
-            self.leave_needs_sync = self.session.is_some() && self.game.connected;
-            self.leave_sync = None;
+        // Cancelling an earlier blocked switch must not forget documents
+        // whose failure has already been reported and consumed.
+        self.game.retry_local_saves();
+        self.change = Some(SessionChange::new(
+            destination,
+            self.session.is_some() && self.game.needs_edit_confirmation(),
+        ));
+    }
+
+    fn finish_change(&mut self, saved: Result<(), String>) {
+        let Some(change) = self.change.take() else {
+            return;
+        };
+        match change.finish(saved) {
+            Ok(Destination::Launch(action)) => self.launch(action),
+            Ok(Destination::Close) => self.exit_requested = true,
+            Err(error) => {
+                // A failed final save never opens the queued destination or
+                // dismisses the error by closing the window.
+                self.menu_open = true;
+                self.launcher.status = format!("Local server stopped with an error: {error}");
+            }
         }
     }
 
-    fn finish_leaving(&mut self) {
-        self.leaving_since = None;
-        self.leave_needs_sync = false;
-        self.leave_sync = None;
-        self.leave_unconfirmed = false;
+    fn stop_session(&mut self) {
         // Close the socket before graceful server shutdown, which waits for
         // active connections and the final world save.
         self.replace_game(String::new(), String::new());
@@ -201,33 +329,56 @@ impl Runtime {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(host) = &mut self.host {
             host.stop();
-            self.stopping = true;
             return;
         }
-        self.exit_requested = self.close_after_stop;
-        self.launcher.status = "Disconnected. You can join again below.".into();
+        self.finish_change(Ok(()));
+    }
+
+    fn poll_change(&mut self) {
+        let Some(change) = &mut self.change else {
+            return;
+        };
+        if change.needs_sync_request(self.game.connected, self.game.edits_pending()) {
+            // The ordered reply also covers Undo/Redo and other messages
+            // sent before this barrier, which have no edit request token.
+            change.sync = self.game.request_sync();
+        }
+        let synced = change.sync.is_some_and(|request| self.game.synced(request));
+        match change.poll_drain(
+            self.game.connected,
+            synced,
+            user_data::pending_writes(),
+            Instant::now(),
+            user_data::take_write_error,
+        ) {
+            DrainProgress::Ready => self.stop_session(),
+            DrainProgress::Blocked(error) => self.launcher.status = error,
+            DrainProgress::Waiting => {}
+        }
     }
 
     fn poll_host(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(result) = self.host.as_mut().and_then(hosting::HostedServer::poll) {
             self.host = None;
+            if self
+                .change
+                .as_ref()
+                .is_some_and(|change| change.phase == ChangePhase::SavingHost)
+            {
+                self.finish_change(result);
+                return;
+            }
+            // Unexpected shutdown or startup failure also returns home, but
+            // cannot complete an in-progress switch whose edits never synced.
             self.replace_game(String::new(), String::new());
             self.session = None;
+            self.change = None;
+            self.menu_open = true;
             self.launcher.status = match result {
-                Ok(()) => {
-                    self.exit_requested = self.close_after_stop;
-                    "World saved. You can continue whenever you’re ready.".into()
-                }
-                Err(error) => {
-                    // A failed final save must remain visible, including when
-                    // the user initiated a window close.
-                    self.close_after_stop = false;
-                    format!("Local server stopped with an error: {error}")
-                }
+                Ok(()) => "Local server stopped. Your saved worlds are below.".into(),
+                Err(error) => format!("Local server stopped with an error: {error}"),
             };
-            self.stopping = false;
-            self.leaving_since = None;
         }
     }
 
@@ -243,6 +394,13 @@ impl Runtime {
             .collapsible(false)
             .default_width(300.0)
             .show(ctx, |ui| {
+                if ui
+                    .add_sized([ui.available_width(), 36.0], egui::Button::new("Main menu"))
+                    .clicked()
+                {
+                    action = Some(SessionAction::MainMenu);
+                }
+                ui.separator();
                 ui.strong(&session.title);
                 ui.label(format!("Playing as {}", session.name));
                 ui.label(if self.game.connected {
@@ -273,26 +431,8 @@ impl Runtime {
                 if !self.launcher.status.is_empty() {
                     ui.label(&self.launcher.status);
                 }
-                ui.horizontal(|ui| {
-                    if !self.game.connected && ui.button("Rejoin now").clicked() {
-                        action = Some(SessionAction::Rejoin);
-                    }
-                    if ui
-                        .button(if session.hosting {
-                            "Save and leave"
-                        } else {
-                            "Disconnect"
-                        })
-                        .clicked()
-                    {
-                        action = Some(SessionAction::Leave);
-                    }
-                });
-                if self.leave_unconfirmed {
-                    ui.weak("Unconfirmed edits may be lost.");
-                    if ui.button("Leave without confirmation").clicked() {
-                        action = Some(SessionAction::LeaveUnconfirmed);
-                    }
+                if !self.game.connected && ui.button("Rejoin now").clicked() {
+                    action = Some(SessionAction::Rejoin);
                 }
             });
         action
@@ -303,46 +443,13 @@ impl Runtime {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-        if self.session.is_some() && !self.stopping {
+        if self.session.is_some() {
             self.game.update(dt, &mut self.renderer);
-            if !self.game.connected && self.game.captured {
+            if self.game.captured && (!self.game.connected || !self.accepts_game_input()) {
                 self.game.release(&self.window);
             }
         }
-        if let Some(since) = self.leaving_since {
-            let connection_lost = self.leave_needs_sync && !self.game.connected;
-            if self.leave_needs_sync
-                && self.leave_sync.is_none()
-                && self.game.connected
-                && !self.game.edits_pending()
-            {
-                // The ordered reply also covers Undo/Redo and other messages
-                // sent before this barrier, which have no edit request token.
-                self.leave_sync = self.game.request_sync();
-            }
-            let network_ready = !self.leave_needs_sync
-                || self
-                    .leave_sync
-                    .is_some_and(|request| self.game.synced(request));
-            if connection_lost || (!network_ready && since.elapsed().as_secs() >= 15) {
-                self.leaving_since = None;
-                self.close_after_stop = false;
-                self.leave_unconfirmed = true;
-                self.launcher.status = if connection_lost {
-                    "Connection lost before your edits were confirmed. Rejoin to check the world, or leave without confirmation."
-                } else {
-                    "The server has not confirmed your edits. Try leaving again to wait, or leave without confirmation."
-                }.into();
-            } else if network_ready && !user_data::pending_writes() {
-                if let Some(error) = user_data::take_write_error() {
-                    self.leaving_since = None;
-                    self.close_after_stop = false;
-                    self.launcher.status = format!("Local changes could not be saved: {error}");
-                } else {
-                    self.finish_leaving();
-                }
-            }
-        }
+        self.poll_change();
         let raw = self.egui.take_egui_input(&self.window);
         #[cfg(target_arch = "wasm32")]
         let raw = {
@@ -352,39 +459,95 @@ impl Runtime {
             }
             raw
         };
-        let mut launch_action = None;
+        let mut menu_action = None;
         let mut session_action = None;
+        let mut change_action = None;
         let context = self.context.clone();
         let output = context.run(raw, |ctx| {
-            if self.leaving_since.is_some() {
+            if let Some(change) = &self.change {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
-                        ui.spinner();
-                        ui.label("Finishing edits and local saves…");
-                        if ui.button("Cancel").clicked() {
-                            self.leaving_since = None;
-                            self.close_after_stop = false;
+                        match change.phase {
+                            ChangePhase::Draining => {
+                                ui.spinner();
+                                ui.label("Finishing edits and local saves…");
+                                if ui.button("Cancel").clicked() {
+                                    change_action = Some(ChangeAction::Cancel);
+                                }
+                            }
+                            ChangePhase::SavingHost => {
+                                ui.spinner();
+                                ui.label("Saving world and stopping server…");
+                            }
+                            ChangePhase::Blocked { unconfirmed } => {
+                                ui.heading("Could not finish the current session");
+                                ui.label(&self.launcher.status);
+                                ui.add_space(12.0);
+                                if ui.button("Retry").clicked() {
+                                    change_action = Some(ChangeAction::Retry);
+                                }
+                                if unconfirmed {
+                                    ui.weak("Unconfirmed edits may be lost.");
+                                    let label = if matches!(change.destination, Destination::Close)
+                                    {
+                                        "Close without confirmation"
+                                    } else {
+                                        "Switch without confirmation"
+                                    };
+                                    if ui.button(label).clicked() {
+                                        change_action = Some(ChangeAction::ContinueUnconfirmed);
+                                    }
+                                }
+                                if ui.button("Return to main menu").clicked() {
+                                    change_action = Some(ChangeAction::Cancel);
+                                }
+                            }
                         }
                     });
                 });
+            } else if self.menu_open {
+                menu_action = self.launcher.ui(
+                    ctx,
+                    self.session.as_ref().map(|session| ActiveSession {
+                        title: &session.title,
+                        hosting_lan: session.lan_port.is_some(),
+                    }),
+                );
             } else if self.session.is_some() {
                 self.game.ui(ctx, &self.renderer, &self.window);
                 session_action = self.session_ui(ctx);
-            } else {
-                launch_action = self.launcher.ui(ctx, self.stopping);
             }
         });
-        if let Some(action) = launch_action {
-            self.launch(action);
+        match menu_action {
+            Some(MenuAction::Resume) => self.resume(),
+            Some(MenuAction::Launch(action)) if self.session.is_some() => {
+                self.begin_change(Destination::Launch(action));
+            }
+            Some(MenuAction::Launch(action)) => self.launch(action),
+            None => {}
+        }
+        match change_action {
+            Some(ChangeAction::Cancel) => {
+                self.change = None;
+            }
+            Some(ChangeAction::Retry) => {
+                self.game.retry_local_saves();
+                if let Some(change) = &mut self.change {
+                    change.retry(self.game.connected);
+                }
+            }
+            Some(ChangeAction::ContinueUnconfirmed) => {
+                self.game.retry_local_saves();
+                if let Some(change) = &mut self.change {
+                    change.retry(false);
+                    change.needs_sync = false;
+                }
+            }
+            None => {}
         }
         match session_action {
-            Some(SessionAction::Leave) => self.leave(false),
-            Some(SessionAction::LeaveUnconfirmed) => {
-                self.leave(false);
-                self.leave_needs_sync = false;
-                self.leave_sync = None;
-            }
+            Some(SessionAction::MainMenu) => self.main_menu(),
             Some(SessionAction::Rejoin) => {
                 if let Some(session) = &self.session {
                     self.replace_game(session.endpoint.clone(), session.name.clone());
@@ -535,7 +698,7 @@ impl ApplicationHandler<UserEvent> for App {
             #[cfg(target_arch = "wasm32")]
             UserEvent::PointerLock { locked, failed } => {
                 if let Some(runtime) = &mut self.runtime {
-                    if locked && (runtime.session.is_none() || runtime.leaving_since.is_some()) {
+                    if !runtime.accepts_game_input() {
                         runtime.game.release(&runtime.window);
                     } else if locked {
                         runtime.game.captured = true;
@@ -552,7 +715,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if matches!(event, WindowEvent::CloseRequested) {
             if let Some(runtime) = &mut self.runtime {
-                runtime.leave(true);
+                runtime.begin_change(Destination::Close);
                 if runtime.exit_requested {
                     event_loop.exit();
                 }
@@ -571,7 +734,20 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let response = runtime.egui.on_window_event(&runtime.window, &event);
-        if runtime.session.is_some() && !runtime.stopping && runtime.leaving_since.is_none() {
+        let menu_escape = runtime.menu_open
+            && runtime.session.is_some()
+            && runtime.change.is_none()
+            && !response.consumed
+            && matches!(
+                &event,
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+            );
+        if menu_escape {
+            runtime.resume();
+        } else if runtime.accepts_game_input() {
             runtime
                 .game
                 .event(&event, &runtime.window, response.consumed);
@@ -593,8 +769,7 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if let Some(runtime) = &mut self.runtime {
-                if runtime.session.is_some() && !runtime.stopping && runtime.leaving_since.is_none()
-                {
+                if runtime.accepts_game_input() {
                     runtime.game.motion(delta);
                 }
             }
@@ -693,4 +868,151 @@ pub fn start() {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Warn);
     run();
+}
+
+#[cfg(test)]
+mod session_change_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn switching(needs_sync: bool) -> SessionChange {
+        SessionChange::new(
+            Destination::Launch(LaunchAction::Join {
+                endpoint: "ws://next-world:3000/ws".into(),
+                name: "Player".into(),
+            }),
+            needs_sync,
+        )
+    }
+
+    #[test]
+    fn switching_waits_for_edits_sync_local_writes_and_final_host_save() {
+        let mut change = switching(true);
+        let now = change.since;
+        assert!(!change.needs_sync_request(true, true));
+        assert_eq!(
+            change.poll_drain(true, false, false, now, || panic!(
+                "too early to take errors"
+            )),
+            DrainProgress::Waiting
+        );
+        assert!(change.needs_sync_request(true, false));
+        change.sync = Some(7);
+        assert!(!change.needs_sync_request(true, false));
+        assert_eq!(
+            change.poll_drain(true, false, false, now, || panic!("sync still pending")),
+            DrainProgress::Waiting
+        );
+        assert_eq!(
+            change.poll_drain(true, true, true, now, || panic!("writes still pending")),
+            DrainProgress::Waiting
+        );
+        assert_eq!(
+            change.poll_drain(true, true, false, now, || None),
+            DrainProgress::Ready
+        );
+        assert_eq!(change.phase, ChangePhase::SavingHost);
+        assert_eq!(
+            change.poll_drain(true, true, false, now, || panic!("host save still pending")),
+            DrainProgress::Waiting
+        );
+        let Ok(Destination::Launch(LaunchAction::Join { endpoint, .. })) = change.finish(Ok(()))
+        else {
+            panic!("the queued server should launch after a successful final save")
+        };
+        assert_eq!(endpoint, "ws://next-world:3000/ws");
+    }
+
+    #[test]
+    fn a_lost_connection_cannot_become_a_clean_switch_by_retrying_while_disconnected() {
+        let mut change = switching(true);
+        assert!(matches!(
+            change.poll_drain(false, false, false, change.since, || None),
+            DrainProgress::Blocked(_)
+        ));
+        assert_eq!(change.phase, ChangePhase::Blocked { unconfirmed: true });
+        change.retry(false);
+        assert!(change.needs_sync);
+        assert!(matches!(
+            change.poll_drain(false, false, false, change.since, || None),
+            DrainProgress::Blocked(_)
+        ));
+        change.retry(true);
+        change.sync = Some(8);
+        assert_eq!(
+            change.poll_drain(true, true, false, change.since, || None),
+            DrainProgress::Ready
+        );
+    }
+
+    #[test]
+    fn a_sync_timeout_keeps_the_destination_and_requires_a_fresh_barrier_on_retry() {
+        let mut change = switching(true);
+        change.sync = Some(7);
+        assert!(matches!(
+            change.poll_drain(
+                true,
+                false,
+                false,
+                change.since + Duration::from_secs(15),
+                || None
+            ),
+            DrainProgress::Blocked(_)
+        ));
+        change.retry(true);
+        assert_eq!(change.sync, None);
+        assert_eq!(
+            change.poll_drain(true, true, false, change.since, || None),
+            DrainProgress::Waiting
+        );
+        assert!(matches!(change.destination, Destination::Launch(_)));
+    }
+
+    #[test]
+    fn failed_local_writes_block_session_teardown_until_a_successful_retry() {
+        let mut change = switching(false);
+        assert!(matches!(
+            change.poll_drain(false, false, false, change.since, || Some(
+                "disk unavailable".into()
+            )),
+            DrainProgress::Blocked(_)
+        ));
+        assert_eq!(change.phase, ChangePhase::Blocked { unconfirmed: false });
+        assert_eq!(
+            change.poll_drain(false, false, false, change.since, || None),
+            DrainProgress::Waiting
+        );
+        change.retry(false);
+        assert_eq!(
+            change.poll_drain(false, false, true, change.since, || None),
+            DrainProgress::Waiting
+        );
+        assert_eq!(
+            change.poll_drain(false, false, false, change.since, || None),
+            DrainProgress::Ready
+        );
+    }
+
+    #[test]
+    fn failed_final_save_never_returns_the_queued_destination() {
+        let mut change = switching(false);
+        assert_eq!(
+            change.poll_drain(false, false, false, change.since, || None),
+            DrainProgress::Ready
+        );
+        assert!(
+            matches!(change.finish(Err("final save failed".into())), Err(error) if error == "final save failed")
+        );
+    }
+
+    #[test]
+    fn closing_during_host_save_overrides_the_queued_world() {
+        let mut change = switching(false);
+        assert_eq!(
+            change.poll_drain(false, false, false, change.since, || None),
+            DrainProgress::Ready
+        );
+        change.destination = Destination::Close;
+        assert!(matches!(change.finish(Ok(())), Ok(Destination::Close)));
+    }
 }

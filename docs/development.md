@@ -57,8 +57,11 @@ loopback ports and use temporary world files.
 
 The native home screen manages named worlds and starts a server for the selected
 world on an available port. Local hosting binds loopback unless the LAN checkbox
-is selected. **Save and leave**, or closing the window, closes the game connection
-and waits for the server's final save. A save error remains visible. A world lock
+is selected. **Main menu** releases gameplay input and keeps the current session
+running; **Resume** returns to it. Choosing another world or server drains pending
+edits and local writes, closes the old connection, and waits for a hosted world's
+final save before opening the destination. Closing the window follows the same
+save path. A sync or save error blocks the switch and remains visible. A world lock
 prevents two app instances from hosting or duplicating the same managed save.
 
 Managed saves live under the application-data directory in `worlds/<id>/`, with
@@ -111,8 +114,13 @@ The [core contract](../crates/core/CONTRACT.md) describes the geometry and proto
 invariants.
 
 Lighting is dynamic. The sun shadow window follows the player with texel-snapped
-motion; eight nearby fixtures cast shadows with 512 px maps and light-volume
-culling. Ambient fill keeps unlit areas
+motion; eight nearby light nodes cast shadows with 512 px maps and light-volume
+culling. Nodes have no visible model in play; their editor guides do not cast
+shadows. Lamp props are independent decoration, with emissive surfaces but no
+automatic local light. The current node renderer is still a fixed warm downward
+spotlight with a 12 metre range, not an omnidirectional point light. Color, radius,
+intensity, and cone settings are not editable or restored from imported maps.
+Ambient fill keeps unlit areas
 readable; there is no baked map lighting or global illumination. Guides, tracers,
 and the first-person weapon do not cast shadows.
 

@@ -102,6 +102,61 @@ mod tests {
         assert_eq!(mode.pending, None);
         assert_eq!(mode.acknowledge(request, true), None);
     }
+
+    #[test]
+    fn disconnected_edit_queue_still_requires_confirmation_before_switching() {
+        let mut game = Game::new(String::new(), "switch test".into());
+        assert!(
+            !game.needs_edit_confirmation(),
+            "an unused connection can be replaced"
+        );
+        game.connected = true;
+        game.edit_queue.push_back(EditIntent::Extrude);
+        game.connection_lost();
+        assert!(!game.edits_pending());
+        assert!(
+            game.needs_edit_confirmation(),
+            "clearing the dead queue must not hide unconfirmed edits"
+        );
+        game.sync = Some((7, false));
+        game.acknowledge_sync(7);
+        assert!(!game.needs_edit_confirmation());
+    }
+
+    #[test]
+    fn a_new_undo_invalidates_an_older_sync_reply_after_a_cancelled_switch() {
+        let mut game = Game::new(String::new(), "undo switch test".into());
+        game.sync = Some((7, false));
+        game.invalidate_sync_for(&ClientMessage::Undo);
+        game.acknowledge_sync(7);
+        assert!(game.needs_edit_confirmation());
+        assert!(!game.synced(7));
+        game.connection_lost();
+        assert!(game.needs_edit_confirmation());
+        game.sync = Some((8, false));
+        game.acknowledge_sync(8);
+        assert!(!game.needs_edit_confirmation());
+    }
+
+    #[test]
+    fn light_node_guides_appear_only_in_editor_and_never_cast_shadows() {
+        let mut game = Game::new(String::new(), "guide test".into());
+        game.objects = vec![WorldObject {
+            id: 1,
+            kind: ObjectKind::Light,
+            position: Vec3::new(2.0, 4.0, 6.0),
+            rotation: 0.0,
+        }];
+        let gameplay = game.geometry();
+        assert!(gameplay.vertices.is_empty());
+        assert!(gameplay.indices.is_empty());
+
+        game.local.editing = true;
+        let editor = game.geometry();
+        assert!(!editor.vertices.is_empty());
+        assert!(!editor.indices.is_empty());
+        assert_eq!(editor.shadow_index_count, 0);
+    }
 }
 impl ModeState {
     fn request(&mut self, editing: bool) -> u32 {
@@ -203,6 +258,7 @@ pub struct Game {
     object_mode: bool,
     object_selection: Option<ObjectSelection>,
     pending_object: Option<PendingObjectEdit>,
+    unconfirmed_edits: bool,
     sync: Option<(u64, bool)>,
     wheel_remainder: f32,
     viewport: [f32; 2],
@@ -286,6 +342,7 @@ impl Game {
             object_mode: false,
             object_selection: None,
             pending_object: None,
+            unconfirmed_edits: false,
             sync: None,
             wheel_remainder: 0.0,
             viewport: [1280.0, 800.0],
@@ -330,14 +387,64 @@ impl Game {
         forward(self.local.yaw, self.local.pitch)
     }
     fn send(&mut self, message: ClientMessage) {
+        if self.socket.is_none() {
+            return;
+        }
+        let Ok(text) = serde_json::to_string(&message) else {
+            return;
+        };
+        self.invalidate_sync_for(&message);
         if let Some((sender, _)) = &mut self.socket {
-            if let Ok(text) = serde_json::to_string(&message) {
-                sender.send(ewebsock::WsMessage::Text(text));
-            }
+            sender.send(ewebsock::WsMessage::Text(text));
         }
     }
     pub(crate) fn edits_pending(&self) -> bool {
         self.editing_busy()
+    }
+
+    pub(crate) fn needs_edit_confirmation(&self) -> bool {
+        self.connected || self.unconfirmed_edits || self.editing_busy()
+    }
+
+    fn invalidate_sync_for(&mut self, message: &ClientMessage) {
+        match message {
+            // These messages have no edit result token. Only the ordered Sync
+            // reply can confirm them, even after reconnecting.
+            ClientMessage::Undo
+            | ClientMessage::Redo
+            | ClientMessage::PlaceObject { .. }
+            | ClientMessage::RemoveObject { .. } => {
+                self.unconfirmed_edits = true;
+                self.sync = None;
+            }
+            ClientMessage::Edit { .. }
+            | ClientMessage::EditRoots { .. }
+            | ClientMessage::EditTransaction { .. } => self.sync = None,
+            _ => {}
+        }
+    }
+
+    fn connection_lost(&mut self) {
+        // Keep this evidence before clearing the old connection's edit state.
+        // A later switch must not mistake a dropped request for a clean start.
+        self.unconfirmed_edits |= self.editing_busy();
+        self.sync = None;
+        self.socket = None;
+        self.connected = false;
+        self.pending.clear();
+        self.pending_edit = None;
+        self.pending_object = None;
+        self.clear_selection();
+        self.firing = false;
+        self.status = "Connection lost · reconnecting…".into();
+        self.reconnect_at = self.time + 3.0;
+    }
+
+    fn acknowledge_sync(&mut self, request: u64) {
+        if self.sync.is_some_and(|(pending, _)| pending == request) {
+            self.sync = Some((request, true));
+            self.unconfirmed_edits = false;
+        }
     }
 
     /// A FIFO server barrier also waits for preceding Undo/Redo messages, which
@@ -419,16 +526,7 @@ impl Game {
                         }
                         _ => log::info!("World connection closed; scheduling reconnect"),
                     }
-                    self.sync = None;
-                    self.socket = None;
-                    self.connected = false;
-                    self.pending.clear();
-                    self.pending_edit = None;
-                    self.pending_object = None;
-                    self.clear_selection();
-                    self.firing = false;
-                    self.status = "Connection lost · reconnecting…".into();
-                    self.reconnect_at = self.time + 3.0;
+                    self.connection_lost();
                 }
                 _ => {}
             }
@@ -578,9 +676,7 @@ impl Game {
                 self.projectiles = projectiles;
             }
             ServerMessage::Synced { request } => {
-                if self.sync.is_some_and(|(pending, _)| pending == request) {
-                    self.sync = Some((request, true));
-                }
+                self.acknowledge_sync(request);
             }
             ServerMessage::ModeChanged { request, editing } => {
                 if let Some(editing) = self.mode.acknowledge(request, editing) {
@@ -1268,6 +1364,7 @@ impl Game {
                     return;
                 };
                 sender.send(ewebsock::WsMessage::Text(text));
+                self.sync = None;
                 self.pending_edit = Some(PendingEdit {
                     request: self.edit_request,
                     plan,
@@ -1440,6 +1537,11 @@ impl Game {
             );
         }
         if self.local.editing {
+            for object in &self.objects {
+                if object.kind == ObjectKind::Light {
+                    mesh.light_guide(object.position);
+                }
+            }
             if let Some(selection) = &self.object_selection {
                 if let Some(object) = self.objects.iter().find(|object| object.id == selection.id) {
                     Self::draw_object_outline(&mut mesh, object, [0.95, 0.72, 0.25]);

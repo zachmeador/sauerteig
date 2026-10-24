@@ -38,6 +38,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Remove an aimed object | Delete / Backspace |
 | Switch geometry / object selection | Q |
 | Show controls / performance stats | F1 / F3 |
+| Return to world picker without disconnecting | Esc → Main menu |
 | Save the shared world on the server | Ctrl+S or Cmd+S |
 
 A selection stays active after releasing the mouse. Editing commands apply to
@@ -55,12 +56,17 @@ changes the selection's active face direction; other faces keep their materials.
 Floors, ceilings, and each wall direction can have independent surfaces. Texture
 scale uses world coordinates, so subdividing a surface does not shrink its pattern.
 
-T also chooses a wall lamp, hanging lamp, utility box, pipe, rock, or a procedural tree. P places the chosen prop. Wall lamps align to walls; hanging
-lamps mount to ceilings, or stand two metres above an aimed floor. Both lamps
-join the dynamic lighting budget. Props are decorative: use cube geometry for
-collision underneath large barriers.
+T also chooses a wall lamp, hanging lamp, utility box, pipe, rock, or a procedural
+tree. P places the chosen prop. Wall lamps align to walls; hanging lamps mount to
+ceilings, or stand two metres above an aimed floor. Lamp models are decoration:
+place a separate light node with L where illumination is needed. Light nodes have
+small editor-only markers and no physical fixture in play. They currently use a
+fixed downward light; configurable point and spot lighting is unfinished. Props
+are decorative: use cube geometry for collision underneath large barriers.
+Older Sauerteig worlds that relied on a lamp prop alone for illumination need a
+separate light node beside it.
 
-Press **Q** in edit mode to select objects. Click a prop, lamp, or spawn to select
+Press **Q** in edit mode to select objects. Click a prop, light marker, or spawn to select
 it; the object panel exposes position and yaw. Arrow keys move it by the current
 grid step, Shift+Up/Down moves vertically, R rotates 90°, H moves it to the aimed
 surface, and Insert duplicates it. Delete removes it. These actions share undo

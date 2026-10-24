@@ -21,6 +21,16 @@ pub enum LaunchAction {
     },
 }
 
+pub enum MenuAction {
+    Resume,
+    Launch(LaunchAction),
+}
+
+pub struct ActiveSession<'a> {
+    pub title: &'a str,
+    pub hosting_lan: bool,
+}
+
 pub struct Launcher {
     preferences: SessionPreferences,
     pub status: String,
@@ -102,6 +112,11 @@ impl Launcher {
         }
     }
 
+    pub fn open(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.refresh();
+    }
+
     fn remember(&mut self) {
         self.status = match self.preferences.save() {
             Ok(()) => String::new(),
@@ -180,7 +195,11 @@ impl Launcher {
         }
     }
 
-    pub fn ui(&mut self, ctx: &egui::Context, saving: bool) -> Option<LaunchAction> {
+    pub fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        current: Option<ActiveSession<'_>>,
+    ) -> Option<MenuAction> {
         let mut action = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::from_rgba_unmultiplied(11, 16, 18, 235)))
@@ -189,6 +208,7 @@ impl Launcher {
                 ui.vertical_centered(|ui| {
                     ui.add_space((ui.available_height() * 0.06).min(40.0));
                     ui.heading(egui::RichText::new("SAUERTEIG").size(30.0));
+                    ui.label("Main menu");
                     ui.add_space(22.0);
                 });
                 let body_height = ui.available_height().max(80.0);
@@ -200,12 +220,24 @@ impl Launcher {
                         egui::ScrollArea::vertical()
                             .max_height(body_height - 16.0)
                             .show(ui, |ui| {
-                                if saving {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label("Saving world and stopping server…");
-                                    });
-                                    return;
+                                if let Some(current) = &current {
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 40.0],
+                                            egui::Button::new(format!(
+                                                "Resume · {}",
+                                                current.title
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(MenuAction::Resume);
+                                    }
+                                    ui.weak("Your current world stays connected while you browse.");
+                                    if current.hosting_lan {
+                                        ui.weak("Switching worlds ends the hosted session.");
+                                    }
+                                    ui.add_space(16.0);
                                 }
                                 ui.label("Player name");
                                 let response = ui.add(
@@ -231,15 +263,20 @@ impl Launcher {
                                         );
                                     });
                                     ui.separator();
-                                    if !self.show_join {
-                                        action = self.worlds_ui(ui);
+                                    let launch = if !self.show_join {
+                                        self.worlds_ui(ui, current.is_some())
                                     } else {
-                                        action = self.join_ui(ui);
+                                        self.join_ui(ui)
+                                    };
+                                    if let Some(launch) = launch {
+                                        action = Some(MenuAction::Launch(launch));
                                     }
                                 }
                                 #[cfg(target_arch = "wasm32")]
                                 {
-                                    action = self.join_ui(ui);
+                                    if let Some(launch) = self.join_ui(ui) {
+                                        action = Some(MenuAction::Launch(launch));
+                                    }
                                     ui.add_space(12.0);
                                     ui.weak("To create a world, open the native Sauerteig app.");
                                 }
@@ -279,7 +316,7 @@ impl Launcher {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn worlds_ui(&mut self, ui: &mut egui::Ui) -> Option<LaunchAction> {
+    fn worlds_ui(&mut self, ui: &mut egui::Ui, session_active: bool) -> Option<LaunchAction> {
         let mut action = None;
         let last = self
             .preferences
@@ -287,7 +324,7 @@ impl Launcher {
             .as_ref()
             .and_then(|id| self.worlds.iter().find(|world| &world.id == id))
             .cloned();
-        if let Some(last) = last {
+        if let Some(last) = last.filter(|_| !session_active) {
             if ui
                 .add_sized(
                     [ui.available_width(), 36.0],
