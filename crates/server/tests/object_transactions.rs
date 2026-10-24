@@ -2,8 +2,9 @@
 
 use futures_util::{SinkExt, StreamExt};
 use sauerteig_core::{
-    Cell, CellEdit, CellFragment, ClientMessage, FineBox, ObjectEdit, ObjectKind, ObjectPlacement,
-    RootEdit, ServerMessage, Vec3, World, WorldBounds, WorldObject, WORLD_FORMAT_VERSION,
+    Cell, CellEdit, CellFragment, ClientMessage, FineBox, MaterialVolume, ObjectEdit, ObjectKind,
+    ObjectPlacement, RootEdit, ServerMessage, Vec3, VolumeEdit, VolumeMaterial, World, WorldBounds,
+    WorldObject, WORLD_FORMAT_VERSION,
 };
 use sauerteig_server::{serve, Config};
 use std::{
@@ -99,13 +100,13 @@ async fn join(url: &str) -> (Socket, u64, World, Vec<WorldObject>) {
             cells,
             roots,
             objects,
+            volumes,
             ..
-        } => (
-            socket,
-            revision,
-            World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap(),
-            objects,
-        ),
+        } => {
+            let mut world = World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap();
+            world.replace_volumes(&volumes).unwrap();
+            (socket, revision, world, objects)
+        }
         other => panic!("expected welcome, got {other:?}"),
     }
 }
@@ -158,7 +159,12 @@ async fn transaction_patch(
             revision: actual,
             roots,
             objects,
+            volumes,
         } => {
+            assert!(
+                volumes.is_none(),
+                "geometry/object edits must not retransmit the volume layer"
+            );
             assert_eq!(actual, revision);
             assert_eq!(roots, expected_roots);
             assert_eq!(objects, expected_objects);
@@ -189,6 +195,173 @@ async fn history_conflict(socket: &mut Socket) {
         ServerMessage::Error { message } => assert!(message.contains("later edit")),
         other => panic!("expected history conflict without any patch, got {other:?}"),
     }
+}
+
+async fn material_patch(
+    socket: &mut Socket,
+    revision: u64,
+    expected_roots: &[RootEdit],
+    expected_objects: &[WorldObject],
+    expected_volumes: &[MaterialVolume],
+) {
+    match event(socket).await {
+        ServerMessage::TransactionPatch {
+            revision: actual,
+            roots,
+            objects,
+            volumes: Some(volumes),
+        } => {
+            assert_eq!(actual, revision);
+            assert_eq!(roots, expected_roots);
+            assert_eq!(objects, expected_objects);
+            assert_eq!(volumes, expected_volumes);
+        }
+        other => panic!("expected atomic material transaction, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn material_geometry_and_objects_share_multiplayer_history_and_saved_reopen() {
+    let temporary = TemporaryWorld::new();
+    let config = Config {
+        world_path: temporary.0.join("world.json"),
+        web_dir: temporary.0.join("web"),
+        editing_allowed: true,
+    };
+    std::fs::write(
+        &config.world_path,
+        br#"{"revision":0,"cells":[],"objects":[]}"#,
+    )
+    .unwrap();
+    let (url, shutdown, server) = start(config.clone()).await;
+    let (mut first, revision, original, _) = join(&url).await;
+    assert_eq!(revision, 0);
+    assert!(original.volumes().is_empty());
+    let (mut second, _, _, _) = join(&url).await;
+    edit_mode(&mut first).await;
+    edit_mode(&mut second).await;
+    let geometry = vec![root([8, 1, 8], Some(Cell::solid(2)))];
+    let removal = vec![root([8, 1, 8], None)];
+    let lamp = ObjectPlacement {
+        kind: ObjectKind::Light,
+        position: Vec3::new(8.5, 3.5, 8.5),
+        rotation: 0.5,
+    };
+    let objects = vec![WorldObject {
+        id: 1,
+        kind: lamp.kind,
+        position: lamp.position,
+        rotation: lamp.rotation,
+    }];
+    let water = MaterialVolume {
+        bounds: FineBox {
+            min: [64, 8, 64],
+            max: [80, 32, 80],
+        },
+        material: VolumeMaterial::Water,
+    };
+    let glass = MaterialVolume {
+        bounds: FineBox {
+            min: [80, 8, 64],
+            max: [81, 32, 80],
+        },
+        material: VolumeMaterial::Glass,
+    };
+    let volumes = vec![water, glass];
+    send(
+        &mut first,
+        ClientMessage::EditTransaction {
+            request: 1,
+            base_revision: 0,
+            roots: geometry.clone(),
+            objects: vec![ObjectEdit::Create { object: lamp }],
+            volumes: volumes
+                .iter()
+                .map(|volume| VolumeEdit {
+                    bounds: volume.bounds,
+                    material: Some(volume.material),
+                })
+                .collect(),
+        },
+    )
+    .await;
+    material_patch(&mut first, 1, &geometry, &objects, &volumes).await;
+    result(&mut first, 1, true).await;
+    material_patch(&mut second, 1, &geometry, &objects, &volumes).await;
+    send(&mut first, ClientMessage::Undo).await;
+    material_patch(&mut first, 2, &removal, &[], &[]).await;
+    material_patch(&mut second, 2, &removal, &[], &[]).await;
+    send(&mut first, ClientMessage::Redo).await;
+    material_patch(&mut first, 3, &geometry, &objects, &volumes).await;
+    material_patch(&mut second, 3, &geometry, &objects, &volumes).await;
+
+    send(
+        &mut second,
+        ClientMessage::EditTransaction {
+            request: 1,
+            base_revision: 3,
+            roots: vec![],
+            objects: vec![],
+            volumes: vec![VolumeEdit {
+                bounds: glass.bounds,
+                material: None,
+            }],
+        },
+    )
+    .await;
+    material_patch(&mut second, 4, &[], &objects, &[water]).await;
+    result(&mut second, 1, true).await;
+    material_patch(&mut first, 4, &[], &objects, &[water]).await;
+    history_conflict(&mut first).await;
+    send(&mut second, ClientMessage::Undo).await;
+    material_patch(&mut second, 5, &[], &objects, &volumes).await;
+    material_patch(&mut first, 5, &[], &objects, &volumes).await;
+    // Restoring the same layer restores undo ownership, but stale transactions
+    // still cannot replace it or partially commit their geometry.
+    send(
+        &mut first,
+        ClientMessage::EditTransaction {
+            request: 2,
+            base_revision: 3,
+            roots: vec![root([9, 1, 9], Some(Cell::solid(1)))],
+            objects: vec![],
+            volumes: vec![VolumeEdit {
+                bounds: water.bounds,
+                material: None,
+            }],
+        },
+    )
+    .await;
+    result(&mut first, 2, false).await;
+    send(&mut first, ClientMessage::Undo).await;
+    material_patch(&mut first, 6, &removal, &[], &[]).await;
+    material_patch(&mut second, 6, &removal, &[], &[]).await;
+    send(&mut first, ClientMessage::Redo).await;
+    material_patch(&mut first, 7, &geometry, &objects, &volumes).await;
+    material_patch(&mut second, 7, &geometry, &objects, &volumes).await;
+    first.close(None).await.unwrap();
+    second.close(None).await.unwrap();
+    stop(shutdown, server).await;
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config.world_path).unwrap()).unwrap();
+    assert_eq!(saved["format_version"], 3);
+    assert_eq!(saved["volumes"].as_array().unwrap().len(), 2);
+    let (url, shutdown, server) = start(config).await;
+    let (mut rejoined, revision, restored, restored_objects) = join(&url).await;
+    assert_eq!(revision, 7);
+    assert_eq!(restored.volumes(), volumes);
+    assert_eq!(restored_objects, objects);
+    assert_eq!(restored.get([8, 1, 8]), Some(Cell::solid(2)));
+    assert!(restored.get([9, 1, 9]).is_none());
+    assert_eq!(restored.volume_material_at(Vec3::new(8.5, 1.5, 8.5)), None);
+    assert_eq!(
+        restored.volume_material_at(Vec3::new(9.5, 2.0, 8.5)),
+        Some(VolumeMaterial::Water)
+    );
+    assert!(restored.intersects_solid_volume(Vec3::new(10.01, 2.0, 8.5), Vec3::new(10.1, 2.5, 8.9)));
+    rejoined.close(None).await.unwrap();
+    stop(shutdown, server).await;
 }
 
 #[tokio::test]
@@ -247,6 +420,7 @@ async fn mixed_edits_are_atomic_conflict_safe_and_persist_through_rejoin() {
     send(
         &mut first,
         ClientMessage::EditTransaction {
+            volumes: Vec::new(),
             request: 1,
             base_revision: 0,
             roots: geometry.clone(),
@@ -278,6 +452,7 @@ async fn mixed_edits_are_atomic_conflict_safe_and_persist_through_rejoin() {
     send(
         &mut second,
         ClientMessage::EditTransaction {
+            volumes: Vec::new(),
             request: 1,
             base_revision: 3,
             roots: vec![],
@@ -297,6 +472,7 @@ async fn mixed_edits_are_atomic_conflict_safe_and_persist_through_rejoin() {
     send(
         &mut first,
         ClientMessage::EditTransaction {
+            volumes: Vec::new(),
             request: 2,
             base_revision: 3,
             roots: vec![root([9, 1, 8], Some(Cell::solid(5)))],
@@ -331,6 +507,7 @@ async fn mixed_edits_are_atomic_conflict_safe_and_persist_through_rejoin() {
     send(
         &mut second,
         ClientMessage::EditTransaction {
+            volumes: Vec::new(),
             request: 2,
             base_revision: 7,
             roots: vec![],
@@ -447,6 +624,7 @@ async fn compact_base_empty_override_and_objects_survive_save_and_rejoin() {
     send(
         &mut builder,
         ClientMessage::EditTransaction {
+            volumes: Vec::new(),
             request: 1,
             base_revision: 0,
             roots: empty_override.clone(),

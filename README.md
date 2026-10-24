@@ -67,7 +67,7 @@ blueprints, and **F2** opens settings, including scroll inversion.
 - [Materials](assets/materials/README.md), [props](assets/props/README.md), and [art direction](research/assets.md)
 
 Sauerteig is a playable prototype. **Legacy import is partial:** supported cube
-geometry and light/spawn positions can be loaded, but original textures, models,
+geometry, water/glass volumes, and light/spawn positions can be loaded, but original textures, models,
 light properties, and gameplay entities are not restored. A map opening
 successfully is not evidence of visual or gameplay fidelity. See the
 [importer's limitations](crates/importer/README.md#appearance-and-entities).

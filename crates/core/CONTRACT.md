@@ -49,6 +49,27 @@ boundaries; meshing can retain partially occluded triangles hidden by depth
 buffering. Corner-deforming a clipped source is rejected when the result cannot
 be represented by one editable cell.
 
+## Material volumes
+
+`World::volumes()` stores a separate sparse layer of disjoint `MaterialVolume`
+boxes on the same eighth-metre grid. A region is either water or glass; absence
+means normal space. Ordered `VolumeEdit` operations paint or clear that layer
+without changing solid geometry. Exact adjacent boxes coalesce. Validation and
+spatial indexing keep large regions compact. A world may store at most 16,384
+material boxes; an edit may contain at most 32,768 changes, allowing a maximum
+paste to clear its destination. `MAX_VOLUME_FACE_CONTACTS` limits equal-material
+pairs sharing a positive-area face to 65,536, bounding the exterior mesh generated
+by partially touching regions. Edge and point contacts do not count, and water/
+glass interfaces remain visible without shared-face subtraction. Intermediate
+splitting is bounded and rejects excessive detail before mutating the world.
+
+Volume assignments may overlap solid terrain. Terrain takes precedence when
+querying a point's material, so a wall inside water is not swimming space. Glass
+has axis-aligned collision and blocks combat rays, rockets, and blast visibility.
+Water is non-solid. The shared movement step queries the player's torso to apply
+drag, reduced gravity, and upward swimming while jump is held. Rendering queries
+the eye separately for underwater tint. Edit-mode flight ignores both effects.
+
 ## Shared edits and history
 
 The server owns world revisions and validates every edit. Edits require edit
@@ -66,8 +87,15 @@ that restored lineage and reinstates the original operation token. Public world
 revisions always increase. A changed edit clears the player's redo stack.
 History is bounded by both operation count and geometry complexity.
 
-`EditTransaction` validates geometry and object mutations together before applying
-either, and broadcasts one `TransactionPatch`. Paste receives fresh object IDs;
+`EditTransaction` validates geometry, object mutations, and volume edits together
+before applying any, and broadcasts one `TransactionPatch`. New glass cannot
+intersect an active fighter. Volume history stores the before/after layer and
+counts toward the history complexity limit. It currently uses one global
+conflict/ownership clock: even a distant intervening volume edit rejects a stale
+volume edit or undo. Ordinary geometry and object edits retain their existing
+per-root/per-object conflict checks. `TransactionPatch.volumes` is the complete
+replacement layer when changed, omitted otherwise; `Welcome` includes the full
+layer. Paste receives fresh object IDs;
 undo removes those objects, while redo restores the same identities. ID allocation
 is persisted so deleted identities are not reused after a restart.
 
@@ -104,8 +132,10 @@ validation code in [`crates/server`](../server/src/).
 
 ## Persistence and objects
 
-Version 2 world saves contain `revision`, `bounds`, compact `regions`, coarse
-`cells`, detailed or empty `roots`, `objects`, and `next_object`. Older saves can
+Version 3 world saves contain `revision`, `bounds`, compact `regions`, coarse
+`cells`, detailed or empty `roots`, `volumes`, `objects`, and `next_object`.
+The loader accepts previous versions; omitted `volumes` means normal space.
+Older saves can
 omit the version and new fields, as well as cell `shape`, `diagonal`, and
 `face_materials`; their original fixed bounds and uniform material still apply.
 Loading validates geometry, limits, and unique positions/object IDs before

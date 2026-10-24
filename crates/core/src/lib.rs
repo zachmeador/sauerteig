@@ -5,6 +5,7 @@ mod fine;
 mod geometry;
 mod physics;
 mod protocol;
+mod volumes;
 mod world;
 
 pub use compact::{
@@ -15,6 +16,7 @@ pub use fine::*;
 pub use glam::Vec3;
 pub use physics::*;
 pub use protocol::*;
+pub use volumes::*;
 pub use world::*;
 
 pub const CHUNK_SIZE: i32 = 8;

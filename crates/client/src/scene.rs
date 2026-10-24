@@ -10,6 +10,8 @@ pub struct Geometry {
     pub indices: Vec<u32>,
     /// Leading indices containing physical geometry that casts dynamic shadows.
     pub shadow_index_count: u32,
+    /// Actors and effects rendered before transparent material boundaries.
+    pub opaque_index_count: u32,
 }
 impl Geometry {
     pub fn triangle(&mut self, a: Vec3, b: Vec3, c: Vec3, color: [f32; 3], emission: f32) {

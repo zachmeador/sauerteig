@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const WORLD_FORMAT_VERSION: u32 = 2;
+pub const WORLD_FORMAT_VERSION: u32 = 3;
 pub const MAX_COMPACT_REGIONS: usize = 400_000;
 pub const MAX_QUERY_ROOTS: usize = 32_768;
 /// Bound GPU uploads and remeshing after repeated local cuts in a source batch.

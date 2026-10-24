@@ -79,7 +79,7 @@ fn empty_override_is_a_real_hole_after_save_and_undo() {
     assert_eq!(hit.face, 0);
     assert_eq!(hit.pos, [1001, 2000, 1000]);
     let json = serde_json::to_value(&world).unwrap();
-    assert_eq!(json["format_version"], 2);
+    assert_eq!(json["format_version"], WORLD_FORMAT_VERSION);
     assert_eq!(json["regions"].as_array().unwrap().len(), 1);
     assert_eq!(json["roots"].as_array().unwrap().len(), 1);
     let mut restored: World = serde_json::from_value(json).unwrap();
@@ -131,7 +131,7 @@ fn overlapping_regions_and_out_of_bounds_data_are_rejected() {
     assert!(World::from_compact_parts(WorldBounds::default(), &[a.clone(), a], &[], &[]).is_err());
     let a = region([8192 * 8, 0, 0], 8, Cell::solid(1));
     assert!(World::from_compact_parts(WorldBounds::default(), &[a], &[], &[]).is_err());
-    let json = r#"{"format_version":3,"bounds":{"min":[0,0,0],"max":[8,8,8]},"regions":[],"cells":[],"roots":[]}"#;
+    let json = r#"{"format_version":4,"bounds":{"min":[0,0,0],"max":[8,8,8]},"regions":[],"cells":[],"roots":[]}"#;
     assert!(serde_json::from_str::<World>(json).is_err());
 }
 #[test]

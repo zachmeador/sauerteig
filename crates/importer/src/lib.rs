@@ -46,6 +46,8 @@ pub struct Cube {
     pub kind: u8,
     pub edges: [u8; 12],
     pub textures: [u16; 6],
+    /// Original on-disk value. Versions 29–32 use a packed byte; version 33
+    /// uses the indexed ushort layout. Keep this value for source inspection.
     pub volume_material: u16,
 }
 impl Cube {
@@ -54,6 +56,17 @@ impl Cube {
     }
     pub fn is_solid(&self) -> bool {
         self.kind == 2 || self.edges == [0x80; 12]
+    }
+
+    /// Translate the older byte layout into the version-33 material bit fields.
+    /// Volume (bits 2–4), clip (5–7), and flags (8–15) remain independent.
+    pub fn normalized_material(&self, version: u32) -> u16 {
+        let material = self.volume_material;
+        if version <= 32 {
+            ((material & 7) << 2) | (((material >> 3) & 3) << 5) | (((material >> 5) & 7) << 8)
+        } else {
+            material
+        }
     }
 }
 #[derive(Clone, Debug, Serialize)]
@@ -79,7 +92,10 @@ pub struct Inventory {
     pub occupied_cube_bounds: Option<[[i32; 3]; 2]>,
     pub leaf_sizes: BTreeMap<u32, usize>,
     pub texture_slot_faces: BTreeMap<u16, usize>,
+    /// Raw source values, retained for comparison with the original map.
     pub volume_material_leaves: BTreeMap<u16, usize>,
+    /// Version-independent material values in the version-33 bit layout.
+    pub normalized_material_leaves: BTreeMap<u16, usize>,
     pub variables: BTreeMap<String, serde_json::Value>,
     pub entities: Vec<Entity>,
     pub vslots: Vec<VSlot>,
@@ -98,6 +114,7 @@ impl Map {
             leaf_sizes: BTreeMap::new(),
             texture_slot_faces: BTreeMap::new(),
             volume_material_leaves: BTreeMap::new(),
+            normalized_material_leaves: BTreeMap::new(),
             variables: self.variables.clone(),
             entities: self.entities.clone(),
             vslots: self.vslots.clone(),
@@ -107,6 +124,10 @@ impl Map {
                 *result
                     .volume_material_leaves
                     .entry(cube.volume_material)
+                    .or_default() += 1;
+                *result
+                    .normalized_material_leaves
+                    .entry(cube.normalized_material(self.header.version))
                     .or_default() += 1;
             }
             if cube.is_empty() {
@@ -624,6 +645,52 @@ mod tests {
             assert_eq!(map.cubes[7].origin, [8, 8, 8]);
             assert_eq!(map.cubes[0].textures, [7; 6]);
         }
+    }
+
+    #[test]
+    fn reads_and_normalizes_materials_in_every_supported_version() {
+        for version in 29..=33 {
+            for (old, current) in [(1u8, 4u16), (19, 76), (34, 264), (136, 1056)] {
+                let mut data = fixture(version);
+                let octree = if version == 29 { 36 } else { 40 } + 11;
+                data[octree] = 1; // An empty geometry leaf can still hold a volume.
+                let raw = if version <= 32 {
+                    u16::from(old)
+                } else {
+                    current
+                };
+                if version <= 31 {
+                    data.splice(octree + 13..octree + 14, [0x80, old]);
+                } else {
+                    data[octree] |= 0x40;
+                    let bytes = if version == 32 {
+                        vec![old]
+                    } else {
+                        current.to_le_bytes().to_vec()
+                    };
+                    data.splice(octree + 13..octree + 13, bytes);
+                }
+                let map = read_octa(&data).unwrap();
+                assert!(map.cubes[0].is_empty());
+                assert_eq!(map.cubes[0].volume_material, raw);
+                assert_eq!(map.cubes[0].normalized_material(version), current);
+                assert_eq!(map.inventory().volume_material_leaves[&raw], 1);
+                assert_eq!(map.inventory().normalized_material_leaves[&current], 1);
+                assert_eq!(map.octree_end_offset, data.len());
+            }
+        }
+    }
+
+    #[test]
+    fn version_33_preserves_material_indices_and_high_flags() {
+        let mut data = fixture(33);
+        let octree = 40 + 11;
+        data[octree] |= 0x40;
+        let material = 0x854fu16; // glass4, clip, and independent high flags.
+        data.splice(octree + 13..octree + 13, material.to_le_bytes());
+        let map = read_octa(&data).unwrap();
+        assert_eq!(map.cubes[0].normalized_material(33), material);
+        assert_eq!(map.octree_end_offset, data.len());
     }
     #[test]
     fn every_truncated_prefix_is_an_error_without_panic() {

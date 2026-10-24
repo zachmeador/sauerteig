@@ -3,8 +3,8 @@
 use crate::regions::{RegionBox, RegionSet};
 use sauerteig_core::{
     canonical_root_fragments, validate_root_edits, Cell, CellEdit, CellFragment, CellPos, FineBox,
-    ObjectPlacement, RayHit, RootEdit, Shape, Vec3, World, WorldObject, MATERIAL_COLORS,
-    SHAPE_FACES,
+    MaterialVolume, ObjectPlacement, RayHit, RootEdit, Shape, Vec3, VolumeEdit, VolumeMaterial,
+    World, WorldObject, MATERIAL_COLORS, MAX_MATERIAL_VOLUMES, SHAPE_FACES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
@@ -34,6 +34,7 @@ pub struct EditPlan {
     /// Kept for the legacy protocol adapter; fine plans use roots exclusively.
     pub edits: Vec<CellEdit>,
     pub roots: Vec<RootEdit>,
+    pub volumes: Vec<VolumeEdit>,
     pub selection_after: EditSelection,
 }
 
@@ -47,6 +48,8 @@ pub struct Clipboard {
     /// Object pivots relative to the clipboard origin, in world metres.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     objects: Vec<ObjectPlacement>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    volumes: Vec<MaterialVolume>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditError {
@@ -61,6 +64,7 @@ pub enum EditError {
     ClippedShape,
     NoChanges,
     InvalidObject,
+    InvalidVolume,
 }
 impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -76,6 +80,7 @@ impl fmt::Display for EditError {
             Self::ClippedShape => "This clipped slope retains its original shape. Shape the complete source cell, or add a new fine cube here.",
             Self::NoChanges => "The selected space already has that shape or material.",
             Self::InvalidObject => "An object has an invalid position or rotation in this blueprint.",
+            Self::InvalidVolume => "Material volumes must have valid, non-overlapping bounds inside the selection.",
         })
     }
 }
@@ -332,6 +337,37 @@ impl EditSelection {
             self.with_plane(plane)?,
             true,
         )
+    }
+    pub fn plan_volume_regions(
+        &self,
+        world: &World,
+        mask: &RegionSet,
+        material: Option<VolumeMaterial>,
+    ) -> Result<EditPlan, EditError> {
+        self.validate()?;
+        if mask.boxes().is_empty() {
+            return Err(EditError::InvalidSelection);
+        }
+        let volumes = mask
+            .boxes()
+            .iter()
+            .map(|bounds| VolumeEdit {
+                bounds: fine(*bounds),
+                material,
+            })
+            .collect::<Vec<_>>();
+        let result = world
+            .prepare_volume_edits(&volumes)
+            .map_err(|_| EditError::InvalidVolume)?;
+        if result == world.volumes() {
+            return Err(EditError::NoChanges);
+        }
+        Ok(EditPlan {
+            edits: Vec::new(),
+            roots: Vec::new(),
+            volumes,
+            selection_after: self.clone(),
+        })
     }
     pub fn plan_carve(&self, world: &World) -> Result<EditPlan, EditError> {
         let bounds = self
@@ -716,6 +752,7 @@ fn replace(
     Ok(EditPlan {
         edits: Vec::new(),
         roots: edits,
+        volumes: Vec::new(),
         selection_after,
     })
 }
@@ -751,6 +788,21 @@ impl Clipboard {
             .map(|f| translated_fragment(f, offset))
             .collect::<Result<_, _>>()?;
         let origin = Vec3::from_array(bounds.min.map(|v| v as f32 / 8.0));
+        let mut volumes = Vec::new();
+        for selected in selection.boxes() {
+            for volume in world.volume_regions(fine(*selected)) {
+                if volumes.len() >= MAX_MATERIAL_VOLUMES {
+                    return Err(EditError::TooLarge);
+                }
+                volumes.push(MaterialVolume {
+                    bounds: FineBox {
+                        min: translate(volume.bounds.min, offset)?,
+                        max: translate(volume.bounds.max, offset)?,
+                    },
+                    material: volume.material,
+                });
+            }
+        }
         let objects = objects
             .iter()
             .filter(|object| contains_object_pivot(selection, object.position, false))
@@ -770,6 +822,7 @@ impl Clipboard {
             mask,
             fragments,
             objects,
+            volumes,
         };
         result.validate()?;
         Ok(result)
@@ -782,6 +835,9 @@ impl Clipboard {
     }
     pub fn objects(&self) -> &[ObjectPlacement] {
         &self.objects
+    }
+    pub fn volumes(&self) -> &[MaterialVolume] {
+        &self.volumes
     }
     /// Resolve object preview or transaction placements from an eighth-metre
     /// destination. IDs are allocated by the server when the paste is accepted.
@@ -816,6 +872,24 @@ impl Clipboard {
         }
         if self.fragments.len() > MAX_EDIT_FRAGMENTS || self.objects.len() > MAX_CLIPBOARD_OBJECTS {
             return Err(EditError::TooLarge);
+        }
+        if self.volumes.len() > MAX_MATERIAL_VOLUMES {
+            return Err(EditError::TooLarge);
+        }
+        sauerteig_core::validate_material_volumes(
+            &self.volumes,
+            FineBox {
+                min: [0; 3],
+                max: self.dims,
+            },
+        )
+        .map_err(|_| EditError::InvalidVolume)?;
+        if self
+            .volumes
+            .iter()
+            .any(|volume| !self.mask.covers(region(volume.bounds)))
+        {
+            return Err(EditError::InvalidVolume);
         }
         for object in &self.objects {
             // Reflection carries a pivot on a lower face onto the upper face.
@@ -899,6 +973,13 @@ impl Clipboard {
             object.position = Vec3::new(old.z, old.y, width as f32 / 8.0 - old.x);
             object.rotation = normalized_yaw(object.rotation + std::f32::consts::FRAC_PI_2);
         }
+        for volume in &mut result.volumes {
+            let old = volume.bounds;
+            volume.bounds = FineBox {
+                min: [old.min[2], old.min[1], width - old.max[0]],
+                max: [old.max[2], old.max[1], width - old.min[0]],
+            };
+        }
         result.validate()?;
         *self = result;
         Ok(())
@@ -947,6 +1028,11 @@ impl Clipboard {
                 std::f32::consts::PI - object.rotation
             });
         }
+        for volume in &mut result.volumes {
+            let lower = volume.bounds.min[axis];
+            volume.bounds.min[axis] = length - volume.bounds.max[axis];
+            volume.bounds.max[axis] = length - lower;
+        }
         result.validate()?;
         *self = result;
         Ok(())
@@ -989,14 +1075,42 @@ impl Clipboard {
         {
             return Err(EditError::OutsideWorld);
         }
-        match replace(world, &mask, fragments, selection_after.clone(), true) {
-            Err(EditError::NoChanges) if !self.objects.is_empty() => Ok(EditPlan {
-                edits: Vec::new(),
-                roots: Vec::new(),
-                selection_after,
-            }),
-            result => result,
+        let mut volumes = mask
+            .boxes()
+            .iter()
+            .map(|bounds| VolumeEdit {
+                bounds: fine(*bounds),
+                material: None,
+            })
+            .collect::<Vec<_>>();
+        for volume in &self.volumes {
+            volumes.push(VolumeEdit {
+                bounds: FineBox {
+                    min: translate(volume.bounds.min, selection.min)?,
+                    max: translate(volume.bounds.max, selection.min)?,
+                },
+                material: Some(volume.material),
+            });
         }
+        let next = world
+            .prepare_volume_edits(&volumes)
+            .map_err(|_| EditError::InvalidVolume)?;
+        if next == world.volumes() {
+            volumes.clear();
+        }
+        let mut plan = match replace(world, &mask, fragments, selection_after.clone(), true) {
+            Err(EditError::NoChanges) if !self.objects.is_empty() || !volumes.is_empty() => {
+                Ok(EditPlan {
+                    edits: Vec::new(),
+                    roots: Vec::new(),
+                    volumes: Vec::new(),
+                    selection_after,
+                })
+            }
+            result => result,
+        }?;
+        plan.volumes = volumes;
+        Ok(plan)
     }
 }
 impl<'de> Deserialize<'de> for Clipboard {
@@ -1008,6 +1122,8 @@ impl<'de> Deserialize<'de> for Clipboard {
             fragments: Vec<CellFragment>,
             #[serde(default)]
             objects: Vec<ObjectPlacement>,
+            #[serde(default)]
+            volumes: Vec<MaterialVolume>,
         }
         let raw = Raw::deserialize(deserializer)?;
         let result = Self {
@@ -1015,6 +1131,7 @@ impl<'de> Deserialize<'de> for Clipboard {
             mask: raw.mask,
             fragments: raw.fragments,
             objects: raw.objects,
+            volumes: raw.volumes,
         };
         result.validate().map_err(serde::de::Error::custom)?;
         Ok(result)
@@ -1383,6 +1500,7 @@ mod tests {
     }
     fn apply(world: &mut World, plan: &EditPlan) {
         world.apply_root_edits(&plan.roots).unwrap();
+        world.apply_volume_edits(&plan.volumes).unwrap();
     }
     fn mask(boxes: &[(CellPos, CellPos)]) -> RegionSet {
         RegionSet::from_boxes(
@@ -1391,6 +1509,191 @@ mod tests {
                 .map(|&(min, max)| RegionBox::new(min, max).unwrap()),
         )
         .unwrap()
+    }
+    fn material_volume(min: CellPos, max: CellPos, material: VolumeMaterial) -> MaterialVolume {
+        MaterialVolume {
+            bounds: FineBox { min, max },
+            material,
+        }
+    }
+    #[test]
+    fn material_assignment_uses_sparse_selection_and_preserves_solid_geometry() {
+        let mut world = World::empty();
+        world.set([0; 3], Some(Cell::solid(2)));
+        let solids = world.cells();
+        let selected = selection([0; 3], [8; 3], 1, 1, 8);
+        let mask = mask(&[([0; 3], [8; 3]), ([128, 0, 128], [384, 128, 384])]);
+        let plan = selected
+            .plan_volume_regions(&world, &mask, Some(VolumeMaterial::Water))
+            .unwrap();
+        assert!(plan.roots.is_empty());
+        assert_eq!(plan.volumes.len(), 2);
+        apply(&mut world, &plan);
+        assert_eq!(world.cells(), solids);
+        assert_eq!(world.volumes().len(), 2);
+        assert_eq!(world.volume_material_at(Vec3::splat(0.5)), None);
+        assert_eq!(
+            world.volume_material_at(Vec3::new(24.0, 1.0, 24.0)),
+            Some(VolumeMaterial::Water)
+        );
+        assert_eq!(world.volume_material_at(Vec3::new(10.0, 1.0, 10.0)), None);
+        assert_eq!(
+            selected
+                .plan_volume_regions(&world, &mask, Some(VolumeMaterial::Water))
+                .unwrap_err(),
+            EditError::NoChanges
+        );
+        let clear = selected.plan_volume_regions(&world, &mask, None).unwrap();
+        apply(&mut world, &clear);
+        assert!(world.volumes().is_empty());
+        assert_eq!(world.cells(), solids);
+    }
+    #[test]
+    fn material_copy_clips_to_selection_and_transforms_with_blueprint() {
+        let mut world = World::empty();
+        world
+            .replace_volumes(&[material_volume(
+                [-8, 0, -8],
+                [48, 16, 48],
+                VolumeMaterial::Water,
+            )])
+            .unwrap();
+        let clip = Clipboard::copy_regions(
+            &world,
+            &mask(&[([0; 3], [8, 16, 8]), ([24, 0, 16], [32, 8, 24])]),
+        )
+        .unwrap();
+        assert_eq!(clip.volumes.len(), 2);
+        assert_eq!(
+            clip.volumes[0].bounds,
+            FineBox {
+                min: [0; 3],
+                max: [8, 16, 8]
+            }
+        );
+        assert_eq!(
+            clip.volumes[1].bounds,
+            FineBox {
+                min: [24, 0, 16],
+                max: [32, 8, 24]
+            }
+        );
+        let mut rotated = clip.clone();
+        rotated.rotate_y().unwrap();
+        assert_eq!(
+            rotated.volumes[0].bounds,
+            FineBox {
+                min: [0, 0, 24],
+                max: [8, 16, 32]
+            }
+        );
+        assert_eq!(
+            rotated.volumes[1].bounds,
+            FineBox {
+                min: [16, 0, 0],
+                max: [24, 8, 8]
+            }
+        );
+        for _ in 0..3 {
+            rotated.rotate_y().unwrap();
+        }
+        assert_eq!(rotated, clip);
+        let mut mirrored = clip.clone();
+        mirrored.mirror(0).unwrap();
+        assert_eq!(
+            mirrored.volumes[0].bounds,
+            FineBox {
+                min: [24, 0, 0],
+                max: [32, 16, 8]
+            }
+        );
+        mirrored.mirror(0).unwrap();
+        assert_eq!(mirrored, clip);
+        let restored: Clipboard =
+            serde_json::from_value(serde_json::to_value(&clip).unwrap()).unwrap();
+        assert_eq!(restored, clip);
+    }
+    #[test]
+    fn paste_replaces_materials_and_normal_space_only_inside_selected_union() {
+        let mut world = World::empty();
+        world
+            .replace_volumes(&[
+                material_volume([0; 3], [8; 3], VolumeMaterial::Glass),
+                material_volume([80, 0, 0], [120, 8, 8], VolumeMaterial::Water),
+            ])
+            .unwrap();
+        let clip =
+            Clipboard::copy_regions(&world, &mask(&[([0; 3], [8; 3]), ([16, 0, 0], [24, 8, 8])]))
+                .unwrap();
+        let target = selection([80, 0, 0], [88, 8, 8], 1, 1, 8);
+        let plan = clip.plan_paste(&world, &target).unwrap();
+        assert!(plan.roots.is_empty());
+        apply(&mut world, &plan);
+        assert_eq!(
+            world.volume_material_at(Vec3::new(10.5, 0.5, 0.5)),
+            Some(VolumeMaterial::Glass)
+        );
+        assert_eq!(
+            world.volume_material_at(Vec3::new(11.5, 0.5, 0.5)),
+            Some(VolumeMaterial::Water)
+        );
+        assert_eq!(world.volume_material_at(Vec3::new(12.5, 0.5, 0.5)), None);
+        assert_eq!(
+            world.volume_material_at(Vec3::new(13.5, 0.5, 0.5)),
+            Some(VolumeMaterial::Water)
+        );
+        assert_eq!(
+            clip.plan_paste(&world, &target).unwrap_err(),
+            EditError::NoChanges
+        );
+    }
+    #[test]
+    fn clipboard_rejects_overlapping_materials_and_materials_in_selection_gaps() {
+        let mut world = World::empty();
+        world
+            .replace_volumes(&[material_volume([0; 3], [8; 3], VolumeMaterial::Glass)])
+            .unwrap();
+        let clip =
+            Clipboard::copy_regions(&world, &mask(&[([0; 3], [8; 3]), ([16, 0, 0], [24, 8, 8])]))
+                .unwrap();
+        let valid = serde_json::to_value(&clip).unwrap();
+        let mut bad = valid.clone();
+        bad["volumes"]
+            .as_array_mut()
+            .unwrap()
+            .push(valid["volumes"][0].clone());
+        assert!(serde_json::from_value::<Clipboard>(bad).is_err());
+        let mut bad = valid.clone();
+        bad["volumes"][0]["bounds"] = serde_json::json!({"min":[8,0,0],"max":[16,8,8]});
+        assert!(serde_json::from_value::<Clipboard>(bad).is_err());
+        let mut legacy = valid;
+        legacy.as_object_mut().unwrap().remove("volumes");
+        assert!(serde_json::from_value::<Clipboard>(legacy)
+            .unwrap()
+            .volumes
+            .is_empty());
+    }
+    #[test]
+    fn crossing_materials_and_selection_strips_stop_at_the_clipboard_limit() {
+        let mut world = World::empty();
+        world
+            .replace_volumes(
+                &(0..128)
+                    .map(|x| {
+                        material_volume([x * 2, 0, 0], [x * 2 + 1, 8, 258], VolumeMaterial::Water)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let selected = mask(
+            &(0..129)
+                .map(|z| ([0, 0, z * 2], [256, 8, z * 2 + 1]))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            Clipboard::copy_regions(&world, &selected).unwrap_err(),
+            EditError::TooLarge
+        );
     }
     #[test]
     fn fine_grid_selects_inside_every_face_at_distant_coordinates() {

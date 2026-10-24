@@ -97,7 +97,7 @@ need HTTPS, with `/ws` proxied as a secure WebSocket. The browser accepts `name`
 and `server` query parameters; an alternate server URL must include `/ws`.
 Names are display labels, with no account authentication.
 
-Shared geometry and objects live in the server's JSON save. Blueprints and
+Shared geometry, material volumes, and objects live in the server's JSON save. Blueprints and
 settings are client-local: IndexedDB for the browser's site origin, or the OS
 application-data folder on desktop. Remembered browser session choices use
 localStorage for that origin. On macOS the application-data folder is
@@ -112,6 +112,16 @@ batches, local chunks, and their face neighbors; raycasts and collision use the
 same cell shapes. Camera and shadow passes cull using actual mesh bounds.
 The [core contract](../crates/core/CONTRACT.md) describes the geometry and protocol
 invariants.
+
+Water and glass occupy a separate sparse layer of disjoint eighth-metre boxes.
+Volume edits rebuild cached boundary meshes; contiguous regions of the same
+material omit internal faces. Transparent faces are culled and sorted behind
+opaque geometry using the same depth buffer. This is alpha blending, with
+procedural water motion and glass tint rather than scene refraction or reflected
+scene captures. Material regions do not cast opaque shadows. Keep intersecting
+transparent regions and large visible water surfaces in runtime checks: sorting
+uses face centers and can show ordering artifacts for overlapping views of large
+faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
 
 Lighting is dynamic. The sun shadow window follows the player with texel-snapped
 motion; eight nearby light nodes cast shadows with 512 px maps and light-volume

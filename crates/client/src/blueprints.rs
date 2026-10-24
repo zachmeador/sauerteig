@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 
-pub const BLUEPRINT_VERSION: u32 = 2;
+pub const BLUEPRINT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Blueprint {
@@ -222,7 +222,9 @@ mod tests {
         editor::EditSelection,
         regions::{RegionBox, RegionSet},
     };
-    use sauerteig_core::{Cell, ObjectKind, Vec3, World, WorldObject};
+    use sauerteig_core::{
+        Cell, FineBox, MaterialVolume, ObjectKind, Vec3, VolumeMaterial, World, WorldObject,
+    };
     fn captured() -> Clipboard {
         let mut world = World::empty();
         world.set([0, 0, 0], Some(Cell::solid(2)));
@@ -262,7 +264,7 @@ mod tests {
         library.save("Room", "Test", captured()).unwrap();
         let json = library.to_json().unwrap();
         assert_eq!(BlueprintLibrary::from_json(&json).unwrap(), library);
-        let future = json.replacen("\"version\":2", "\"version\":3", 1);
+        let future = json.replacen("\"version\":3", "\"version\":4", 1);
         assert!(BlueprintLibrary::from_json(&future).is_err());
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let entry = value["entries"][0].clone();
@@ -280,6 +282,44 @@ mod tests {
             .unwrap()
             .plan_paste(&World::empty(), &selection)
             .is_ok());
+    }
+
+    #[test]
+    fn library_migrates_old_versions_and_keeps_material_volumes() {
+        let mut world = World::empty();
+        world
+            .replace_volumes(&[MaterialVolume {
+                bounds: FineBox {
+                    min: [0; 3],
+                    max: [8; 3],
+                },
+                material: VolumeMaterial::Water,
+            }])
+            .unwrap();
+        let selection = RegionSet::from_boxes([RegionBox::new([0; 3], [16; 3]).unwrap()]).unwrap();
+        let mut library = BlueprintLibrary::new();
+        library
+            .save(
+                "Pool",
+                "Water",
+                Clipboard::copy_regions(&world, &selection).unwrap(),
+            )
+            .unwrap();
+        let json = library.to_json().unwrap();
+        let restored = BlueprintLibrary::from_json(&json).unwrap();
+        assert_eq!(restored, library);
+        assert_eq!(restored.load(1).unwrap().volumes(), world.volumes());
+        for version in [1, 2] {
+            let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+            old["version"] = serde_json::json!(version);
+            old["entries"][0]["clipboard"]
+                .as_object_mut()
+                .unwrap()
+                .remove("volumes");
+            let migrated = BlueprintLibrary::from_json(&old.to_string()).unwrap();
+            assert_eq!(migrated.version, BLUEPRINT_VERSION);
+            assert!(migrated.load(1).unwrap().volumes().is_empty());
+        }
     }
 
     #[test]

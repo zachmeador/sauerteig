@@ -75,15 +75,22 @@ fn run() -> Result<(), String> {
             };
             let (world, report) = convert(&map, &options)?;
             eprintln!(
-                "Imported {} compact regions, {} coarse cells, {} detailed roots, {} lights, {} spawns. \
-                 Cropped {} leaves; clipped {}. Unsupported omissions: {}.",
+                "Imported {} compact regions, {} coarse cells, {} detailed roots, {} material \
+                 volumes ({} water / {} glass source leaves), {} lights, {} spawns. \
+                 Cropped {} geometry / {} volume leaves; clipped {} geometry / {} volume leaves. \
+                 Unsupported geometry omissions: {}.",
                 report.imported_regions,
                 report.imported_coarse_cells,
                 report.imported_detailed_roots,
+                report.imported_volume_boxes,
+                report.imported_water_leaves,
+                report.imported_glass_leaves,
                 report.imported_lights,
                 report.imported_spawns,
                 report.leaves_outside_region,
+                report.volume_leaves_outside_region,
                 report.leaves_clipped_at_region,
+                report.volume_leaves_clipped_at_region,
                 report.unsupported_leaves_omitted.len(),
             );
             (

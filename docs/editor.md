@@ -17,6 +17,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Extend / reorient the selection | Right click; Shift+left click in drag-look mode |
 | Add / subtract a selection volume | Alt+left drag / Alt+Shift+left drag |
 | Selection mode and numeric volume size | Esc → Selection |
+| Assign normal space, water, or glass | Esc → Selection → Volume material → Apply |
 | Clear the selection in edit mode | Space |
 | Extrude / carve the selected or aimed face | Wheel down / up |
 | Make the grid smaller / larger | G+wheel down / up; [ / ] also work |
@@ -27,7 +28,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Cycle and apply material | Y+wheel |
 | Choose material | 1–8 |
 | Browse materials and props | T, or Esc → Assets |
-| Undo your latest geometry or object edit | U or Z |
+| Undo your latest geometry, volume, or object edit | U or Z |
 | Redo your latest undone edit | Shift+U or Shift+Z |
 | Copy / paste selected volumes | C / V |
 | Save, organize, or load blueprints | B, or Esc → Blueprints |
@@ -74,20 +75,36 @@ and redo with geometry. Release the mouse with Esc to use the numeric controls.
 
 ## Volumes and blueprints
 
+**Volume materials** describe the space between solid surfaces. Select a region,
+open **Esc → Selection**, choose **Water** or **Glass**, and press **Apply**.
+**Normal space** clears the material assignment. This leaves solid geometry in
+place: carve a pool or opening first, then fill the space. The entire additive
+selection is affected, including areas with no solid cubes. Glass is transparent
+but blocks players and shots. Water is non-solid, slows movement and falling, and
+Space swims upward. These are static regions, not flowing fluid simulations.
+
+Water and glass surfaces can be selected like geometry. Turn off **Select water
+and glass surfaces** in the selection panel to reach geometry behind them.
+Wheel operations still edit solid geometry; use the volume material control to
+add or remove water and glass. Surface textures and volume materials are separate.
+
 Selections can contain several volumes: select the main building, then add its
 annex with Alt+drag. Overlaps count once. Subtract volumes with Alt+Shift+drag.
-Copy captures geometry, empty space, and objects whose pivots lie inside that
+Copy captures geometry, empty space, material volumes, and objects whose pivots lie inside that
 union. Paste replaces only
 those volumes, leaving the gaps between them alone. Blue outlines preview the
 clipboard at the active selection's minimum corner; V commits the placement.
-R and M transform geometry, face materials, the selection mask, and object
+R and M transform geometry, face materials, volume materials, the selection mask, and object
 positions/facing. Object meshes retain their original shape when mirrored.
 Pasted objects receive new identities; existing objects at the destination stay.
 
 Press B to save a selection as a named blueprint. The library supports folders,
 search, renaming, moving, duplication, deletion, and loading back into the
 clipboard for placement. Blueprints include props, lights, and spawns together
-with geometry, so a building keeps its fixtures. Older geometry-only blueprints
+with geometry and volume materials, so a building keeps its fixtures and windows.
+Older blueprints have normal space throughout their selection. Pasting replaces
+the destination's material assignments, including clearing regions that are normal
+space in the blueprint. Older geometry-only blueprints
 still load. Libraries and settings are local to
 each client, separate from the shared map. Browser data lives in IndexedDB for
 that site origin. Desktop data uses the OS application data folder (on macOS,
@@ -99,10 +116,13 @@ Selections are sparse boxes rather than lists of empty tiny cubes. Each edit is
 bounded to 16,384 changed one-metre roots and 65,536 geometry fragments, with a
 16 MiB network message ceiling. A very large or intricate operation can still
 exceed those limits. Undo history is bounded by both operation count and stored
-geometry complexity.
+geometry complexity. Material volumes use separate compact boxes, limited to
+16,384 per world; their size does not expand into one-metre geometry edits.
 
 Changes are shared immediately. Personal undo is rejected if someone has
-subsequently changed the same cells or objects. A combined paste is one atomic
+subsequently changed the same cells or objects. Volume materials currently share
+one conflict/undo ownership clock for the whole layer: another player's volume
+edit can block your stale edit or undo even at a different location. A combined paste is one atomic
 edit and one undo entry. Redo checks ownership too, including edits
 that restored an identical value. A new edit clears your redo history. Adding
 geometry through an active fighter is also rejected.

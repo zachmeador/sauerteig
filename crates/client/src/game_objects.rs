@@ -215,6 +215,7 @@ impl Game {
             base_revision,
             roots: Vec::new(),
             objects,
+            volumes: Vec::new(),
         });
     }
 

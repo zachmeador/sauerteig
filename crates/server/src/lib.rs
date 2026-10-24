@@ -8,11 +8,11 @@ pub use network::serve;
 
 use persistence::SavedWorld;
 use sauerteig_core::{
-    forward, player_intersects_fragment, ray_player, simulate_player, spawn_point,
-    validate_root_edits, Cell, CellEdit, CellFragment, CellPos, ClientMessage, FineBox, InputFrame,
-    ObjectEdit, ObjectKind, ObjectPlacement, Player, Projectile, RootEdit, ServerMessage,
-    ShotEffect, Vec3, World, WorldObject, FIXED_DT, PLAYER_HEIGHT, PLAYER_RADIUS,
-    WORLD_FORMAT_VERSION,
+    forward, player_intersects_fragment, player_intersects_volume, ray_player, simulate_player,
+    spawn_point, validate_root_edits, Cell, CellEdit, CellFragment, CellPos, ClientMessage,
+    FineBox, InputFrame, MaterialVolume, ObjectEdit, ObjectKind, ObjectPlacement, Player,
+    Projectile, RootEdit, ServerMessage, ShotEffect, Vec3, VolumeEdit, VolumeMaterial, World,
+    WorldObject, FIXED_DT, PLAYER_HEIGHT, PLAYER_RADIUS, WORLD_FORMAT_VERSION,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -66,16 +66,25 @@ struct ObjectState {
     value: Option<WorldObject>,
 }
 
+#[derive(Clone, Copy)]
+enum EditPatch {
+    Legacy,
+    Roots,
+    Transaction,
+}
+
 struct UndoEntry {
     revision: u64,
     before: Vec<RootEdit>,
     after: Vec<RootEdit>,
     previous_revisions: Vec<Option<u64>>,
-    root_patch: bool,
-    transaction_patch: bool,
+    patch: EditPatch,
     objects_before: Vec<ObjectState>,
     objects_after: Vec<ObjectState>,
     previous_object_revisions: Vec<Option<u64>>,
+    volumes_before: Option<Vec<MaterialVolume>>,
+    volumes_after: Option<Vec<MaterialVolume>>,
+    previous_volume_revision: Option<u64>,
     complexity: usize,
 }
 
@@ -129,6 +138,9 @@ struct Session {
     root_changed_at: HashMap<CellPos, u64>,
     object_revisions: HashMap<u32, u64>,
     object_changed_at: HashMap<u32, u64>,
+    volume_revision: Option<u64>,
+    volumes_changed_at: u64,
+    volume_bytes: usize,
     geometry_fragments: usize,
     geometry_root_costs: HashMap<CellPos, RootCost>,
     geometry_bytes: usize,
@@ -151,9 +163,14 @@ impl Session {
             .map(|e| (e.pos, saved.revision))
             .chain(saved.roots.iter().map(|e| (e.pos, saved.revision)))
             .collect();
-        let world =
+        let mut world =
             World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)
                 .expect("validated saved world");
+        world
+            .replace_volumes(&saved.volumes)
+            .expect("validated saved material volumes");
+        let volume_bytes = json_bytes(&world.volumes());
+        let volume_revision = (!world.volumes().is_empty()).then_some(saved.revision);
         let geometry_root_costs: HashMap<_, _> = world
             .cells()
             .iter()
@@ -205,6 +222,9 @@ impl Session {
             cell_revisions,
             object_changed_at: object_revisions.clone(),
             object_revisions,
+            volume_revision,
+            volumes_changed_at: saved.revision,
+            volume_bytes,
             geometry_fragments,
             geometry_root_costs,
             geometry_bytes,
@@ -228,6 +248,7 @@ impl Session {
             regions: self.world.regions(),
             cells: self.world.cells(),
             roots: self.world.root_overrides(),
+            volumes: self.world.volumes().to_vec(),
             objects: self.objects.clone(),
             next_object: self.next_object,
         }
@@ -286,6 +307,7 @@ impl Session {
                 regions: self.world.regions(),
                 cells: self.world.cells(),
                 roots: self.world.root_overrides(),
+                volumes: self.world.volumes().to_vec(),
                 objects: self.objects.clone(),
                 players: self.players(),
                 editing_allowed: self.editing_allowed,
@@ -427,9 +449,17 @@ impl Session {
                 base_revision,
                 roots,
                 objects,
+                volumes,
                 ..
             } => {
-                self.commit_transaction(id, roots, objects, Some(base_revision), true, true)?;
+                self.commit_transaction(
+                    id,
+                    roots,
+                    objects,
+                    volumes,
+                    Some(base_revision),
+                    EditPatch::Transaction,
+                )?;
             }
             ClientMessage::PlaceObject {
                 kind,
@@ -446,9 +476,9 @@ impl Session {
                             rotation,
                         },
                     }],
+                    vec![],
                     None,
-                    false,
-                    false,
+                    EditPatch::Legacy,
                 )?;
             }
             ClientMessage::RemoveObject { id: object_id } => {
@@ -456,9 +486,9 @@ impl Session {
                     id,
                     vec![],
                     vec![ObjectEdit::Delete { id: object_id }],
+                    vec![],
                     None,
-                    false,
-                    false,
+                    EditPatch::Legacy,
                 )?;
             }
             ClientMessage::Sync { request } => self.send(id, ServerMessage::Synced { request }),
@@ -530,7 +560,18 @@ impl Session {
         root_patch: bool,
     ) -> Result<(), String> {
         validate_root_request(&roots)?;
-        self.commit_transaction(id, roots, vec![], base_revision, root_patch, false)
+        self.commit_transaction(
+            id,
+            roots,
+            vec![],
+            vec![],
+            base_revision,
+            if root_patch {
+                EditPatch::Roots
+            } else {
+                EditPatch::Legacy
+            },
+        )
     }
 
     fn commit_transaction(
@@ -538,13 +579,13 @@ impl Session {
         id: u64,
         roots: Vec<RootEdit>,
         objects: Vec<ObjectEdit>,
+        volumes: Vec<VolumeEdit>,
         base_revision: Option<u64>,
-        root_patch: bool,
-        transaction_patch: bool,
+        patch: EditPatch,
     ) -> Result<(), String> {
         self.require_editor(id)?;
-        if roots.is_empty() && objects.is_empty() {
-            return Err("An edit must change geometry or objects.".into());
+        if roots.is_empty() && objects.is_empty() && volumes.is_empty() {
+            return Err("An edit must change geometry, objects, or material volumes.".into());
         }
         if !roots.is_empty() {
             validate_root_request(&roots)?;
@@ -566,6 +607,22 @@ impl Session {
             }) {
                 return Err("These cells changed after the edit began; try again.".into());
             }
+            if !volumes.is_empty() && self.volumes_changed_at > base_revision {
+                return Err("Material volumes changed after the edit began; try again.".into());
+            }
+        }
+        let volumes_after = if volumes.is_empty() {
+            None
+        } else {
+            let after = self.world.prepare_volume_edits(&volumes)?;
+            (after != self.world.volumes()).then_some(after)
+        };
+        let volume_bytes = volumes_after.as_ref().map_or(self.volume_bytes, json_bytes);
+        let volumes_before = volumes_after
+            .as_ref()
+            .map(|_| self.world.volumes().to_vec());
+        if let Some(after) = &volumes_after {
+            self.validate_volume_fighter_overlap(after)?;
         }
         // Resolve every object before mutating either part of the world. IDs
         // are reserved locally and become consumed only on a successful commit.
@@ -644,7 +701,7 @@ impl Session {
             })
             .filter(|root| self.world.root_fragments(root.pos) != root.fragments)
             .collect();
-        if roots.is_empty() && objects_after.is_empty() {
+        if roots.is_empty() && objects_after.is_empty() && volumes_after.is_none() {
             return Ok(());
         }
         self.validate_fighter_overlap(&roots)?;
@@ -669,9 +726,12 @@ impl Session {
             .iter()
             .map(|o| self.object_revisions.get(&o.id).copied())
             .collect();
-        self.charge_edit(id, roots_complexity(&roots) + objects_after.len())?;
-        let geometry_changed = self.apply_roots(&roots)?;
-        if !geometry_changed && objects_after.is_empty() {
+        self.charge_edit(
+            id,
+            roots_complexity(&roots) + objects_after.len() + volumes.len(),
+        )?;
+        let geometry_changed = self.apply_roots(&roots, volume_bytes)?;
+        if !geometry_changed && objects_after.is_empty() && volumes_after.is_none() {
             return Ok(());
         }
         if !geometry_changed {
@@ -693,19 +753,28 @@ impl Session {
         }
         let (before, roots, previous_revisions) = (changed_before, changed_after, changed_previous);
         self.apply_object_states(&objects_after);
+        let previous_volume_revision = self.volume_revision;
+        if let Some(after) = &volumes_after {
+            self.apply_volumes(after);
+        }
         self.next_object = next_object;
-        let complexity =
-            roots_complexity(&before) + roots_complexity(&roots) + objects_before.len() * 2;
+        let complexity = roots_complexity(&before)
+            + roots_complexity(&roots)
+            + objects_before.len() * 2
+            + volumes_before.as_ref().map_or(0, Vec::len)
+            + volumes_after.as_ref().map_or(0, Vec::len);
         let entry = UndoEntry {
             revision: self.revision,
             before,
             after: roots.clone(),
             previous_revisions,
-            root_patch,
-            transaction_patch,
+            patch,
             objects_before,
             objects_after,
             previous_object_revisions,
+            volumes_before,
+            volumes_after,
+            previous_volume_revision,
             complexity,
         };
         let peer = self.peers.get_mut(&id).unwrap();
@@ -719,8 +788,9 @@ impl Session {
             history_complexity -= discarded.complexity;
         }
         let object_patch = !entry.objects_after.is_empty();
+        let volume_patch = entry.volumes_after.is_some();
         undo.push_back(entry);
-        self.broadcast_change(roots, root_patch, transaction_patch, object_patch);
+        self.broadcast_change(roots, patch, object_patch, volume_patch);
         Ok(())
     }
 
@@ -754,6 +824,27 @@ impl Session {
         self.objects.sort_by_key(|o| o.id);
     }
 
+    fn validate_volume_fighter_overlap(&self, volumes: &[MaterialVolume]) -> Result<(), String> {
+        for peer in self.peers.values().filter(|peer| !peer.player.editing) {
+            if volumes.iter().any(|volume| {
+                volume.material == VolumeMaterial::Glass
+                    && player_intersects_volume(&peer.player, volume)
+            }) {
+                return Err("That change would place solid glass inside a player.".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_volumes(&mut self, volumes: &[MaterialVolume]) {
+        self.world
+            .replace_volumes(volumes)
+            .expect("previously validated material volume state");
+        self.volume_bytes = json_bytes(&self.world.volumes());
+        self.volume_revision = Some(self.revision);
+        self.volumes_changed_at = self.revision;
+    }
+
     fn undo(&mut self, id: u64) -> Result<(), String> {
         self.require_editor(id)?;
         let Some(entry) = self.peers[&id].undo.back() else {
@@ -773,15 +864,29 @@ impl Session {
         {
             return Err("Cannot undo: a later edit changed these objects.".into());
         }
+        if entry.volumes_before.is_some() && self.volume_revision != Some(entry.revision) {
+            return Err("Cannot undo: a later edit changed material volumes.".into());
+        }
         self.validate_fighter_overlap(&entry.before)?;
         self.validate_object_count(&entry.objects_before)?;
+        if let Some(volumes) = &entry.volumes_before {
+            self.validate_volume_fighter_overlap(volumes)?;
+        }
         let edits = entry.before.clone();
         let objects = entry.objects_before.clone();
-        self.charge_edit(id, roots_complexity(&edits) + objects.len())?;
-        if !self.apply_roots(&edits)? {
+        let volumes = entry.volumes_before.clone();
+        let volume_bytes = volumes.as_ref().map_or(self.volume_bytes, json_bytes);
+        self.charge_edit(
+            id,
+            roots_complexity(&edits) + objects.len() + volumes.as_ref().map_or(0, Vec::len),
+        )?;
+        if !self.apply_roots(&edits, volume_bytes)? {
             self.changed();
         }
         self.apply_object_states(&objects);
+        if let Some(volumes) = &volumes {
+            self.apply_volumes(volumes);
+        }
         let entry = self.peers.get_mut(&id).unwrap().undo.pop_back().unwrap();
         // Restore ownership lineage; monotonic stale-snapshot clocks never rewind.
         for (e, previous) in edits.iter().zip(&entry.previous_revisions) {
@@ -798,9 +903,12 @@ impl Session {
                 self.object_revisions.remove(&object.id);
             }
         }
-        let (root_patch, transaction_patch) = (entry.root_patch, entry.transaction_patch);
+        if volumes.is_some() {
+            self.volume_revision = entry.previous_volume_revision;
+        }
+        let patch = entry.patch;
         self.peers.get_mut(&id).unwrap().redo.push(entry);
-        self.broadcast_change(edits, root_patch, transaction_patch, !objects.is_empty());
+        self.broadcast_change(edits, patch, !objects.is_empty(), volumes.is_some());
         Ok(())
     }
 
@@ -825,15 +933,29 @@ impl Session {
         {
             return Err("Cannot redo: a later edit changed these objects.".into());
         }
+        if entry.volumes_after.is_some() && self.volume_revision != entry.previous_volume_revision {
+            return Err("Cannot redo: a later edit changed material volumes.".into());
+        }
         self.validate_fighter_overlap(&entry.after)?;
         self.validate_object_count(&entry.objects_after)?;
+        if let Some(volumes) = &entry.volumes_after {
+            self.validate_volume_fighter_overlap(volumes)?;
+        }
         let edits = entry.after.clone();
         let objects = entry.objects_after.clone();
-        self.charge_edit(id, roots_complexity(&edits) + objects.len())?;
-        if !self.apply_roots(&edits)? {
+        let volumes = entry.volumes_after.clone();
+        let volume_bytes = volumes.as_ref().map_or(self.volume_bytes, json_bytes);
+        self.charge_edit(
+            id,
+            roots_complexity(&edits) + objects.len() + volumes.as_ref().map_or(0, Vec::len),
+        )?;
+        if !self.apply_roots(&edits, volume_bytes)? {
             self.changed();
         }
         self.apply_object_states(&objects);
+        if let Some(volumes) = &volumes {
+            self.apply_volumes(volumes);
+        }
         let entry = self.peers.get_mut(&id).unwrap().redo.pop().unwrap();
         for edit in &edits {
             self.cell_revisions.insert(edit.pos, entry.revision);
@@ -841,24 +963,28 @@ impl Session {
         for object in &objects {
             self.object_revisions.insert(object.id, entry.revision);
         }
-        let (root_patch, transaction_patch) = (entry.root_patch, entry.transaction_patch);
+        if volumes.is_some() {
+            self.volume_revision = Some(entry.revision);
+        }
+        let patch = entry.patch;
         self.peers.get_mut(&id).unwrap().undo.push_back(entry);
-        self.broadcast_change(edits, root_patch, transaction_patch, !objects.is_empty());
+        self.broadcast_change(edits, patch, !objects.is_empty(), volumes.is_some());
         Ok(())
     }
 
     fn broadcast_change(
         &mut self,
         roots: Vec<RootEdit>,
-        root_patch: bool,
-        transaction_patch: bool,
+        patch: EditPatch,
         object_patch: bool,
+        volume_patch: bool,
     ) {
-        if transaction_patch {
+        if matches!(patch, EditPatch::Transaction) || volume_patch {
             self.broadcast(ServerMessage::TransactionPatch {
                 revision: self.revision,
                 roots,
                 objects: self.objects.clone(),
+                volumes: volume_patch.then(|| self.world.volumes().to_vec()),
             });
         } else if object_patch {
             self.broadcast(ServerMessage::Objects {
@@ -866,7 +992,7 @@ impl Session {
                 objects: self.objects.clone(),
             });
         } else {
-            self.broadcast_roots(roots, root_patch);
+            self.broadcast_roots(roots, matches!(patch, EditPatch::Roots));
         }
     }
 
@@ -893,7 +1019,7 @@ impl Session {
         Ok(())
     }
 
-    fn apply_roots(&mut self, roots: &[RootEdit]) -> Result<bool, String> {
+    fn apply_roots(&mut self, roots: &[RootEdit], volume_bytes: usize) -> Result<bool, String> {
         // Requests were validated before reaching this method; history entries
         // are previously accepted state. Charge the room budget for the same
         // canonical representation that the world will store, not its authored
@@ -930,6 +1056,7 @@ impl Session {
         }
         if self.geometry_bytes - removed.iter().map(|cost| cost.bytes).sum::<usize>()
             + added.iter().map(|cost| cost.bytes).sum::<usize>()
+            + volume_bytes
             > MAX_GEOMETRY_BYTES
         {
             return Err(SNAPSHOT_LIMIT_ERROR.into());
@@ -1006,7 +1133,7 @@ impl Session {
         self.world.intersects_box(
             p - Vec3::new(PLAYER_RADIUS, 0.0, PLAYER_RADIUS),
             p + Vec3::new(PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_RADIUS),
-        )
+        ) || self.world.intersects_solid_volume(body_min, body_max)
     }
 
     fn safe_spawn(&self, index: u32) -> Vec3 {
@@ -1137,6 +1264,10 @@ impl Session {
         let world_hit = self.world.raycast(origin, direction, max_distance);
         let mut nearest = world_hit.as_ref().map_or(max_distance, |h| h.distance);
         let mut collided = world_hit.is_some();
+        if let Some(glass) = self.world.raycast_solid_volumes(origin, direction, nearest) {
+            nearest = glass.distance;
+            collided = true;
+        }
         let mut target = None;
         for (&id, peer) in &self.peers {
             if id == owner || peer.player.editing {
@@ -1189,15 +1320,18 @@ impl Session {
             if distance >= 3.5 && direct != Some(id) {
                 continue;
             }
+            let ray_origin = center + delta.normalize_or_zero() * 0.03;
+            let ray_direction = delta.normalize_or_zero();
+            let ray_distance = (distance - 0.06).max(0.0);
             let visible = distance < 0.05
-                || self
+                || (self
                     .world
-                    .raycast(
-                        center + delta.normalize_or_zero() * 0.03,
-                        delta.normalize_or_zero(),
-                        (distance - 0.06).max(0.0),
-                    )
-                    .is_none();
+                    .raycast(ray_origin, ray_direction, ray_distance)
+                    .is_none()
+                    && self
+                        .world
+                        .raycast_solid_volumes(ray_origin, ray_direction, ray_distance)
+                        .is_none());
             if !visible && direct != Some(id) {
                 continue;
             }

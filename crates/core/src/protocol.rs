@@ -1,4 +1,7 @@
-use crate::{spawn_point, CellEdit, CellFragment, RootEdit, Vec3, WorldBounds, EYE_HEIGHT};
+use crate::{
+    spawn_point, CellEdit, CellFragment, MaterialVolume, RootEdit, Vec3, VolumeEdit, WorldBounds,
+    EYE_HEIGHT,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -137,6 +140,8 @@ pub enum ClientMessage {
         base_revision: u64,
         roots: Vec<RootEdit>,
         objects: Vec<ObjectEdit>,
+        #[serde(default)]
+        volumes: Vec<VolumeEdit>,
     },
     PlaceObject {
         kind: ObjectKind,
@@ -178,6 +183,8 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         roots: Vec<RootEdit>,
         objects: Vec<WorldObject>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        volumes: Vec<MaterialVolume>,
         players: Vec<Player>,
         editing_allowed: bool,
     },
@@ -199,6 +206,8 @@ pub enum ServerMessage {
         revision: u64,
         roots: Vec<RootEdit>,
         objects: Vec<WorldObject>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        volumes: Option<Vec<MaterialVolume>>,
     },
     EditResult {
         request: u64,

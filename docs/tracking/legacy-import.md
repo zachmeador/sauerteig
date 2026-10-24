@@ -10,16 +10,18 @@ server load alone does not satisfy this outcome.
 
 ## Working now
 
-The converter reads supported OCTA files, retains solid geometry at original scale,
-and imports light/spawn positions. It produces editable Sauerteig JSON and an
-import report, never overwriting the source. The local private archive has 19
+The converter reads supported OCTA files, retains solid geometry and water/glass
+assignments at original scale, and imports light/spawn positions. It produces
+editable Sauerteig JSON and an import report, never overwriting the source. The local private archive has 19
 loadable copies: 15 without solid-geometry omissions and four recovery copies that
 each omit 23 zero-thickness sheets. Four other sources fail gzip checksum checks;
 they need source recovery or another original, not a relaxed integrity check.
 
 The archive copies use fallback material. Source texture/model references are not
 loaded assets. Original light properties and spawn facing are not applied. These
-copies are geometry recoveries, not restored maps.
+copies remain partial recoveries, not restored maps. Water/glass now render and
+have basic swimming/collision behavior. Original liquid styles and unsupported
+material flags remain explicitly reported rather than applied.
 
 ## Remaining work
 
@@ -31,7 +33,7 @@ copies are geometry recoveries, not restored maps.
 - [ ] Preserve spawn heading and use it on join/respawn; storing rotation alone
   is insufficient while the server reads only spawn positions.
 - [ ] Represent legacy zero-thickness surfaces without losing visible faces.
-- [ ] Adapt pickups, triggers, clip/liquid volumes, sounds, and sky/environment
+- [ ] Adapt pickups, triggers, other clip/liquid volumes, sounds, and sky/environment
   settings, explicitly reporting unsupported behavior.
 - [ ] Offer an OGZ import UI with a preview of omissions and unresolved media
   before creating a saved copy.
@@ -43,8 +45,12 @@ placement, lighting, collision, spawn facing, and gameplay behavior. Check nativ
 and browser, editing, save/reopen, and multiplayer. There is currently no exhaustive
 comparison of this kind.
 
-The 19 local copies passed isolated server startup/health and graceful save checks;
-those checks had no players and establish loadability only. Existing tests cover
+The 19 local copies passed two isolated server startup/health and graceful save
+cycles each after adding volume materials; terrain, objects, bounds, and material
+assignments stayed identical. Seventeen maps contain water/glass, with at most
+4,227 compact boxes. A regenerated cube4 copy also opened in the native renderer.
+These are not visual comparisons against the source engine. The server checks
+had no players and establish loadability only. Existing tests cover
 parser limits, transforms, shape conversion, and omission reporting. The
 [importer docs](../../crates/importer/README.md) own format support and technical
 limits; do not duplicate that specification here.

@@ -1,6 +1,6 @@
 # Legacy OGZ import
 
-`sauerteig-import` reads Cube 2 **OCTA versions 29–33**, including older Tesseract maps saved in that format. **Import is partial, not a faithful map restoration.** It converts supported solid geometry and light/spawn positions into an editable Sauerteig world, plus a report of source data and omissions. Original textures, models, lighting properties, and gameplay entities are not restored. This is a command-line import path; it is not yet an in-game OGZ file picker. Newer Tesseract `MAPZ` files and earlier Cube formats are rejected explicitly.
+`sauerteig-import` reads Cube 2 **OCTA versions 29–33**, including older Tesseract maps saved in that format. **Import is partial, not a faithful map restoration.** It converts supported solid geometry, water/glass volumes, and light/spawn positions into an editable Sauerteig world, plus a report of source data and omissions. Original textures, models, lighting properties, and gameplay entities are not restored. This is a command-line import path; it is not yet an in-game OGZ file picker. Newer Tesseract `MAPZ` files and earlier Cube formats are rejected explicitly.
 
 ```sh
 . ./scripts/env.sh
@@ -30,11 +30,26 @@ Zero-thickness sheets are one unsupported case. They can be visible in the sourc
 
 ## Appearance and entities
 
+Water and glass are separate volume assignments, including those on empty octree
+leaves. The importer decodes the older packed material byte used before OCTA 33
+and the newer 16-bit layout, transforms their bounds with the geometry, and joins
+adjacent equal-material boxes without rounding their extent. Material assignments
+inside solid leaves are retained so later carving can expose them. Solid terrain
+takes precedence for rendering and immersion. The converted layer is limited to
+16,384 disjoint boxes; an oversized layer is rejected instead of silently dropped.
+
+Glass blocks movement and shots; water supports swimming. They use Sauerteig's
+current transparent shaders, not the original appearance. Alternate water/glass
+styles, lava, and unsupported clip/noclip/gameclip/death/alpha flags are recorded
+in the conversion report. In particular, source glass without a collision flag
+becomes solid glass here. This is a reported behavior difference. Original
+water colors, reflection/refraction settings, and liquid lighting are not restored.
+
 OGZ contains **texture slot numbers, virtual-slot overrides and model entity indices**, not the texture images or model files. Their meaning comes from the companion map config and the original installation's default texture/model configs. Missing configs or a different game version can change the slot-to-file mapping.
 
 The report retains texture usage, virtual-slot metadata, map variables, entity positions/attributes, and literal config references. `--material-map FILE` accepts a JSON object such as `{"7":0,"12":2}` to select current Sauerteig materials for legacy slots. Each face is mapped independently and rotated into Sauerteig's coordinate system. Unmapped slots use neutral material 0. **Original texture images, UV overrides and external asset loading are not implemented.**
 
-Light and playerstart positions are imported. Light radius/color, spotlight parameters and spawn yaw remain in the report; imported lights do not reproduce those attributes. They become independent light nodes with no fixture model, currently rendered as fixed warm downward spotlights with a 12 metre range. Only eight nearby nodes illuminate the scene at a time. This changes the original lighting substantially; source point lights and sun/environment settings are not reproduced. Mapmodels, sounds, pickups, triggers, water/lava/clip volumes, blend maps and skyboxes need separate adapters. Source geometry still imports when its texture or model is missing. Old lightmaps, merged render caches and PVS are discarded in favor of current geometry meshing and dynamic lighting.
+Light and playerstart positions are imported. Light radius/color, spotlight parameters and spawn yaw remain in the report; imported lights do not reproduce those attributes. They become independent light nodes with no fixture model, currently rendered as fixed warm downward spotlights with a 12 metre range. Only eight nearby nodes illuminate the scene at a time. This changes the original lighting substantially; source point lights and sun/environment settings are not reproduced. Mapmodels, sounds, pickups, triggers, lava/clip volumes, blend maps and skyboxes need separate adapters. Source geometry still imports when its texture or model is missing. Old lightmaps, merged render caches and PVS are discarded in favor of current geometry meshing and dynamic lighting.
 
 ## Asset licenses
 

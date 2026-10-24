@@ -1,9 +1,11 @@
 pub(crate) mod culling;
 mod props;
+mod volumes;
 
 use self::{
     culling::{Bounds, Frustum},
     props::{instance_layout, PropRenderer},
+    volumes::VolumeRenderer,
 };
 use crate::lighting::{
     closest_lights, sun_shadow_matrix, LIGHT_RANGE, LOCAL_LIGHTS, LOCAL_SHADOW_SIZE,
@@ -142,13 +144,16 @@ impl GpuMesh {
         self.draw_prefix(pass, self.count);
     }
     fn draw_prefix<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, count: u32) {
-        let count = count.min(self.count);
-        if count == 0 {
+        self.draw_range(pass, 0..count);
+    }
+    fn draw_range<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, range: std::ops::Range<u32>) {
+        let range = range.start.min(self.count)..range.end.min(self.count);
+        if range.is_empty() {
             return;
         }
         pass.set_vertex_buffer(0, self.vertex.slice(..));
         pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..count, 0, 0..1);
+        pass.draw_indexed(range, 0, 0..1);
     }
 }
 pub struct Renderer {
@@ -162,6 +167,7 @@ pub struct Renderer {
     pub materials: crate::materials::Materials,
     identity_instance: wgpu::Buffer,
     props: PropRenderer,
+    volumes: VolumeRenderer,
     camera_group: wgpu::BindGroup,
     shadow_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
@@ -361,6 +367,7 @@ impl Renderer {
         });
         let materials = crate::materials::Materials::new(&device, &queue)?;
         let props = PropRenderer::new(&device)?;
+        let volumes = VolumeRenderer::new(&device, format, &camera_layout);
         let identity_instance = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world identity transform"),
             contents: bytemuck::cast_slice(&[[0.0f32; 4]]),
@@ -502,6 +509,7 @@ impl Renderer {
             materials,
             identity_instance,
             props,
+            volumes,
             camera_group,
             shadow_group,
             pipeline,
@@ -519,7 +527,9 @@ impl Renderer {
         })
     }
     pub fn visible_triangles(&self) -> usize {
-        self.visible_world_triangles + self.props.visible_triangles()
+        self.visible_world_triangles
+            + self.props.visible_triangles()
+            + self.volumes.visible_triangles()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -534,6 +544,10 @@ impl Renderer {
     pub fn rebuild_all(&mut self, world: &World) {
         self.chunks.clear();
         self.rebuild(world, &world.chunk_keys());
+        self.rebuild_volumes(world);
+    }
+    pub fn rebuild_volumes(&mut self, world: &World) {
+        self.volumes.rebuild(&self.device, world);
     }
     pub fn rebuild(&mut self, world: &World, keys: &[ChunkKey]) {
         for &key in keys {
@@ -568,10 +582,12 @@ impl Renderer {
         eye: Vec3,
         direction: Vec3,
         time: f32,
+        underwater: bool,
         objects: &[WorldObject],
         vertices: &[GpuVertex],
         indices: &[u32],
         shadow_index_count: u32,
+        opaque_index_count: u32,
         output: egui::FullOutput,
         context: &egui::Context,
     ) -> Result<(), wgpu::SurfaceError> {
@@ -597,7 +613,11 @@ impl Renderer {
             light_view_proj: sun_projection.to_cols_array_2d(),
             eye_time: [eye.x, eye.y, eye.z, time],
             sun: [sun.x, sun.y, sun.z, encode_srgb],
-            fog: [0.105, 0.125, 0.135, 0.00005],
+            fog: if underwater {
+                [0.022, 0.105, 0.13, 0.0025]
+            } else {
+                [0.105, 0.125, 0.135, 0.00005]
+            },
             points: [[0.0; 4]; 8],
             point_colors: [[0.0; 4]; 8],
             local_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); LOCAL_LIGHTS],
@@ -610,6 +630,8 @@ impl Renderer {
             .sum();
         let nearby = closest_lights(objects, eye);
         self.props.prepare(&self.queue, objects, eye, &nearby);
+        self.volumes
+            .prepare(&self.queue, eye, direction, &camera_frustum);
         for (i, light) in nearby.iter().enumerate() {
             if let Some(light) = light {
                 let p = light.position;
@@ -760,8 +782,19 @@ impl Renderer {
             if let Some(mesh) = &self.objects {
                 mesh.draw(&mut pass);
             }
-            self.dynamic.draw(&mut pass);
+            self.dynamic.draw_prefix(&mut pass, opaque_index_count);
             self.props.draw(&mut pass, None);
+            self.volumes.draw(&mut pass, underwater);
+            // Guides and the first-person weapon remain readable through the
+            // material tint. Remote actors and physical effects were drawn
+            // before the transparent boundaries and retain normal occlusion.
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.camera_group, &[]);
+            pass.set_bind_group(1, &self.shadow_group, &[]);
+            pass.set_bind_group(2, &self.materials.group, &[]);
+            pass.set_vertex_buffer(1, self.identity_instance.slice(..));
+            self.dynamic
+                .draw_range(&mut pass, opaque_index_count..self.dynamic.count);
         }
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -825,7 +858,11 @@ fn depth_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) ->
 mod material_shader_tests {
     #[test]
     fn textured_instanced_world_and_shadow_shaders_validate() {
-        for shader in [include_str!("world.wgsl"), include_str!("shadow.wgsl")] {
+        for shader in [
+            include_str!("world.wgsl"),
+            include_str!("shadow.wgsl"),
+            include_str!("volume.wgsl"),
+        ] {
             let module = naga::front::wgsl::parse_str(shader).unwrap();
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),

@@ -24,6 +24,7 @@ fn room() -> Session {
     }
     Session::new(
         SavedWorld {
+            volumes: Vec::new(),
             format_version: 2,
             bounds: Default::default(),
             regions: Vec::new(),
@@ -35,6 +36,218 @@ fn room() -> Session {
         },
         true,
     )
+}
+
+fn volume_edit(
+    min: [i32; 3],
+    max: [i32; 3],
+    material: Option<sauerteig_core::VolumeMaterial>,
+) -> sauerteig_core::VolumeEdit {
+    sauerteig_core::VolumeEdit {
+        bounds: FineBox { min, max },
+        material,
+    }
+}
+
+fn volume_transaction(
+    session: &mut Session,
+    id: u64,
+    base_revision: u64,
+    roots: Vec<RootEdit>,
+    objects: Vec<sauerteig_core::ObjectEdit>,
+    volumes: Vec<sauerteig_core::VolumeEdit>,
+) -> Result<(), String> {
+    session.handle(
+        id,
+        ClientMessage::EditTransaction {
+            request: 1,
+            base_revision,
+            roots,
+            objects,
+            volumes,
+        },
+    )
+}
+
+#[test]
+fn volume_layer_history_preserves_multiplayer_ownership_and_stale_clear_clocks() {
+    use sauerteig_core::VolumeMaterial::{Glass, Water};
+    let mut session = room();
+    let (a, mut events) = peer(&mut session, true);
+    let (b, _events) = peer(&mut session, true);
+    volume_transaction(
+        &mut session,
+        a,
+        0,
+        vec![],
+        vec![],
+        vec![volume_edit([160, 32, 160], [176, 48, 176], Some(Water))],
+    )
+    .unwrap();
+    assert_eq!(session.revision, 1);
+    match serde_json::from_str::<ServerMessage>(&events.try_recv().unwrap()).unwrap() {
+        ServerMessage::TransactionPatch {
+            volumes: Some(volumes),
+            roots,
+            objects,
+            ..
+        } => {
+            assert_eq!(volumes, session.world.volumes());
+            assert!(roots.is_empty() && objects.is_empty());
+        }
+        other => panic!("expected atomic material patch, got {other:?}"),
+    }
+    let water = session.world.volumes().to_vec();
+    volume_transaction(
+        &mut session,
+        b,
+        1,
+        vec![],
+        vec![],
+        vec![volume_edit([240, 32, 160], [248, 48, 176], Some(Glass))],
+    )
+    .unwrap();
+    let combined = session.world.volumes().to_vec();
+    assert!(session.undo(a).unwrap_err().contains("later edit"));
+    session.undo(b).unwrap();
+    assert_eq!(session.world.volumes(), water);
+    session.undo(a).unwrap();
+    assert!(session.world.volumes().is_empty());
+    assert!(volume_transaction(
+        &mut session,
+        a,
+        0,
+        vec![],
+        vec![],
+        vec![volume_edit([160, 32, 160], [176, 48, 176], None)]
+    )
+    .unwrap_err()
+    .contains("changed after"));
+    session.redo(a).unwrap();
+    assert_eq!(session.world.volumes(), water);
+    session.redo(b).unwrap();
+    assert_eq!(session.world.volumes(), combined);
+}
+
+#[test]
+fn invalid_material_object_and_fighter_changes_leave_mixed_transactions_atomic() {
+    use sauerteig_core::{ObjectEdit, ObjectPlacement, VolumeMaterial::Glass};
+    let mut session = room();
+    let (builder, _events) = peer(&mut session, true);
+    let (fighter, _events) = peer(&mut session, false);
+    session.peers.get_mut(&fighter).unwrap().player.position = Vec3::new(20.5, 4.0, 20.5);
+    let root = fine_root([30, 4, 20], [1, 2, 3], 1);
+    let before = serde_json::to_vec(&session.saved()).unwrap();
+    let invalid_object = ObjectEdit::Create {
+        object: ObjectPlacement {
+            kind: ObjectKind::Tree,
+            position: Vec3::splat(f32::NAN),
+            rotation: 0.0,
+        },
+    };
+    assert!(volume_transaction(
+        &mut session,
+        builder,
+        0,
+        vec![root.clone()],
+        vec![invalid_object],
+        vec![volume_edit([240, 32, 160], [248, 48, 176], Some(Glass))]
+    )
+    .is_err());
+    assert_eq!(serde_json::to_vec(&session.saved()).unwrap(), before);
+    assert!(volume_transaction(
+        &mut session,
+        builder,
+        0,
+        vec![root.clone()],
+        vec![],
+        vec![volume_edit([160, 32, 160], [176, 48, 176], Some(Glass))]
+    )
+    .unwrap_err()
+    .contains("inside a player"));
+    assert_eq!(serde_json::to_vec(&session.saved()).unwrap(), before);
+    assert!(volume_transaction(
+        &mut session,
+        builder,
+        0,
+        vec![root],
+        vec![],
+        vec![volume_edit([0, -1, 0], [8, 8, 8], None)]
+    )
+    .is_err());
+    assert_eq!(serde_json::to_vec(&session.saved()).unwrap(), before);
+    assert!(session.peers[&builder].undo.is_empty());
+}
+
+#[test]
+fn volume_replacements_obey_combined_wire_budget_before_any_mutation() {
+    use sauerteig_core::VolumeMaterial::Water;
+    let mut session = room();
+    let (builder, _events) = peer(&mut session, true);
+    session.geometry_bytes = crate::MAX_GEOMETRY_BYTES - 1;
+    let before = session.world.volumes().to_vec();
+    assert!(volume_transaction(
+        &mut session,
+        builder,
+        0,
+        vec![],
+        vec![],
+        vec![volume_edit([160, 32, 160], [176, 48, 176], Some(Water))]
+    )
+    .unwrap_err()
+    .contains("snapshot limit"));
+    assert_eq!(session.revision, 0);
+    assert_eq!(session.world.volumes(), before);
+    assert!(session.peers[&builder].undo.is_empty());
+}
+
+#[test]
+fn water_does_not_block_combat_but_glass_stops_shots_and_blast_visibility() {
+    use sauerteig_core::{
+        MaterialVolume,
+        VolumeMaterial::{Glass, Water},
+    };
+    let mut session = room();
+    let (shooter, _events) = peer(&mut session, false);
+    let (target, _events) = peer(&mut session, false);
+    session.peers.get_mut(&shooter).unwrap().player.position = Vec3::new(0.0, 1.0, 0.0);
+    session.peers.get_mut(&target).unwrap().player.position = Vec3::new(6.0, 1.0, 0.0);
+    let water = MaterialVolume {
+        bounds: FineBox {
+            min: [8, 8, -8],
+            max: [16, 40, 8],
+        },
+        material: Water,
+    };
+    session.world.replace_volumes(&[water]).unwrap();
+    let origin = session.peers[&shooter].player.eye();
+    assert_eq!(
+        session.trace(origin, Vec3::X, 10.0, shooter).1,
+        Some(target)
+    );
+    session
+        .world
+        .replace_volumes(&[
+            water,
+            MaterialVolume {
+                bounds: FineBox {
+                    min: [24, 8, -8],
+                    max: [25, 40, 8],
+                },
+                material: Glass,
+            },
+        ])
+        .unwrap();
+    let (distance, hit, collided) = session.trace(origin, Vec3::X, 10.0, shooter);
+    assert_eq!(distance, 3.0);
+    assert_eq!(hit, None);
+    assert!(collided);
+    let center = Vec3::new(2.9, 2.0, 0.0);
+    session.explode(center, shooter, None);
+    assert_eq!(session.peers[&target].player.health, 100);
+    session.world.replace_volumes(&[water]).unwrap();
+    session.explode(center, shooter, None);
+    assert!(session.peers[&target].player.health < 100);
 }
 
 fn peer(session: &mut Session, editing: bool) -> (u64, mpsc::Receiver<String>) {
@@ -259,6 +472,7 @@ fn precoalescing_saves_and_replacements_count_the_stored_geometry() {
     write_world(
         &path,
         &SavedWorld {
+            volumes: Vec::new(),
             format_version: 2,
             bounds: Default::default(),
             regions: Vec::new(),
@@ -1303,6 +1517,7 @@ fn transaction(
     session.handle(
         id,
         ClientMessage::EditTransaction {
+            volumes: Vec::new(),
             request: 1,
             base_revision,
             roots,
@@ -1621,6 +1836,7 @@ fn fighters_standing_on_a_negative_y_floor_do_not_fall_out_of_the_world() {
     }
     let mut session = Session::new(
         SavedWorld {
+            volumes: Vec::new(),
             revision: 0,
             format_version: 2,
             bounds: sauerteig_core::WorldBounds {
@@ -1731,6 +1947,7 @@ fn compact_snapshot_accounting_is_small_conservative_and_survives_cuts() {
         cell: Cell::solid(0),
     };
     let saved = SavedWorld {
+        volumes: Vec::new(),
         revision: 0,
         format_version: 2,
         bounds: sauerteig_core::WorldBounds {
@@ -1844,6 +2061,7 @@ fn snapshot_load_budget_counts_canonical_growth_before_accepting_roots() {
         }],
     };
     let saved = SavedWorld {
+        volumes: Vec::new(),
         revision: 0,
         format_version: 2,
         bounds: sauerteig_core::WorldBounds {

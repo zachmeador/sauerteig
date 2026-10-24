@@ -20,6 +20,15 @@ A blocker belongs in its work document with the next practical step.
 
 ## Complete scopes
 
+- Basic water/glass material volumes: verified on 2026-10-24 with transparent
+  rendering and underwater views in native/browser, shared browser edits visible
+  natively, material undo, blueprint capture, and swimming. Glass collision and
+  weapon blocking, sparse editing/transforms, stale conflicts, and save/rejoin
+  have regression coverage. All 271 workspace tests, Clippy, and both builds pass.
+  This uses simple alpha transparency; original liquid styles, lava/clip flags,
+  scene reflection/refraction, and broad GPU performance validation remain outside
+  this scope. [Controls](../editor.md#volumes-and-blueprints) and
+  [rendering limits](../development.md#rendering-and-assets).
 - Main menu and automatic session switching: verified on 2026-10-24 in native
   and browser clients. Opening the menu kept players connected; native editing,
   switching worlds, and reopening retained the edit. Browser server switching
@@ -39,8 +48,11 @@ A blocker belongs in its work document with the next practical step.
   [Storage and hosting](../development.md#hosting-and-saves).
 - Loading the available private OGZ archive into this Mac's saved-world library:
   15 conversions without solid-geometry omissions, four explicitly recovered
-  copies, and four rejected corrupt inputs. All 19 copies passed server open/save
-  checks. This completed local setup does **not** complete map restoration.
+  copies, and four rejected corrupt inputs. On 2026-10-24 all 19 untouched library
+  copies were refreshed with backups; 17 contain restored water/glass assignments.
+  All 19 passed two server open/save cycles with unchanged terrain and objects.
+  Original OGZ hashes are unchanged. This completed local setup does **not**
+  complete map restoration.
 
 ## How to keep this useful
 

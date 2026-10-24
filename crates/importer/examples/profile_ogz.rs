@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &restored.cells,
         &restored.roots,
     )?;
+    world.replace_volumes(&restored.volumes)?;
     let deserialize_and_load_ms = elapsed_ms(start);
     let keys = world.chunk_keys();
     let start = Instant::now();
@@ -111,6 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "stored_regions": save.regions.len(),
             "stored_coarse_cells": save.cells.len(),
             "stored_root_overrides": save.roots.len(),
+            "stored_material_volumes": save.volumes.len(),
             "saved_json_bytes": bytes.len(),
             "parse_ms": parse_ms,
             "import_and_validate_ms": import_ms,

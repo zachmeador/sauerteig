@@ -3,11 +3,20 @@ use crate::{
     Cube, Inventory, Map,
 };
 use sauerteig_core::{
-    Cell, CellEdit, CellFragment, ObjectKind, RootEdit, Shape, Vec3, World, WorldBounds,
-    WorldObject, SHAPE_FACES, WORLD_FORMAT_VERSION,
+    coalesce_material_volumes, Cell, CellEdit, CellFragment, MaterialVolume, ObjectKind, RootEdit,
+    Shape, Vec3, VolumeMaterial, World, WorldBounds, WorldObject, SHAPE_FACES,
+    WORLD_FORMAT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+// Canonical version-33 fields after translating the older byte encoding.
+const MATF_INDEX: u16 = 0x03;
+const MATF_VOLUME: u16 = 0x1c;
+const MATF_CLIP: u16 = 0xe0;
+const MAT_WATER: u16 = 4;
+const MAT_GLASS: u16 = 12;
+const MAT_CLIP: u16 = 64;
 
 #[derive(Clone, Debug)]
 pub struct ImportOptions {
@@ -44,6 +53,8 @@ pub struct ImportedWorld {
     #[serde(default)]
     pub regions: Vec<CellFragment>,
     #[serde(default)]
+    pub volumes: Vec<MaterialVolume>,
+    #[serde(default)]
     pub revision: u64,
     #[serde(default)]
     pub cells: Vec<CellEdit>,
@@ -78,6 +89,19 @@ pub struct ImportReport {
     pub imported_detailed_roots: usize,
     pub imported_regions: usize,
     pub imported_fragments: usize,
+    pub imported_water_leaves: usize,
+    pub imported_glass_leaves: usize,
+    pub imported_volume_boxes: usize,
+    pub volume_leaves_outside_region: usize,
+    pub volume_leaves_clipped_at_region: usize,
+    /// Normalized volume type/index values whose behavior is not imported.
+    pub unsupported_volume_material_leaves: BTreeMap<u16, usize>,
+    /// Independent source flags, excluding the supported glass clip flag.
+    pub material_flags_not_imported: BTreeMap<u16, usize>,
+    /// Non-default water/glass styles currently use the standard appearance.
+    pub volume_variants_not_imported: BTreeMap<u16, usize>,
+    /// Source glass with no clip or an override becomes collidable glass.
+    pub glass_leaves_with_collision_not_reproduced: usize,
     pub texture_slot_mapping: BTreeMap<u16, u8>,
     pub unmapped_texture_slot_faces: BTreeMap<u16, usize>,
     pub leaves_with_multiple_face_textures: usize,
@@ -103,6 +127,15 @@ impl ImportReport {
             imported_detailed_roots: 0,
             imported_regions: 0,
             imported_fragments: 0,
+            imported_water_leaves: 0,
+            imported_glass_leaves: 0,
+            imported_volume_boxes: 0,
+            volume_leaves_outside_region: 0,
+            volume_leaves_clipped_at_region: 0,
+            unsupported_volume_material_leaves: BTreeMap::new(),
+            material_flags_not_imported: BTreeMap::new(),
+            volume_variants_not_imported: BTreeMap::new(),
+            glass_leaves_with_collision_not_reproduced: 0,
             texture_slot_mapping: options.materials.clone(),
             unmapped_texture_slot_faces: BTreeMap::new(),
             leaves_with_multiple_face_textures: 0,
@@ -115,7 +148,9 @@ impl ImportReport {
                 "Imported geometry uses dynamic lighting. Baked lightmaps, merged render surfaces, PVS, blend maps and sky rendering are not imported.".into(),
                 "Texture slot references and virtual-slot metadata are retained in this report. Unmapped slots use neutral material 0; texture imagery is not inside OGZ.".into(),
                 "Each logical cube face retains its mapped material. World face order [-X,+X,-Y,+Y,-Z,+Z] maps to legacy face slots [0,1,4,5,3,2].".into(),
-                "Lights retain placement only: radius, color and spotlight attributes remain in the entity report. Mapmodels, pickups, triggers, sounds and volume effects need later adapters.".into(),
+                "Water and glass retain exact leaf bounds in a separate material-volume layer, including empty leaves. Adjacent matching boxes are merged without resampling; textured terrain remains independent.".into(),
+                "Water/glass use current appearance and behavior. Original styles, lava, independent clip/noclip/gameclip, death and alpha flags are counted explicitly when not reproduced; raw and normalized source values remain in the inventory.".into(),
+                "Lights retain placement only: radius, color and spotlight attributes remain in the entity report. Mapmodels, pickups, triggers and sounds need later adapters.".into(),
             ],
         }
     }
@@ -130,6 +165,34 @@ impl ImportReport {
         }
         self.leaves_with_multiple_face_textures += usize::from(counts.len() > 1);
         [0, 1, 4, 5, 3, 2].map(|face| *materials.get(&cube.textures[face]).unwrap_or(&0))
+    }
+
+    fn record_source_material(&mut self, material: u16) {
+        let volume = material & MATF_VOLUME;
+        let index = material & MATF_INDEX;
+        let mut flags = material & !(MATF_VOLUME | MATF_INDEX);
+        if volume == MAT_GLASS && flags & MATF_CLIP == MAT_CLIP {
+            // Source glass commonly carries MAT_CLIP. Our glass already clips.
+            flags &= !MAT_CLIP;
+        }
+        if flags != 0 {
+            *self.material_flags_not_imported.entry(flags).or_default() += 1;
+        }
+        if volume != 0 && volume != MAT_WATER && volume != MAT_GLASS {
+            *self
+                .unsupported_volume_material_leaves
+                .entry(volume | index)
+                .or_default() += 1;
+        }
+        if (volume == MAT_WATER || volume == MAT_GLASS) && index != 0 {
+            *self
+                .volume_variants_not_imported
+                .entry(volume | index)
+                .or_default() += 1;
+        }
+        if volume == MAT_GLASS && material & MATF_CLIP != MAT_CLIP {
+            self.glass_leaves_with_collision_not_reproduced += 1;
+        }
     }
 }
 
@@ -169,21 +232,42 @@ pub fn convert(
     let world_bounds = bounds.fine_box();
     let mut report = ImportReport::new(map, options, &transform);
     let mut regions = Vec::new();
+    let mut volumes = Vec::new();
     for cube in &map.cubes {
-        if cube.is_empty() {
+        let material = cube.normalized_material(map.header.version);
+        report.record_source_material(material);
+        let volume = match material & MATF_VOLUME {
+            MAT_WATER => Some(VolumeMaterial::Water),
+            MAT_GLASS => Some(VolumeMaterial::Glass),
+            _ => None,
+        };
+        if cube.is_empty() && volume.is_none() {
             continue;
         }
         if transform.overlap(cube) == RegionOverlap::Outside {
-            report.leaves_outside_region += 1;
+            report.leaves_outside_region += usize::from(!cube.is_empty());
+            report.volume_leaves_outside_region += usize::from(volume.is_some());
             continue;
         }
         let source_bounds = transform.cube_bounds(cube)?;
         let Some(bounds) = source_bounds.intersection(world_bounds) else {
-            report.leaves_outside_region += 1;
+            report.leaves_outside_region += usize::from(!cube.is_empty());
+            report.volume_leaves_outside_region += usize::from(volume.is_some());
             continue;
         };
         if bounds != source_bounds {
-            report.leaves_clipped_at_region += 1;
+            report.leaves_clipped_at_region += usize::from(!cube.is_empty());
+            report.volume_leaves_clipped_at_region += usize::from(volume.is_some());
+        }
+        if let Some(material) = volume {
+            match material {
+                VolumeMaterial::Water => report.imported_water_leaves += 1,
+                VolumeMaterial::Glass => report.imported_glass_leaves += 1,
+            }
+            volumes.push(MaterialVolume { bounds, material });
+        }
+        if cube.is_empty() {
+            continue;
         }
         let face_materials = report.face_materials_for(cube, &options.materials);
         let mut cell = match cube_cell(cube, face_materials[0]) {
@@ -217,11 +301,23 @@ pub fn convert(
             cell,
         });
     }
-    if !options.crop && (report.leaves_outside_region > 0 || report.leaves_clipped_at_region > 0) {
-        return Err("source geometry lies outside its declared legacy world bounds".into());
+    if !options.crop
+        && (report.leaves_outside_region > 0
+            || report.leaves_clipped_at_region > 0
+            || report.volume_leaves_outside_region > 0
+            || report.volume_leaves_clipped_at_region > 0)
+    {
+        return Err(
+            "source geometry or material volumes lie outside declared legacy world bounds".into(),
+        );
     }
-    let world = World::from_compact_parts(bounds, &regions, &[], &[])
+    let volumes = coalesce_material_volumes(volumes);
+    let mut world = World::from_compact_parts(bounds, &regions, &[], &[])
         .map_err(|e| format!("imported geometry validation failed: {e}"))?;
+    world
+        .replace_volumes(&volumes)
+        .map_err(|e| format!("imported material-volume validation failed: {e}"))?;
+    report.imported_volume_boxes = volumes.len();
     let regions = world.regions();
     let cells = world.cells();
     let roots = world.root_overrides();
@@ -230,8 +326,8 @@ pub fn convert(
     report.imported_regions = regions.len();
     report.imported_fragments =
         regions.len() + cells.len() + roots.iter().map(|r| r.fragments.len()).sum::<usize>();
-    if report.imported_fragments == 0 {
-        return Err("the chosen region contains no importable geometry".into());
+    if report.imported_fragments == 0 && volumes.is_empty() {
+        return Err("the chosen region contains no importable geometry or material volumes".into());
     }
     let mut objects = Vec::new();
     for entity in &map.entities {
@@ -277,6 +373,7 @@ pub fn convert(
             format_version: WORLD_FORMAT_VERSION,
             bounds,
             regions,
+            volumes,
             revision: 0,
             cells,
             roots,
@@ -371,6 +468,7 @@ fn cube_cell(cube: &Cube, material: u8) -> Result<Cell, String> {
 mod tests {
     use super::*;
     use crate::Header;
+    use sauerteig_core::FineBox;
     fn map(cubes: Vec<Cube>) -> Map {
         Map {
             header: Header {
@@ -411,6 +509,198 @@ mod tests {
         cube.edges[8] = 0;
         cube.edges[10] = 0;
         cube
+    }
+
+    fn empty_volume(origin: [i32; 3], size: u32, material: u16) -> Cube {
+        Cube {
+            origin,
+            size,
+            kind: 1,
+            edges: [0; 12],
+            textures: [9; 6],
+            volume_material: material,
+        }
+    }
+
+    #[test]
+    fn empty_water_and_glass_import_without_solid_geometry_and_survive_save() {
+        let source = map(vec![
+            empty_volume([0, 0, 0], 8, 4),
+            empty_volume([16, 0, 0], 8, 76),
+        ]);
+        let (save, report) = convert(&source, &options()).unwrap();
+        assert!(save.regions.is_empty() && save.cells.is_empty() && save.roots.is_empty());
+        assert_eq!(report.imported_water_leaves, 1);
+        assert_eq!(report.imported_glass_leaves, 1);
+        assert_eq!(report.imported_volume_boxes, 2);
+        assert!(report.material_flags_not_imported.is_empty());
+        assert!(report.unmapped_texture_slot_faces.is_empty());
+        let restored: ImportedWorld =
+            serde_json::from_slice(&serde_json::to_vec(&save).unwrap()).unwrap();
+        assert_eq!(restored.volumes, save.volumes);
+        assert!(save.volumes.contains(&MaterialVolume {
+            bounds: FineBox {
+                min: [0, 0, -8],
+                max: [8, 8, 0],
+            },
+            material: VolumeMaterial::Water,
+        }));
+        assert!(save.volumes.contains(&MaterialVolume {
+            bounds: FineBox {
+                min: [16, 0, -8],
+                max: [24, 8, 0],
+            },
+            material: VolumeMaterial::Glass,
+        }));
+    }
+
+    #[test]
+    fn deformed_terrain_and_its_empty_space_material_remain_independent() {
+        let terrain = ramp();
+        let mut with_water = terrain.clone();
+        with_water.volume_material = 4;
+        let (plain, _) = convert(&map(vec![terrain]), &options()).unwrap();
+        let (water, report) = convert(&map(vec![with_water]), &options()).unwrap();
+        assert_eq!(water.regions, plain.regions);
+        assert_eq!(water.volumes.len(), 1);
+        assert_eq!(
+            water.volumes[0].bounds,
+            plain.regions[0].source_bounds().unwrap()
+        );
+        assert_eq!(water.volumes[0].material, VolumeMaterial::Water);
+        assert_eq!(report.imported_water_leaves, 1);
+    }
+
+    #[test]
+    fn legacy_byte_and_current_materials_convert_to_the_same_volumes() {
+        for version in 29..=33 {
+            let mut source = map(vec![
+                empty_volume([0, 0, 0], 8, if version <= 32 { 1 } else { 4 }),
+                empty_volume([16, 0, 0], 8, if version <= 32 { 19 } else { 76 }),
+            ]);
+            source.header.version = version;
+            let (save, report) = convert(&source, &options()).unwrap();
+            assert_eq!(save.volumes.len(), 2);
+            assert_eq!(report.imported_water_leaves, 1);
+            assert_eq!(report.imported_glass_leaves, 1);
+            assert!(report.material_flags_not_imported.is_empty());
+        }
+    }
+
+    #[test]
+    fn unsupported_source_behaviors_and_style_variants_are_reported() {
+        let source = map(vec![
+            empty_volume([0, 0, 0], 8, 7),     // water4
+            empty_volume([8, 0, 0], 8, 79),    // glass4 + clip
+            empty_volume([16, 0, 0], 8, 264),  // lava + death
+            empty_volume([24, 0, 0], 8, 64),   // independent clip
+            empty_volume([32, 0, 0], 8, 32),   // noclip
+            empty_volume([40, 0, 0], 8, 96),   // gameclip
+            empty_volume([48, 0, 0], 8, 1024), // alpha
+            empty_volume([56, 0, 0], 8, 12),   // glass without clip
+        ]);
+        let (save, report) = convert(&source, &options()).unwrap();
+        assert_eq!(save.volumes.len(), 3);
+        assert_eq!(
+            report.unsupported_volume_material_leaves,
+            BTreeMap::from([(8, 1)])
+        );
+        assert_eq!(
+            report.material_flags_not_imported,
+            BTreeMap::from([(32, 1), (64, 1), (96, 1), (256, 1), (1024, 1)])
+        );
+        assert_eq!(
+            report.volume_variants_not_imported,
+            BTreeMap::from([(7, 1), (15, 1)])
+        );
+        assert_eq!(report.glass_leaves_with_collision_not_reproduced, 1);
+        assert_eq!(report.source.volume_material_leaves.len(), 8);
+    }
+
+    #[test]
+    fn material_volumes_keep_original_scale_and_require_explicit_crop() {
+        let mut source = map(vec![empty_volume([0; 3], 1024, 4)]);
+        source.header.world_size = 1024;
+        let mut opts = options();
+        let (full, report) = convert(&source, &opts).unwrap();
+        assert_eq!(full.volumes[0].bounds, full.bounds.fine_box());
+        assert_eq!(full.bounds.min, [0, 0, -128]);
+        assert_eq!(full.bounds.max, [128, 128, 0]);
+        assert_eq!(report.volume_leaves_clipped_at_region, 0);
+        opts.crop = true;
+        let (cropped, report) = convert(&source, &opts).unwrap();
+        assert_eq!(report.volume_leaves_clipped_at_region, 1);
+        assert_eq!(report.leaves_clipped_at_region, 0);
+        assert_eq!(
+            cropped.volumes[0].bounds,
+            FineBox {
+                min: [0, 0, -512],
+                max: [512, 384, 0],
+            }
+        );
+        let outside = map(vec![empty_volume([512, 0, 0], 8, 4)]);
+        assert!(convert(&outside, &options())
+            .unwrap_err()
+            .contains("outside"));
+        let too_fine = map(vec![empty_volume([0; 3], 1, 4)]);
+        opts.crop = false;
+        opts.units_per_metre = 16;
+        assert!(convert(&too_fine, &opts)
+            .unwrap_err()
+            .contains("finer than"));
+    }
+
+    #[test]
+    fn adjacent_volume_merging_preserves_gaps_and_material_boundaries() {
+        let box_at = |min: [i32; 3], material| MaterialVolume {
+            bounds: FineBox {
+                min,
+                max: min.map(|v| v + 8),
+            },
+            material,
+        };
+        let cubes: Vec<_> = (0..8)
+            .map(|i| {
+                box_at(
+                    std::array::from_fn(|a| if i & (1 << a) == 0 { 0 } else { 8 }),
+                    VolumeMaterial::Water,
+                )
+            })
+            .collect();
+        let merged = coalesce_material_volumes(cubes);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].bounds,
+            FineBox {
+                min: [0; 3],
+                max: [16; 3]
+            }
+        );
+
+        let original = vec![
+            box_at([0, 0, 0], VolumeMaterial::Water),
+            box_at([8, 0, 0], VolumeMaterial::Water),
+            box_at([0, 8, 0], VolumeMaterial::Water),
+            box_at([8, 8, 0], VolumeMaterial::Glass),
+            box_at([24, 0, 0], VolumeMaterial::Water),
+        ];
+        let merged = coalesce_material_volumes(original.clone());
+        assert_eq!(merged.len(), 4);
+        for x in 0..32 {
+            for y in 0..16 {
+                let point = FineBox {
+                    min: [x, y, 0],
+                    max: [x + 1, y + 1, 1],
+                };
+                let material_at = |volumes: &[MaterialVolume]| {
+                    volumes
+                        .iter()
+                        .find(|v| v.bounds.contains(point))
+                        .map(|v| v.material)
+                };
+                assert_eq!(material_at(&original), material_at(&merged));
+            }
+        }
     }
     #[test]
     fn large_legacy_ramp_keeps_exact_surface_collision_and_save_geometry() {
@@ -492,7 +782,7 @@ mod tests {
         .unwrap();
         assert_eq!(save.format_version, 1);
         assert_eq!(save.bounds, WorldBounds::default());
-        assert!(save.regions.is_empty() && save.roots.is_empty());
+        assert!(save.regions.is_empty() && save.roots.is_empty() && save.volumes.is_empty());
         assert_eq!(save.cells[0].cell.unwrap().material_for_face(5), 3);
     }
 

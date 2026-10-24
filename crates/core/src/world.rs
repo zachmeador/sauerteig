@@ -225,6 +225,7 @@ pub struct World {
     pub(crate) bounds: crate::WorldBounds,
     pub(crate) compact: crate::compact::CompactWorld,
     pub(crate) overrides: BTreeSet<CellPos>,
+    pub(crate) volumes: crate::volumes::VolumeLayer,
 }
 
 // Old array/object saves remain readable; new snapshots name their format explicitly.
@@ -233,6 +234,7 @@ impl Serialize for World {
         if !self.has_regions()
             && self.bounds == crate::WorldBounds::default()
             && self.fine.is_empty()
+            && self.volumes().is_empty()
         {
             return self.cells().serialize(serializer);
         }
@@ -243,6 +245,8 @@ impl Serialize for World {
             regions: Vec<crate::CellFragment>,
             cells: Vec<CellEdit>,
             roots: Vec<crate::RootEdit>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            volumes: Vec<crate::MaterialVolume>,
         }
         Parts {
             format_version: crate::WORLD_FORMAT_VERSION,
@@ -250,6 +254,7 @@ impl Serialize for World {
             regions: self.regions(),
             cells: self.cells(),
             roots: self.root_overrides(),
+            volumes: self.volumes().to_vec(),
         }
         .serialize(serializer)
     }
@@ -271,6 +276,8 @@ impl<'de> Deserialize<'de> for World {
                 cells: Vec<CellEdit>,
                 #[serde(default)]
                 roots: Vec<crate::RootEdit>,
+                #[serde(default)]
+                volumes: Vec<crate::MaterialVolume>,
             },
         }
         match Parts::deserialize(deserializer)? {
@@ -281,11 +288,15 @@ impl<'de> Deserialize<'de> for World {
                 regions,
                 cells,
                 roots,
+                volumes,
             } => {
                 if format_version > crate::WORLD_FORMAT_VERSION {
                     return Err(serde::de::Error::custom("Unsupported world format version"));
                 }
-                Self::from_compact_parts(bounds, &regions, &cells, &roots)
+                Self::from_compact_parts(bounds, &regions, &cells, &roots).and_then(|mut world| {
+                    world.replace_volumes(&volumes)?;
+                    Ok(world)
+                })
             }
         }
         .map_err(serde::de::Error::custom)

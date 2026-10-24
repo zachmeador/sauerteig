@@ -8,6 +8,8 @@ pub const MOVE_SPEED: f32 = 9.0;
 pub const FLY_SPEED: f32 = 16.0;
 pub const JUMP_SPEED: f32 = 8.2;
 pub const GRAVITY: f32 = 25.0;
+pub const SWIM_SPEED: f32 = 4.5;
+pub const WATER_DRAG: f32 = 3.0;
 const STEP_HEIGHT: f32 = 0.56;
 const SKIN: f32 = 0.0002;
 
@@ -57,6 +59,11 @@ pub fn player_intersects_fragment(player: &Player, fragment: &crate::CellFragmen
     crate::fine::fragment_intersects_box(fragment, min, max)
 }
 
+pub fn player_intersects_volume(player: &Player, volume: &crate::MaterialVolume) -> bool {
+    let (min, max) = body_bounds(player.position);
+    min.cmplt(volume.bounds.world_max()).all() && max.cmpgt(volume.bounds.world_min()).all()
+}
+
 pub fn ray_player(
     origin: Vec3,
     direction: Vec3,
@@ -82,6 +89,34 @@ pub fn ray_player(
 /// Highest surface in the requested vertical interval under the player's box.
 /// Each cell is two triangular prisms, rather than a flat average-height block.
 fn support_between(world: &World, feet: Vec3, min_y: f32, max_y: f32) -> Option<f32> {
+    let terrain = terrain_support_between(world, feet, min_y, max_y);
+    let glass = volume_support(world, feet, min_y, max_y, false);
+    match (terrain, glass) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn volume_support(world: &World, feet: Vec3, low: f32, high: f32, ceiling: bool) -> Option<f32> {
+    let (mut min, mut max) = body_bounds(feet);
+    let skin = contact_skin(feet);
+    min.y = low - skin;
+    max.y = high + skin;
+    world
+        .solid_volumes_in_box(min, max)
+        .into_iter()
+        .filter_map(|volume| {
+            let height = if ceiling {
+                volume.bounds.world_min().y
+            } else {
+                volume.bounds.world_max().y
+            };
+            (height >= low - skin && height <= high + skin).then_some(height)
+        })
+        .reduce(|a, b| if ceiling { a.min(b) } else { a.max(b) })
+}
+
+fn terrain_support_between(world: &World, feet: Vec3, min_y: f32, max_y: f32) -> Option<f32> {
     let (min, max) = body_bounds(feet);
     let skin = contact_skin(feet);
     if world.has_regions() {
@@ -142,6 +177,15 @@ fn support_between(world: &World, feet: Vec3, min_y: f32, max_y: f32) -> Option<
 }
 
 fn first_ceiling(world: &World, feet: Vec3, old_head: f32, new_head: f32) -> Option<f32> {
+    let terrain = terrain_first_ceiling(world, feet, old_head, new_head);
+    let glass = volume_support(world, feet, old_head, new_head, true);
+    match (terrain, glass) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn terrain_first_ceiling(world: &World, feet: Vec3, old_head: f32, new_head: f32) -> Option<f32> {
     let (min, max) = body_bounds(feet);
     let skin = contact_skin(feet);
     if world.has_regions() {
@@ -354,7 +398,7 @@ fn accumulate_support(
 
 fn free_at(world: &World, position: Vec3) -> bool {
     let (min, max) = body_bounds(position);
-    !world.intersects_box(min, max)
+    !world.intersects_box(min, max) && !world.intersects_solid_volume(min, max)
 }
 
 fn move_horizontal(world: &World, player: &mut Player, axis: usize, amount: f32) {
@@ -483,9 +527,13 @@ pub fn simulate_player(world: &World, player: &mut Player, input: &InputFrame, d
         player.grounded = false;
     }
 
+    let swimming = world.volume_material_at(player.position + Vec3::Y * (PLAYER_HEIGHT * 0.5))
+        == Some(crate::VolumeMaterial::Water);
     // Ground friction, acceleration along the requested direction, and retained
     // air momentum give movement a fast arena-FPS feel rather than a lerp.
-    if player.grounded && !input.jump {
+    if swimming {
+        player.velocity *= (1.0 - WATER_DRAG * dt).max(0.0);
+    } else if player.grounded && !input.jump {
         let speed = Vec3::new(player.velocity.x, 0.0, player.velocity.z).length();
         if speed > 0.0001 {
             let reduced = (speed - speed.max(2.5) * 7.0 * dt).max(0.0) / speed;
@@ -495,20 +543,39 @@ pub fn simulate_player(world: &World, player: &mut Player, input: &InputFrame, d
     }
     let wish = (forward(player.yaw, 0.0) * axis(input.forward) + right * axis(input.strafe))
         .clamp_length_max(1.0);
-    let wish_speed = wish.length() * MOVE_SPEED;
+    let wish_speed = wish.length() * if swimming { SWIM_SPEED } else { MOVE_SPEED };
     if wish_speed > 0.0 {
         let direction = wish.normalize();
         let needed = wish_speed - player.velocity.dot(direction);
         if needed > 0.0 {
-            let acceleration = if player.grounded { 14.0 } else { 3.0 };
+            let acceleration = if swimming {
+                6.0
+            } else if player.grounded {
+                14.0
+            } else {
+                3.0
+            };
             player.velocity += direction * needed.min(acceleration * wish_speed * dt);
         }
     }
-    if player.grounded && input.jump {
+    if swimming {
+        let vertical = if input.jump {
+            1.0
+        } else {
+            axis(input.vertical)
+        };
+        if vertical != 0.0 {
+            let target = vertical * SWIM_SPEED;
+            let change =
+                (target - player.velocity.y).clamp(-SWIM_SPEED * 6.0 * dt, SWIM_SPEED * 6.0 * dt);
+            player.velocity.y += change;
+        }
+        player.grounded = false;
+    } else if player.grounded && input.jump {
         player.velocity.y = JUMP_SPEED;
         player.grounded = false;
     }
-    player.velocity.y -= GRAVITY * dt;
+    player.velocity.y -= GRAVITY * if swimming { 0.12 } else { 1.0 } * dt;
     let substeps = ((player.velocity.length() * dt / 0.15).ceil() as usize).clamp(1, 64);
     let step_dt = dt / substeps as f32;
     for _ in 0..substeps {

@@ -5,8 +5,8 @@ use crate::{
     MAX_WORLD_FRAGMENTS, MAX_WORLD_SNAPSHOT_BYTES,
 };
 use sauerteig_core::{
-    arena_objects, validate_root_edits, CellEdit, CellFragment, RootEdit, World, WorldBounds,
-    WorldObject, WORLD_FORMAT_VERSION,
+    arena_objects, validate_root_edits, CellEdit, CellFragment, MaterialVolume, RootEdit, World,
+    WorldBounds, WorldObject, WORLD_FORMAT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::Path};
@@ -25,6 +25,8 @@ pub(super) struct SavedWorld {
     pub(super) cells: Vec<CellEdit>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) roots: Vec<RootEdit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) volumes: Vec<MaterialVolume>,
     pub(super) objects: Vec<WorldObject>,
     #[serde(default)]
     pub(super) next_object: u32,
@@ -39,6 +41,7 @@ pub(super) fn load_world(path: &Path) -> Result<SavedWorld, String> {
             regions: Vec::new(),
             cells: World::arena().cells(),
             roots: Vec::new(),
+            volumes: Vec::new(),
             objects: arena_objects(),
             next_object: 0,
         });
@@ -86,7 +89,15 @@ pub(super) fn load_world(path: &Path) -> Result<SavedWorld, String> {
         }
     }
     validate_snapshot_geometry(&saved.regions, &saved.cells, &saved.roots)?;
-    World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)?;
+    if crate::snapshot_geometry_bytes(&saved.regions, &saved.cells, &saved.roots)
+        + crate::json_bytes(&saved.volumes)
+        > crate::MAX_GEOMETRY_BYTES
+    {
+        return Err(crate::SNAPSHOT_LIMIT_ERROR.into());
+    }
+    let mut world =
+        World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)?;
+    world.replace_volumes(&saved.volumes)?;
     for object in &saved.objects {
         let position = object.position.floor().as_ivec3().to_array();
         if !saved.bounds.contains_pos(position) {

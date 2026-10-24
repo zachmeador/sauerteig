@@ -266,7 +266,7 @@ impl Game {
                                 if let Some(entry) = self.library.get(id) {
                                     let dims = entry.clipboard.dims().map(|v| v as f32 / 8.0);
                                     ui.label(format!("{} × {} × {} m", dims[0], dims[1], dims[2]));
-                                    ui.label(format!("{} selection volumes · {} objects", entry.clipboard.mask().boxes().len(), entry.clipboard.objects().len()));
+                                    ui.label(format!("{} selection volumes · {} objects · {} material regions", entry.clipboard.mask().boxes().len(), entry.clipboard.objects().len(), entry.clipboard.volumes().len()));
                                     ui.add_space(8.0);
                                     ui.label("Name");
                                     ui.text_edit_singleline(&mut self.library_ui.edit_name);
@@ -323,7 +323,7 @@ impl Game {
                     });
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(&self.library_status).color(COPPER).small());
-                    ui.label(egui::RichText::new("Geometry and objects · stored on this device").color(MUTED).small());
+                    ui.label(egui::RichText::new("Geometry, materials and objects · stored on this device").color(MUTED).small());
                     ui.horizontal(|ui| {
                         if !self.library_ready && ui.button("Retry loading").clicked() {
                             self.library_status = "Loading…".into();
@@ -389,6 +389,27 @@ impl Game {
                 }
                 let regions = self.selected_regions();
                 ui.label(format!("{} volumes · {:.3} m³", regions.boxes().len(), regions.volume() as f64 / 512.0));
+                ui.separator();
+                ui.label("Volume material");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("volume-material")
+                        .selected_text(match self.volume_material {
+                            None => "Normal space",
+                            Some(VolumeMaterial::Water) => "Water",
+                            Some(VolumeMaterial::Glass) => "Glass",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.volume_material, None, "Normal space");
+                            ui.selectable_value(&mut self.volume_material, Some(VolumeMaterial::Water), "Water");
+                            ui.selectable_value(&mut self.volume_material, Some(VolumeMaterial::Glass), "Glass");
+                        });
+                    if ui.add_enabled(!regions.boxes().is_empty() && !self.editing_busy(), egui::Button::new("Apply")).clicked() {
+                        self.edit_queue.push_back(EditIntent::Volume(self.volume_material));
+                    }
+                });
+                ui.weak("Fills selected space. Solid geometry stays in place.");
+                ui.checkbox(&mut self.select_volumes, "Select water and glass surfaces");
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Copy").clicked() { self.copy_selection(); }
                     if ui.button("Blueprints").clicked() { self.show_blueprints = true; }

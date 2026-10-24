@@ -156,6 +156,44 @@ mod tests {
         assert!(!editor.vertices.is_empty());
         assert!(!editor.indices.is_empty());
         assert_eq!(editor.shadow_index_count, 0);
+        assert_eq!(editor.opaque_index_count, 0);
+    }
+
+    #[test]
+    fn actors_and_effects_precede_transparency_while_guides_and_weapon_follow_it() {
+        let mut game = Game::new(String::new(), "volume draw order".into());
+        let remote = Player::new(game.local.id + 1, "remote".into());
+        game.players = vec![remote];
+        game.projectiles = vec![Projectile {
+            id: 1,
+            owner: game.local.id,
+            position: Vec3::new(10.0, 3.0, 4.0),
+            velocity: Vec3::Z * 10.0,
+        }];
+        game.effects = vec![(
+            ShotEffect {
+                from: Vec3::new(1.0, 2.0, 3.0),
+                to: Vec3::new(4.0, 2.0, 3.0),
+                owner: game.local.id,
+                hit: false,
+            },
+            0.0,
+        )];
+        let physical = game.geometry();
+        assert!(physical.shadow_index_count > 0);
+        assert!(physical.opaque_index_count > physical.shadow_index_count);
+        assert_eq!(physical.indices.len() as u32, physical.opaque_index_count);
+
+        game.players[0].editing = true;
+        game.captured = true;
+        let guided = game.geometry();
+        assert_eq!(guided.shadow_index_count, physical.shadow_index_count);
+        assert_eq!(guided.opaque_index_count, physical.opaque_index_count);
+        assert!(guided.indices.len() > physical.indices.len());
+        assert_eq!(
+            &guided.indices[..guided.opaque_index_count as usize],
+            &physical.indices
+        );
     }
 }
 impl ModeState {
@@ -202,6 +240,7 @@ enum EditIntent {
     Carve,
     Deform(i8),
     Paint(u8),
+    Volume(Option<VolumeMaterial>),
     Paste(Clipboard),
 }
 struct PendingEdit {
@@ -278,6 +317,8 @@ pub struct Game {
     library_ui: LibraryUi,
     regions: RegionSet,
     selection_mode: SelectionMode,
+    volume_material: Option<VolumeMaterial>,
+    select_volumes: bool,
     selecting_subtract: bool,
     paste_preview: bool,
     pub fps: f32,
@@ -362,6 +403,8 @@ impl Game {
             library_ui: LibraryUi::default(),
             regions: RegionSet::new(),
             selection_mode: SelectionMode::Replace,
+            volume_material: None,
+            select_volumes: true,
             selecting_subtract: false,
             paste_preview: false,
             fps: 60.0,
@@ -592,6 +635,7 @@ impl Game {
                 objects,
                 players,
                 editing_allowed,
+                volumes,
             } => {
                 if format_version > WORLD_FORMAT_VERSION {
                     self.notify(
@@ -601,12 +645,19 @@ impl Game {
                     self.connected = false;
                     return;
                 }
-                let Ok(world) = World::from_compact_parts(bounds, &regions, &cells, &roots) else {
+                let Ok(mut world) = World::from_compact_parts(bounds, &regions, &cells, &roots)
+                else {
                     self.notify("Server sent invalid world geometry.");
                     self.socket = None;
                     self.connected = false;
                     return;
                 };
+                if world.replace_volumes(&volumes).is_err() {
+                    self.notify("Server sent invalid material volumes.");
+                    self.socket = None;
+                    self.connected = false;
+                    return;
+                }
                 self.world = world;
                 self.objects = objects;
                 self.players = players;
@@ -728,20 +779,39 @@ impl Game {
                 revision,
                 roots,
                 objects,
+                volumes,
             } => {
                 if revision <= self.revision {
                     return;
                 }
                 let start = web_time::Instant::now();
+                if let Some(volumes) = &volumes {
+                    if validate_material_volumes(volumes, self.world.bounds().fine_box()).is_err() {
+                        self.notify("Server sent invalid material volumes.");
+                        self.socket = None;
+                        self.connected = false;
+                        self.reconnect_at = self.time + 1.0;
+                        return;
+                    }
+                }
                 match self.world.apply_root_edits(&roots) {
                     Ok(chunks) => {
                         if let Some(pending) = &mut self.pending_object {
                             pending.observe_patch(&self.objects, &objects);
                         }
+                        let objects_changed = self.objects != objects;
                         self.objects = objects;
                         self.revision = revision;
                         renderer.rebuild(&self.world, &chunks);
-                        self.rebuild_objects(renderer);
+                        if let Some(volumes) = volumes {
+                            self.world
+                                .replace_volumes(&volumes)
+                                .expect("validated volume patch");
+                            renderer.rebuild_volumes(&self.world);
+                        }
+                        if objects_changed {
+                            self.rebuild_objects(renderer);
+                        }
                         self.last_edit_ms = start.elapsed().as_secs_f32() * 1000.0;
                         self.peak_edit_ms = self.peak_edit_ms.max(self.last_edit_ms);
                         if self.local.editing {
@@ -1139,6 +1209,16 @@ impl Game {
         }
         let (origin, direction) = self.edit_ray();
         self.selected = self.world.raycast(origin, direction, 60.0);
+        if self.select_volumes {
+            if let Some(hit) = self.world.raycast_volumes(origin, direction, 60.0) {
+                if self
+                    .selected
+                    .is_none_or(|solid| hit.distance < solid.distance)
+                {
+                    self.selected = Some(hit);
+                }
+            }
+        }
         if let Some(drag) = &self.selection_drag {
             match drag.update(origin, direction) {
                 Ok(selection) => self.selection = Some(selection),
@@ -1320,6 +1400,9 @@ impl Game {
             EditIntent::Paint(material) => {
                 selection.plan_paint_regions(&self.world, &self.selected_regions(), material)
             }
+            EditIntent::Volume(material) => {
+                selection.plan_volume_regions(&self.world, &self.selected_regions(), material)
+            }
             EditIntent::Deform(delta) => match self.edge {
                 Some(edge) => selection.plan_deform_edge(&self.world, edge, delta),
                 None => selection.plan_deform(&self.world, self.corner, delta),
@@ -1329,12 +1412,13 @@ impl Game {
         match plan {
             Ok(plan) => {
                 self.edit_request = self.edit_request.wrapping_add(1);
-                let message = if !objects.is_empty() {
+                let message = if !objects.is_empty() || !plan.volumes.is_empty() {
                     ClientMessage::EditTransaction {
                         request: self.edit_request,
                         base_revision: self.revision,
                         roots: plan.roots.clone(),
                         objects,
+                        volumes: plan.volumes.clone(),
                     }
                 } else if !plan.roots.is_empty() {
                     ClientMessage::EditRoots {
@@ -1498,15 +1582,6 @@ impl Game {
             }
         }
         mesh.shadow_index_count = mesh.indices.len() as u32;
-        for player in &self.players {
-            if player.id != self.local.id && player.editing {
-                let mut p = player.clone();
-                if let Some(position) = self.remote_positions.get(&p.id) {
-                    p.position = *position;
-                }
-                mesh.player_guide(&p);
-            }
-        }
         for rocket in &self.projectiles {
             mesh.cuboid(
                 rocket.position,
@@ -1535,6 +1610,16 @@ impl Game {
                 },
                 1.0,
             );
+        }
+        mesh.opaque_index_count = mesh.indices.len() as u32;
+        for player in &self.players {
+            if player.id != self.local.id && player.editing {
+                let mut p = player.clone();
+                if let Some(position) = self.remote_positions.get(&p.id) {
+                    p.position = *position;
+                }
+                mesh.player_guide(&p);
+            }
         }
         if self.local.editing {
             for object in &self.objects {

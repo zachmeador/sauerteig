@@ -577,10 +577,13 @@ impl Runtime {
             self.game.eye(),
             self.game.direction(),
             self.game.time,
+            self.game.world.volume_material_at(self.game.eye())
+                == Some(sauerteig_core::VolumeMaterial::Water),
             &self.game.objects,
             &mesh.vertices,
             &mesh.indices,
             mesh.shadow_index_count,
+            mesh.opaque_index_count,
             output,
             &self.context,
         ) {
