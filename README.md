@@ -9,24 +9,21 @@ live arena. Written in Rust, with native desktop and WebGPU browser clients.
 Install [Rust](https://rustup.rs/), then run these commands from the repository
 root. Linux builds also need the [system libraries](docs/development.md#linux-dependencies).
 
-Start the server:
+Start the native app:
 
 ```sh
 . ./scripts/env.sh
-cargo run -p sauerteig-server
+cargo run -p sauerteig-client
 ```
 
-In another terminal, start a client:
+Choose **New world**, **Continue**, or **Join server**. Opening a local world
+starts its server automatically; **Save and leave** stops it after saving.
+Named worlds, player name, and the last server are remembered. Local hosting
+accepts players on this computer; enable LAN hosting to let other computers join.
 
-```sh
-. ./scripts/env.sh
-cargo run -p sauerteig-client -- --name Player
-```
-
-Additional clients join the same room. The default server is
-`ws://127.0.0.1:3000/ws`; use the client's `--server` option to change it.
-Worlds save automatically to `.local/world.json`. A new save starts with the
-industrial arena; `--world PATH` selects another save.
+On macOS, `./scripts/build-macos-app.sh` creates `.local/Sauerteig.app`, including
+the browser client. Double-click it to play. Existing world JSON files can be
+copied into the world picker through **Import an existing world**.
 
 ### Browser
 
@@ -38,7 +35,7 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.100 --locked
 ```
 
-Build the client, then start or restart the server:
+Build the client and run a standalone server:
 
 ```sh
 ./scripts/build-web.sh
@@ -49,8 +46,9 @@ Open **http://localhost:3000/?name=Player** in a browser with WebGPU enabled.
 Browser and native players share the same room. Hosting away from localhost
 requires HTTPS and secure WebSockets. See [development and hosting](docs/development.md).
 
-On macOS, `./scripts/build-macos-app.sh` creates `.local/Sauerteig.app`.
-The server runs separately.
+The native app's Session panel also provides the browser address for its hosted
+world. The browser can join servers; creating and hosting worlds uses the native
+app or standalone server.
 
 ## Playing and editing
 
@@ -65,9 +63,10 @@ blueprints, and **F2** opens settings, including scroll inversion.
 - [Geometry and multiplayer invariants](crates/core/CONTRACT.md)
 - [Materials](assets/materials/README.md), [props](assets/props/README.md), and [art direction](research/assets.md)
 
-Sauerteig is under development. Rooms support up to 16 players, worlds are
-128 × 48 × 128 metres, and the editor grid reaches 1/8 metre. Props currently
-have no gameplay collision and are excluded from blueprints and geometry undo.
+Sauerteig is under development. Rooms support up to 16 players and the editor
+grid reaches 1/8 metre. Imported worlds use compact geometry and their own bounds,
+up to 8,192 metres per axis. Props and lights support editing, undo, and blueprints;
+props currently have no gameplay collision.
 Public-server authentication and moderation are not implemented. Ordinary-laptop
 performance and combat over internet connections still need broader playtesting.
 

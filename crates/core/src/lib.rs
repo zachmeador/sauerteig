@@ -1,11 +1,16 @@
 //! The renderer-independent world and simulation shared by every client and server.
 
+mod compact;
 mod fine;
 mod geometry;
 mod physics;
 mod protocol;
 mod world;
 
+pub use compact::{
+    WorldBounds, MAX_COMPACT_BATCH_TRIANGLES, MAX_COMPACT_REGIONS, MAX_QUERY_ROOTS,
+    WORLD_FORMAT_VERSION,
+};
 pub use fine::*;
 pub use glam::Vec3;
 pub use physics::*;

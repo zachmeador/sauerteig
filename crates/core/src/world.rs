@@ -1,4 +1,4 @@
-use crate::{Vec3, CHUNK_SIZE, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN};
+use crate::{Vec3, CHUNK_SIZE};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -72,6 +72,9 @@ impl Shape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     pub material: u8,
+    /// Optional logical face slots (-X,+X,-Y,+Y,-Z,+Z). Old cells use material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_materials: Option<[u8; 6]>,
     /// (x0,z0), (x1,z0), (x1,z1), (x0,z1), in eighths of a cell.
     pub heights: [u8; 4],
     /// False joins top corners 0 to 2; true joins 1 to 3.
@@ -90,6 +93,7 @@ impl Cell {
     pub fn solid(material: u8) -> Self {
         Self {
             material,
+            face_materials: None,
             heights: [8; 4],
             diagonal: false,
             shape: None,
@@ -98,10 +102,35 @@ impl Cell {
 
     pub fn is_valid(self) -> bool {
         (self.material as usize) < MATERIAL_COLORS.len()
+            && self
+                .face_materials
+                .is_none_or(|m| m.into_iter().all(|v| (v as usize) < MATERIAL_COLORS.len()))
             && self.shape.map_or_else(
                 || self.heights.iter().all(|&h| h <= 8) && self.heights.iter().any(|&h| h > 0),
                 Shape::is_valid,
             )
+    }
+
+    pub fn material_for_face(self, face: u8) -> u8 {
+        self.face_materials
+            .and_then(|m| m.get(face as usize).copied())
+            .unwrap_or(self.material)
+    }
+
+    pub fn set_face_material(&mut self, face: u8, material: u8) {
+        if face >= 6 || material as usize >= MATERIAL_COLORS.len() {
+            return;
+        }
+        let mut faces = self.face_materials.unwrap_or([self.material; 6]);
+        faces[face as usize] = material;
+        self.face_materials = (faces != [self.material; 6]).then_some(faces);
+    }
+
+    pub fn set_material(&mut self, material: u8) {
+        if (material as usize) < MATERIAL_COLORS.len() {
+            self.material = material;
+            self.face_materials = None;
+        }
     }
 
     pub fn as_shape(self) -> Shape {
@@ -193,28 +222,38 @@ impl Default for Chunk {
 pub struct World {
     chunks: BTreeMap<ChunkKey, Chunk>,
     pub(crate) fine: BTreeMap<CellPos, crate::fine::FineRoot>,
+    pub(crate) bounds: crate::WorldBounds,
+    pub(crate) compact: crate::compact::CompactWorld,
+    pub(crate) overrides: BTreeSet<CellPos>,
 }
 
-// Chunk arrays are an implementation detail. Snapshots contain only occupied cells.
+// Old array/object saves remain readable; new snapshots name their format explicitly.
 impl Serialize for World {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.fine.is_empty() {
-            self.cells().serialize(serializer)
-        } else {
-            #[derive(Serialize)]
-            struct Parts {
-                cells: Vec<CellEdit>,
-                roots: Vec<crate::RootEdit>,
-            }
-            Parts {
-                cells: self.cells(),
-                roots: self.detailed_roots(),
-            }
-            .serialize(serializer)
+        if !self.has_regions()
+            && self.bounds == crate::WorldBounds::default()
+            && self.fine.is_empty()
+        {
+            return self.cells().serialize(serializer);
         }
+        #[derive(Serialize)]
+        struct Parts {
+            format_version: u32,
+            bounds: crate::WorldBounds,
+            regions: Vec<crate::CellFragment>,
+            cells: Vec<CellEdit>,
+            roots: Vec<crate::RootEdit>,
+        }
+        Parts {
+            format_version: crate::WORLD_FORMAT_VERSION,
+            bounds: self.bounds(),
+            regions: self.regions(),
+            cells: self.cells(),
+            roots: self.root_overrides(),
+        }
+        .serialize(serializer)
     }
 }
-
 impl<'de> Deserialize<'de> for World {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -222,23 +261,34 @@ impl<'de> Deserialize<'de> for World {
         enum Parts {
             Legacy(Vec<CellEdit>),
             Current {
+                #[serde(default)]
+                format_version: u32,
+                #[serde(default)]
+                bounds: crate::WorldBounds,
+                #[serde(default)]
+                regions: Vec<crate::CellFragment>,
+                #[serde(default)]
                 cells: Vec<CellEdit>,
+                #[serde(default)]
                 roots: Vec<crate::RootEdit>,
             },
         }
-        let cells = match Parts::deserialize(deserializer)? {
-            Parts::Legacy(cells) => cells,
-            Parts::Current { cells, roots } => {
-                return Self::from_parts(&cells, &roots).map_err(serde::de::Error::custom)
+        match Parts::deserialize(deserializer)? {
+            Parts::Legacy(cells) => Self::from_parts(&cells, &[]),
+            Parts::Current {
+                format_version,
+                bounds,
+                regions,
+                cells,
+                roots,
+            } => {
+                if format_version > crate::WORLD_FORMAT_VERSION {
+                    return Err(serde::de::Error::custom("Unsupported world format version"));
+                }
+                Self::from_compact_parts(bounds, &regions, &cells, &roots)
             }
-        };
-        if cells
-            .iter()
-            .any(|e| !Self::is_valid_pos(e.pos) || e.cell.is_some_and(|c| !c.is_valid()))
-        {
-            return Err(serde::de::Error::custom("invalid world cell"));
         }
-        Ok(Self::from_cells(&cells))
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -252,10 +302,12 @@ impl World {
         Self::default()
     }
 
-    pub fn is_valid_pos([x, y, z]: CellPos) -> bool {
-        (WORLD_MIN..WORLD_MAX).contains(&x)
-            && (0..WORLD_HEIGHT).contains(&y)
-            && (WORLD_MIN..WORLD_MAX).contains(&z)
+    /// Outer coordinate safety envelope; use contains_pos for this world's bounds.
+    pub fn is_valid_pos(pos: CellPos) -> bool {
+        pos.into_iter().all(|v| {
+            (-crate::compact::MAX_WORLD_COORDINATE..crate::compact::MAX_WORLD_COORDINATE)
+                .contains(&v)
+        })
     }
 
     pub fn cell_chunk(pos: CellPos) -> ChunkKey {
@@ -276,11 +328,29 @@ impl World {
             .and_then(|c| c.cells[local_index(pos)])
     }
 
+    pub(crate) fn has_local_geometry(&self) -> bool {
+        !self.chunks.is_empty() || !self.fine.is_empty()
+    }
+
     /// Invalid data is ignored, rather than silently deleting an existing cell.
     pub fn set(&mut self, pos: CellPos, cell: Option<Cell>) {
-        if !Self::is_valid_pos(pos) || cell.is_some_and(|c| !c.is_valid()) {
+        if !self.contains_pos(pos) || cell.is_some_and(|c| !c.is_valid()) {
             return;
         }
+        if self.has_regions() {
+            let edit = crate::RootEdit {
+                pos,
+                fragments: cell
+                    .map(|c| vec![crate::CellFragment::from_cell(pos, c)])
+                    .unwrap_or_default(),
+            };
+            let _ = self.apply_root_edits(&[edit]);
+            return;
+        }
+        self.set_storage(pos, cell);
+    }
+
+    pub(crate) fn set_storage(&mut self, pos: CellPos, cell: Option<Cell>) {
         self.fine.remove(&pos);
         let key = Self::cell_chunk(pos);
         let index = local_index(pos);
@@ -328,32 +398,25 @@ impl World {
             .keys()
             .copied()
             .chain(self.fine.keys().copied().map(Self::cell_chunk))
+            .chain(self.compact.batches.keys().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
     }
 
     pub fn apply_edits(&mut self, edits: &[CellEdit]) -> Vec<ChunkKey> {
-        let mut dirty = BTreeSet::new();
-        for edit in edits {
-            if !Self::is_valid_pos(edit.pos)
-                || edit.cell.is_some_and(|c| !c.is_valid())
-                || (self.get(edit.pos) == edit.cell && !self.fine.contains_key(&edit.pos))
-            {
-                continue;
-            }
-            self.set(edit.pos, edit.cell);
-            let key = Self::cell_chunk(edit.pos);
-            dirty.insert(key);
-            for axis in 0..3 {
-                for delta in [-1, 1] {
-                    let mut adjacent = key;
-                    adjacent[axis] += delta;
-                    dirty.insert(adjacent);
-                }
-            }
-        }
-        dirty.into_iter().collect()
+        let roots: Vec<_> = edits
+            .iter()
+            .filter(|e| self.contains_pos(e.pos) && e.cell.is_none_or(Cell::is_valid))
+            .map(|e| crate::RootEdit {
+                pos: e.pos,
+                fragments: e
+                    .cell
+                    .map(|c| vec![crate::CellFragment::from_cell(e.pos, c)])
+                    .unwrap_or_default(),
+            })
+            .collect();
+        self.apply_root_edits(&roots).unwrap_or_default()
     }
 
     /// Foundry: roofed perimeter bays around an open service yard. Upper routes
@@ -435,6 +498,7 @@ impl World {
                     [x, level, z],
                     Some(Cell {
                         material: 1,
+                        face_materials: None,
                         heights: [if step % 2 == 0 { 4 } else { 8 }; 4],
                         diagonal: false,
                         shape: None,
@@ -453,6 +517,7 @@ impl World {
                     [x, level, z],
                     Some(Cell {
                         material: 1,
+                        face_materials: None,
                         heights: [low + 4, low + 4, low, low],
                         diagonal: false,
                         shape: None,
@@ -469,6 +534,7 @@ impl World {
                     [x, 5, z],
                     Some(Cell {
                         material: 2,
+                        face_materials: None,
                         heights: [2; 4],
                         diagonal: false,
                         shape: None,
@@ -501,6 +567,7 @@ impl World {
                         [sx, 3, sz],
                         Some(Cell {
                             material: 2,
+                            face_materials: None,
                             heights: if edge { [2, 2, 4, 4] } else { [4; 4] },
                             diagonal: false,
                             shape: None,
@@ -530,6 +597,7 @@ impl World {
                 [x, 4, z],
                 Some(Cell {
                     material: 5,
+                    face_materials: None,
                     heights: [1; 4],
                     diagonal: false,
                     shape: None,
@@ -607,6 +675,15 @@ pub fn arena_objects() -> Vec<crate::WorldObject> {
 /// A single network edit group at the editor's supported coarse grid sizes.
 /// The caller selects the origin; coordinates outside the world are omitted.
 pub fn block_edits(origin: CellPos, grid: i32, cell: Option<Cell>) -> Vec<CellEdit> {
+    block_edits_in(crate::WorldBounds::default(), origin, grid, cell)
+}
+
+pub fn block_edits_in(
+    bounds: crate::WorldBounds,
+    origin: CellPos,
+    grid: i32,
+    cell: Option<Cell>,
+) -> Vec<CellEdit> {
     if ![1, 2, 4, 8].contains(&grid) || cell.is_some_and(|c| !c.is_valid()) {
         return Vec::new();
     }
@@ -615,7 +692,7 @@ pub fn block_edits(origin: CellPos, grid: i32, cell: Option<Cell>) -> Vec<CellEd
         for y in 0..grid {
             for x in 0..grid {
                 let pos = [origin[0] + x, origin[1] + y, origin[2] + z];
-                if World::is_valid_pos(pos) {
+                if bounds.contains_pos(pos) {
                     edits.push(CellEdit { pos, cell });
                 }
             }

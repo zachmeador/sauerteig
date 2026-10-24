@@ -167,9 +167,18 @@ impl Geometry {
     }
     pub fn objects(objects: &[WorldObject]) -> Self {
         let mut mesh = Self::default();
-        for o in objects {
+        for object in objects {
+            let first_vertex = mesh.vertices.len();
+            // Author procedural parts around their shared pivot, then move the
+            // whole model. This keeps offsets and normals in the same yaw frame
+            // and preserves small details far from the world origin.
+            let o = WorldObject {
+                position: Vec3::ZERO,
+                rotation: 0.0,
+                ..object.clone()
+            };
             match o.kind {
-                ObjectKind::Tree => mesh.tree(o),
+                ObjectKind::Tree => mesh.tree(&o),
                 ObjectKind::WallLamp
                 | ObjectKind::HangingLamp
                 | ObjectKind::UtilityBox
@@ -245,6 +254,12 @@ impl Geometry {
                         );
                     }
                 }
+            }
+            let rotation = Mat3::from_rotation_y(object.rotation);
+            for vertex in &mut mesh.vertices[first_vertex..] {
+                vertex.position =
+                    (object.position + rotation * Vec3::from_array(vertex.position)).to_array();
+                vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
             }
         }
         mesh

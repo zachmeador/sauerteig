@@ -146,7 +146,10 @@ fn fixture_visibility(index: i32, position: vec3<f32>, normal: vec3<f32>) -> f32
                     uv + offset, light_ndc.z + dot(gradient, offset) - bias);
             }
         }
-        visibility = sum / 9.0;
+        // Fade the bounded camera-following shadow window before its edge.
+        // Distant terrain remains sunlit instead of acquiring a moving hard seam.
+        let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+        visibility = mix(1.0, sum / 9.0, smoothstep(0.0, 0.08, edge));
     }
     let ambient = mix(vec3<f32>(0.045, 0.055, 0.070), vec3<f32>(0.105, 0.13, 0.155), n.y * 0.5 + 0.5);
     var lit = color * (ambient * ao + vec3<f32>(0.85, 0.88, 0.90) * max(dot(n, sun), 0.0) * visibility);

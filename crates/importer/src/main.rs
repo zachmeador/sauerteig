@@ -75,8 +75,9 @@ fn run() -> Result<(), String> {
             };
             let (world, report) = convert(&map, &options)?;
             eprintln!(
-                "Imported {} coarse cells, {} detailed roots, {} lights, {} spawns. \
+                "Imported {} compact regions, {} coarse cells, {} detailed roots, {} lights, {} spawns. \
                  Cropped {} leaves; clipped {}. Unsupported omissions: {}.",
+                report.imported_regions,
                 report.imported_coarse_cells,
                 report.imported_detailed_roots,
                 report.imported_lights,
@@ -164,7 +165,8 @@ Shared options:
   --cfg FILE             Inspect literal references only; never execute scripts
 
 Only OCTA versions 29–33 are supported. Originals and existing outputs are never overwritten.
-Without --crop, maps that do not fit are rejected. Missing textures use neutral material 0.
+Without --crop, the complete original-scale world is retained in compact regions.
+World bounds and authored-size limits are validated. Missing textures use neutral material 0.
 Models, gameplay entities, volumes and baked rendering need separate adapters.
 After import, start a separate server with --world WORLD.json to view the result."
     );

@@ -3,14 +3,18 @@
 use crate::regions::{RegionBox, RegionSet};
 use sauerteig_core::{
     canonical_root_fragments, validate_root_edits, Cell, CellEdit, CellFragment, CellPos, FineBox,
-    RayHit, RootEdit, Shape, Vec3, World, MATERIAL_COLORS, SHAPE_FACES, WORLD_HEIGHT, WORLD_MAX,
-    WORLD_MIN,
+    ObjectPlacement, RayHit, RootEdit, Shape, Vec3, World, WorldObject, MATERIAL_COLORS,
+    SHAPE_FACES,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 const MAX_EDIT_FRAGMENTS: usize = 65_536;
 const MAX_EDIT_ROOTS: usize = 16_384;
+const MAX_CLIPBOARD_OBJECTS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditSelection {
@@ -35,11 +39,14 @@ pub struct EditPlan {
 
 /// Empty selected space is represented by a box union, not allocated voxels.
 /// Sources remain intact under clipping, so copying part of a slope is exact.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Clipboard {
     dims: CellPos,
     mask: RegionSet,
     fragments: Vec<CellFragment>,
+    /// Object pivots relative to the clipboard origin, in world metres.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    objects: Vec<ObjectPlacement>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditError {
@@ -53,6 +60,7 @@ pub enum EditError {
     UnsupportedTransform,
     ClippedShape,
     NoChanges,
+    InvalidObject,
 }
 impl fmt::Display for EditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,6 +75,7 @@ impl fmt::Display for EditError {
             Self::UnsupportedTransform => "Mirror supports the X or Z axis.",
             Self::ClippedShape => "This clipped slope retains its original shape. Shape the complete source cell, or add a new fine cube here.",
             Self::NoChanges => "The selected space already has that shape or material.",
+            Self::InvalidObject => "An object has an invalid position or rotation in this blueprint.",
         })
     }
 }
@@ -85,12 +94,6 @@ fn fine(bounds: RegionBox) -> FineBox {
 }
 fn one_region(bounds: FineBox) -> Result<RegionSet, EditError> {
     RegionSet::from_boxes([region(bounds)]).map_err(|_| EditError::InvalidSelection)
-}
-fn world_bounds() -> FineBox {
-    FineBox {
-        min: [WORLD_MIN * 8, 0, WORLD_MIN * 8],
-        max: [WORLD_MAX * 8, WORLD_HEIGHT * 8, WORLD_MAX * 8],
-    }
 }
 fn check_grid(grid: i32) -> Result<(), EditError> {
     if [1, 2, 4, 8, 16, 32, 64].contains(&grid) {
@@ -134,18 +137,29 @@ fn translated_fragment(f: &CellFragment, offset: CellPos) -> Result<CellFragment
         cell: f.cell,
     })
 }
-fn capture(world: &World, mask: &RegionSet) -> Vec<CellFragment> {
+fn capture(world: &World, mask: &RegionSet) -> Result<Vec<CellFragment>, EditError> {
     let mut fragments = Vec::new();
+    let mut touched = BTreeSet::new();
     for &bounds in mask.boxes() {
-        for root in world.roots_in(fine(bounds)) {
-            fragments.extend(
-                root.fragments
-                    .into_iter()
-                    .filter_map(|f| f.clipped(fine(bounds))),
-            );
+        for root in world
+            .try_roots_in(fine(bounds), MAX_EDIT_ROOTS)
+            .map_err(|_| EditError::TooLarge)?
+        {
+            touched.insert(root.pos);
+            if touched.len() > MAX_EDIT_ROOTS {
+                return Err(EditError::TooLarge);
+            }
+            for fragment in root.fragments {
+                if let Some(fragment) = fragment.clipped(fine(bounds)) {
+                    if fragments.len() >= MAX_EDIT_FRAGMENTS {
+                        return Err(EditError::TooLarge);
+                    }
+                    fragments.push(fragment);
+                }
+            }
         }
     }
-    fragments
+    Ok(fragments)
 }
 
 impl EditSelection {
@@ -160,10 +174,12 @@ impl EditSelection {
         }
         let axis = hit.face as usize / 2;
         let sign = if hit.face % 2 == 1 { 1 } else { -1 };
-        let point = hit.point * 8.0 - hit.normal * 0.0001;
-        let mut min = point
-            .to_array()
-            .map(|v| (v.floor() as i32).div_euclid(grid) * grid);
+        // Apply the inward bias in f64: at distant map coordinates an f32
+        // subtraction can round away and select empty space across the face.
+        let mut min = std::array::from_fn(|a| {
+            let point = f64::from(hit.point[a]) * 8.0 - f64::from(hit.normal[a]) * 0.0001;
+            (point.floor() as i32).div_euclid(grid) * grid
+        });
         let mut max = min.map(|v| v + grid);
         // Fine selection addresses the cube containing the actual surface hit,
         // including low parts of a larger sloped source. Coarse selection keeps
@@ -300,7 +316,7 @@ impl EditSelection {
     pub fn plan_extrude(&self, world: &World, value: u8) -> Result<EditPlan, EditError> {
         material(value)?;
         let bounds = self.slab(true)?;
-        if !world_bounds().contains(bounds) {
+        if !world.bounds().fine_box().contains(bounds) {
             return Err(EditError::OutsideWorld);
         }
         let fragments = filled(bounds, self.grid.min(8) as u8, Cell::solid(value))?;
@@ -320,7 +336,7 @@ impl EditSelection {
     pub fn plan_carve(&self, world: &World) -> Result<EditPlan, EditError> {
         let bounds = self
             .slab(false)?
-            .intersection(world_bounds())
+            .intersection(world.bounds().fine_box())
             .ok_or(EditError::NoChanges)?;
         let plane = if self.sign > 0 {
             bounds.min[self.axis]
@@ -347,12 +363,16 @@ impl EditSelection {
     ) -> Result<EditPlan, EditError> {
         self.validate()?;
         material(value)?;
-        let mut fragments = capture(world, mask);
-        if fragments.iter().all(|f| f.cell.material == value) {
+        let mut fragments = capture(world, mask)?;
+        let face = self.face_index() as u8;
+        if fragments
+            .iter()
+            .all(|f| f.cell.material_for_face(face) == value)
+        {
             return Err(EditError::NoChanges);
         }
         for fragment in &mut fragments {
-            fragment.cell.material = value;
+            fragment.cell.set_face_material(face, value);
         }
         replace(world, mask, fragments, self.clone(), false)
     }
@@ -387,12 +407,12 @@ impl EditSelection {
             bounds.max[self.axis] = bounds.min[self.axis] + self.grid.min(8);
         }
         let bounds = bounds
-            .intersection(world_bounds())
+            .intersection(world.bounds().fine_box())
             .ok_or(EditError::NoChanges)?;
         let selected = one_region(bounds)?;
         let mut fragments = Vec::new();
         let mut changed = false;
-        for original in capture(world, &selected) {
+        for original in capture(world, &selected)? {
             let sources = if original.cell.is_full() {
                 // A solid cube can be refined without resampling any surface.
                 let mut size = self.grid.min(original.size as i32).min(8) as u8;
@@ -544,10 +564,19 @@ fn filled(bounds: FineBox, size: u8, cell: Cell) -> Result<Vec<CellFragment>, Ed
     }
     Ok(out)
 }
-fn root_positions(bounds: FineBox) -> Vec<CellPos> {
+fn root_positions(bounds: FineBox) -> Result<Vec<CellPos>, EditError> {
+    if bounds.is_empty() {
+        return Err(EditError::InvalidSelection);
+    }
     let min = bounds.min.map(|v| v.div_euclid(8));
     let max = bounds.max.map(|v| (v - 1).div_euclid(8));
-    let mut out = Vec::new();
+    let count: u128 = (0..3)
+        .map(|axis| (i64::from(max[axis]) - i64::from(min[axis]) + 1) as u128)
+        .product();
+    if count > MAX_EDIT_ROOTS as u128 {
+        return Err(EditError::TooLarge);
+    }
+    let mut out = Vec::with_capacity(count as usize);
     for x in min[0]..=max[0] {
         for y in min[1]..=max[1] {
             for z in min[2]..=max[2] {
@@ -555,7 +584,7 @@ fn root_positions(bounds: FineBox) -> Vec<CellPos> {
             }
         }
     }
-    out
+    Ok(out)
 }
 fn normalize(fragments: &mut Vec<CellFragment>) {
     // At most 512 pieces per root. Coalesce only identical source solids; this
@@ -601,7 +630,7 @@ fn replace(
         && mask
             .boxes()
             .iter()
-            .any(|b| !world_bounds().contains(fine(*b)))
+            .any(|b| !world.bounds().fine_box().contains(fine(*b)))
     {
         return Err(EditError::OutsideWorld);
     }
@@ -610,18 +639,30 @@ fn replace(
     }
     let mut roots: BTreeMap<CellPos, Vec<CellFragment>> = BTreeMap::new();
     for &bounds in mask.boxes() {
-        for root in world.roots_in(fine(bounds)) {
+        for root in world
+            .try_roots_in(fine(bounds), MAX_EDIT_ROOTS)
+            .map_err(|_| EditError::TooLarge)?
+        {
             roots.entry(root.pos).or_insert(root.fragments);
+            if roots.len() > MAX_EDIT_ROOTS {
+                return Err(EditError::TooLarge);
+            }
         }
     }
     for f in &added {
-        if !f.is_valid() || !mask.covers(region(f.bounds)) || !world_bounds().contains(f.bounds) {
+        if !f.is_valid()
+            || !mask.covers(region(f.bounds))
+            || !world.bounds().fine_box().contains(f.bounds)
+        {
             return Err(EditError::InvalidShape);
         }
-        for pos in root_positions(f.bounds) {
+        for pos in root_positions(f.bounds)? {
             roots
                 .entry(pos)
                 .or_insert_with(|| world.root_fragments(pos));
+            if roots.len() > MAX_EDIT_ROOTS {
+                return Err(EditError::TooLarge);
+            }
         }
     }
     if roots.len() > MAX_EDIT_ROOTS {
@@ -645,7 +686,7 @@ fn replace(
         *fragments = kept;
     }
     for f in added {
-        for pos in root_positions(f.bounds) {
+        for pos in root_positions(f.bounds)? {
             roots
                 .get_mut(&pos)
                 .unwrap()
@@ -685,7 +726,17 @@ impl Clipboard {
         selection.validate()?;
         Self::copy_regions(world, &one_region(selection.bounds())?)
     }
+    #[cfg(test)]
     pub fn copy_regions(world: &World, selection: &RegionSet) -> Result<Self, EditError> {
+        Self::copy_regions_with_objects(world, selection, &[])
+    }
+    /// Capture object pivots in the exact selected union. Subtracted volumes do
+    /// not contribute objects, even when they lie inside the union's bounds.
+    pub fn copy_regions_with_objects(
+        world: &World,
+        selection: &RegionSet,
+        objects: &[WorldObject],
+    ) -> Result<Self, EditError> {
         let bounds = selection.bounds().ok_or(EditError::InvalidSelection)?;
         let dims = checked_dims(bounds.min, bounds.max)?;
         let mut offset = [0; 3];
@@ -695,14 +746,30 @@ impl Clipboard {
         let mask = selection
             .translated(offset)
             .map_err(|_| EditError::OutsideWorld)?;
-        let fragments = capture(world, selection)
+        let fragments = capture(world, selection)?
             .iter()
             .map(|f| translated_fragment(f, offset))
+            .collect::<Result<_, _>>()?;
+        let origin = Vec3::from_array(bounds.min.map(|v| v as f32 / 8.0));
+        let objects = objects
+            .iter()
+            .filter(|object| contains_object_pivot(selection, object.position, false))
+            .map(|object| {
+                if !object.rotation.is_finite() || object.rotation.abs() > 1_000_000.0 {
+                    return Err(EditError::InvalidObject);
+                }
+                Ok(ObjectPlacement {
+                    kind: object.kind,
+                    position: object.position - origin,
+                    rotation: normalized_yaw(object.rotation),
+                })
+            })
             .collect::<Result<_, _>>()?;
         let result = Self {
             dims,
             mask,
             fragments,
+            objects,
         };
         result.validate()?;
         Ok(result)
@@ -712,6 +779,30 @@ impl Clipboard {
     }
     pub fn mask(&self) -> &RegionSet {
         &self.mask
+    }
+    pub fn objects(&self) -> &[ObjectPlacement] {
+        &self.objects
+    }
+    /// Resolve object preview or transaction placements from an eighth-metre
+    /// destination. IDs are allocated by the server when the paste is accepted.
+    pub fn placed_objects(&self, origin: CellPos) -> Result<Vec<ObjectPlacement>, EditError> {
+        self.validate()?;
+        let offset = Vec3::from_array(origin.map(|v| v as f32 / 8.0));
+        self.objects
+            .iter()
+            .map(|object| {
+                let position = object.position + offset;
+                if !position.is_finite()
+                    || !World::is_valid_pos(position.floor().as_ivec3().to_array())
+                {
+                    return Err(EditError::OutsideWorld);
+                }
+                Ok(ObjectPlacement {
+                    position,
+                    ..object.clone()
+                })
+            })
+            .collect()
     }
     fn validate(&self) -> Result<(), EditError> {
         if self.mask.bounds()
@@ -723,15 +814,27 @@ impl Clipboard {
         {
             return Err(EditError::InvalidSelection);
         }
-        if self.fragments.len() > MAX_EDIT_FRAGMENTS {
+        if self.fragments.len() > MAX_EDIT_FRAGMENTS || self.objects.len() > MAX_CLIPBOARD_OBJECTS {
             return Err(EditError::TooLarge);
+        }
+        for object in &self.objects {
+            // Reflection carries a pivot on a lower face onto the upper face.
+            // Closed containment preserves that placement without rounding it
+            // inward; initial capture still uses half-open selection semantics.
+            if !object.position.is_finite()
+                || !object.rotation.is_finite()
+                || object.rotation.abs() > 1_000_000.0
+                || !contains_object_pivot(&self.mask, object.position, true)
+            {
+                return Err(EditError::InvalidObject);
+            }
         }
         let mut buckets: BTreeMap<CellPos, Vec<usize>> = BTreeMap::new();
         for (i, f) in self.fragments.iter().enumerate() {
             if !f.is_valid() || !self.mask.covers(region(f.bounds)) {
                 return Err(EditError::InvalidShape);
             }
-            for pos in root_positions(f.bounds) {
+            for pos in root_positions(f.bounds)? {
                 let previous = buckets.entry(pos).or_default();
                 if previous
                     .iter()
@@ -740,6 +843,9 @@ impl Clipboard {
                     return Err(EditError::InvalidShape);
                 }
                 previous.push(i);
+                if buckets.len() > MAX_EDIT_ROOTS {
+                    return Err(EditError::TooLarge);
+                }
             }
         }
         Ok(())
@@ -777,11 +883,21 @@ impl Clipboard {
             ];
             let h = f.cell.heights;
             f.cell.heights = [h[1], h[2], h[3], h[0]];
+            // (x,y,z) -> (z,y,-x) carries each logical face to its new axis.
+            f.cell.face_materials = f
+                .cell
+                .face_materials
+                .map(|m| [m[4], m[5], m[2], m[3], m[1], m[0]]);
             f.cell.diagonal = !f.cell.diagonal;
             f.cell.shape = f
                 .cell
                 .shape
                 .map(|s| transform_shape(s, |[x, y, z]| [z, y, 8 - x]));
+        }
+        for object in &mut result.objects {
+            let old = object.position;
+            object.position = Vec3::new(old.z, old.y, width as f32 / 8.0 - old.x);
+            object.rotation = normalized_yaw(object.rotation + std::f32::consts::FRAC_PI_2);
         }
         result.validate()?;
         *self = result;
@@ -813,11 +929,22 @@ impl Clipboard {
                 [h[3], h[2], h[1], h[0]]
             };
             f.cell.diagonal = !f.cell.diagonal;
+            if let Some(materials) = &mut f.cell.face_materials {
+                materials.swap(axis * 2, axis * 2 + 1);
+            }
             f.cell.shape = f.cell.shape.map(|s| {
                 transform_shape(s, |mut v| {
                     v[axis] = 8 - v[axis];
                     v
                 })
+            });
+        }
+        for object in &mut result.objects {
+            object.position[axis] = length as f32 / 8.0 - object.position[axis];
+            object.rotation = normalized_yaw(if axis == 0 {
+                -object.rotation
+            } else {
+                std::f32::consts::PI - object.rotation
             });
         }
         result.validate()?;
@@ -839,7 +966,7 @@ impl Clipboard {
         if mask
             .boxes()
             .iter()
-            .any(|b| !world_bounds().contains(fine(*b)))
+            .any(|b| !world.bounds().fine_box().contains(fine(*b)))
         {
             return Err(EditError::OutsideWorld);
         }
@@ -855,7 +982,21 @@ impl Clipboard {
             sign: selection.sign,
             grid: selection.grid,
         };
-        replace(world, &mask, fragments, selection_after, true)
+        if self
+            .placed_objects(selection.min)?
+            .iter()
+            .any(|object| !world.contains_pos(object.position.floor().as_ivec3().to_array()))
+        {
+            return Err(EditError::OutsideWorld);
+        }
+        match replace(world, &mask, fragments, selection_after.clone(), true) {
+            Err(EditError::NoChanges) if !self.objects.is_empty() => Ok(EditPlan {
+                edits: Vec::new(),
+                roots: Vec::new(),
+                selection_after,
+            }),
+            result => result,
+        }
     }
 }
 impl<'de> Deserialize<'de> for Clipboard {
@@ -865,16 +1006,35 @@ impl<'de> Deserialize<'de> for Clipboard {
             dims: CellPos,
             mask: RegionSet,
             fragments: Vec<CellFragment>,
+            #[serde(default)]
+            objects: Vec<ObjectPlacement>,
         }
         let raw = Raw::deserialize(deserializer)?;
         let result = Self {
             dims: raw.dims,
             mask: raw.mask,
             fragments: raw.fragments,
+            objects: raw.objects,
         };
         result.validate().map_err(serde::de::Error::custom)?;
         Ok(result)
     }
+}
+fn contains_object_pivot(mask: &RegionSet, position: Vec3, include_upper_face: bool) -> bool {
+    let point = position * 8.0;
+    mask.boxes().iter().any(|bounds| {
+        (0..3).all(|axis| {
+            point[axis] >= bounds.min[axis] as f32
+                && if include_upper_face {
+                    point[axis] <= bounds.max[axis] as f32
+                } else {
+                    point[axis] < bounds.max[axis] as f32
+                }
+        })
+    })
+}
+fn normalized_yaw(yaw: f32) -> f32 {
+    yaw.rem_euclid(std::f32::consts::TAU)
 }
 /// Permute canonical vertices and carry the actual diagonal edge to each new
 /// logical face. Canonical face winding also corrects reflected orientation.
@@ -913,6 +1073,291 @@ fn transform_shape(shape: Shape, transform: impl Fn([u8; 3]) -> [u8; 3]) -> Shap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sauerteig_core::ObjectKind;
+    use sauerteig_core::{WorldBounds, WORLD_HEIGHT, WORLD_MAX};
+
+    fn object(id: u32, kind: ObjectKind, position: [f32; 3], rotation: f32) -> WorldObject {
+        WorldObject {
+            id,
+            kind,
+            position: Vec3::from_array(position),
+            rotation,
+        }
+    }
+
+    #[test]
+    fn painting_and_clipboard_transforms_preserve_independent_face_materials() {
+        let mut world = World::empty();
+        world.set(
+            [0, 0, 0],
+            Some(Cell {
+                face_materials: Some([0, 1, 2, 3, 4, 5]),
+                ..Cell::solid(0)
+            }),
+        );
+        let selected = selection([0; 3], [8; 3], 1, 1, 8);
+        let plan = selected.plan_paint(&world, 7).unwrap();
+        apply(&mut world, &plan);
+        let painted = world.root_fragments([0; 3])[0].cell;
+        assert_eq!(painted.face_materials, Some([0, 1, 2, 7, 4, 5]));
+        assert_eq!(
+            selected.plan_paint(&world, 7).unwrap_err(),
+            EditError::NoChanges
+        );
+        let original = Clipboard::copy(&world, &selected).unwrap();
+        let mut rotated = original.clone();
+        rotated.rotate_y().unwrap();
+        assert_eq!(
+            rotated.fragments[0].cell.face_materials,
+            Some([4, 5, 2, 7, 1, 0])
+        );
+        for _ in 0..3 {
+            rotated.rotate_y().unwrap();
+        }
+        assert_eq!(rotated, original);
+        let mut mirrored = original.clone();
+        mirrored.mirror(0).unwrap();
+        assert_eq!(
+            mirrored.fragments[0].cell.face_materials,
+            Some([1, 0, 2, 7, 4, 5])
+        );
+        mirrored.mirror(0).unwrap();
+        assert_eq!(mirrored, original);
+        mirrored.mirror(2).unwrap();
+        assert_eq!(
+            mirrored.fragments[0].cell.face_materials,
+            Some([0, 1, 2, 7, 5, 4])
+        );
+    }
+
+    #[test]
+    fn compact_worlds_support_local_paint_copy_and_paste_beyond_the_starter_bounds() {
+        let bounds = WorldBounds {
+            min: [-512, -256, -512],
+            max: [512, 256, 512],
+        };
+        let source = CellFragment {
+            bounds: FineBox {
+                min: [192 * 8, 0, 192 * 8],
+                max: [208 * 8, 16 * 8, 208 * 8],
+            },
+            origin: [192 * 8, 0, 192 * 8],
+            size: 128,
+            cell: Cell::solid(0),
+        };
+        let mut world = World::from_compact_parts(bounds, &[source], &[], &[]).unwrap();
+        let selected = selection(
+            [200 * 8, 15 * 8, 200 * 8],
+            [201 * 8, 16 * 8, 201 * 8],
+            1,
+            1,
+            8,
+        );
+        let paint = selected.plan_paint(&world, 7).unwrap();
+        apply(&mut world, &paint);
+        assert_eq!(world.region_count(), 1);
+        assert_eq!(
+            world.root_fragments([200, 15, 200])[0]
+                .cell
+                .material_for_face(3),
+            7
+        );
+        assert_eq!(
+            world.root_fragments([201, 15, 200])[0]
+                .cell
+                .material_for_face(3),
+            0
+        );
+        let clipboard = Clipboard::copy(&world, &selected).unwrap();
+        let destination = selection(
+            [220 * 8, 15 * 8, 220 * 8],
+            [221 * 8, 16 * 8, 221 * 8],
+            1,
+            1,
+            8,
+        );
+        let paste = clipboard.plan_paste(&world, &destination).unwrap();
+        apply(&mut world, &paste);
+        assert_eq!(
+            world.root_fragments([220, 15, 220])[0]
+                .cell
+                .material_for_face(3),
+            7
+        );
+        assert!(world
+            .raycast(Vec3::new(220.5, 20.0, 220.5), -Vec3::Y, 10.0)
+            .is_some());
+    }
+
+    #[test]
+    fn oversized_compact_selections_and_clipboard_fragments_fail_before_expansion() {
+        let bounds = WorldBounds {
+            min: [0; 3],
+            max: [4096; 3],
+        };
+        let source = CellFragment {
+            bounds: bounds.fine_box(),
+            origin: [0; 3],
+            size: 32768,
+            cell: Cell::solid(0),
+        };
+        let world =
+            World::from_compact_parts(bounds, std::slice::from_ref(&source), &[], &[]).unwrap();
+        let selected = selection([0; 3], [32768; 3], 1, 1, 8);
+        assert_eq!(
+            Clipboard::copy(&world, &selected).unwrap_err(),
+            EditError::TooLarge
+        );
+        let encoded = serde_json::json!({
+            "dims": [32768, 32768, 32768],
+            "mask": one_region(source.bounds).unwrap(),
+            "fragments": [source],
+        });
+        assert!(serde_json::from_value::<Clipboard>(encoded).is_err());
+    }
+
+    #[test]
+    fn object_capture_respects_subtracted_volumes_and_half_open_edges() {
+        let mut regions = mask(&[([-16, 0, -8], [16, 16, 16])]);
+        regions
+            .subtract(RegionBox::new([-8, 0, 0], [8, 16, 8]).unwrap())
+            .unwrap();
+        let objects = vec![
+            object(11, ObjectKind::Light, [-1.5, 0.5, 0.5], 0.0),
+            object(12, ObjectKind::Spawn, [0.0, 0.5, 0.5], 0.0),
+            object(13, ObjectKind::Pipe, [1.0, 0.5, 0.5], 0.0),
+            object(14, ObjectKind::Rock, [2.0, 0.5, 0.5], 0.0),
+            object(15, ObjectKind::WallLamp, [-2.0, 1.0, -1.0], 0.0),
+        ];
+        let clip =
+            Clipboard::copy_regions_with_objects(&World::empty(), &regions, &objects).unwrap();
+        assert_eq!(
+            clip.objects().iter().map(|o| o.kind).collect::<Vec<_>>(),
+            vec![ObjectKind::Light, ObjectKind::Pipe, ObjectKind::WallLamp]
+        );
+        assert_eq!(clip.objects()[0].position, Vec3::new(0.5, 0.5, 1.5));
+        let placed = clip.placed_objects([32, 8, 24]).unwrap();
+        assert_eq!(placed[0].position, Vec3::new(4.5, 1.5, 4.5));
+    }
+
+    #[test]
+    fn object_transforms_follow_geometry_and_preserve_facing() {
+        let mut world = World::empty();
+        world.set([0, 0, 0], Some(Cell::solid(2)));
+        let objects = vec![
+            object(1, ObjectKind::UtilityBox, [0.25, 0.5, 1.5], 0.3),
+            object(2, ObjectKind::HangingLamp, [0.0, 1.0, 0.0], 0.0),
+        ];
+        let original = Clipboard::copy_regions_with_objects(
+            &world,
+            &mask(&[([0, 0, 0], [16, 16, 24])]),
+            &objects,
+        )
+        .unwrap();
+        let mut rotated = original.clone();
+        rotated.rotate_y().unwrap();
+        assert_eq!(rotated.dims(), [24, 16, 16]);
+        assert_eq!(rotated.objects()[0].position, Vec3::new(1.5, 0.5, 1.75));
+        let direction = |yaw: f32| Vec3::new(yaw.sin(), 0.0, yaw.cos());
+        let old_facing = direction(original.objects()[0].rotation);
+        let rotated_facing = direction(rotated.objects()[0].rotation);
+        assert!((rotated_facing - Vec3::new(old_facing.z, 0.0, -old_facing.x)).length() < 1e-6);
+        for _ in 0..3 {
+            rotated.rotate_y().unwrap();
+        }
+        assert_eq!(rotated.fragments, original.fragments);
+        assert_eq!(rotated.mask, original.mask);
+        for (after, before) in rotated.objects().iter().zip(original.objects()) {
+            assert_eq!(after.position, before.position);
+            assert!((direction(after.rotation) - direction(before.rotation)).length() < 1e-6);
+        }
+        for axis in [0, 2] {
+            let mut mirrored = original.clone();
+            mirrored.mirror(axis).unwrap();
+            let mut expected = old_facing;
+            expected[axis] = -expected[axis];
+            assert!((direction(mirrored.objects()[0].rotation) - expected).length() < 1e-6);
+            mirrored.mirror(axis).unwrap();
+            assert_eq!(mirrored.fragments, original.fragments);
+            for (after, before) in mirrored.objects().iter().zip(original.objects()) {
+                assert_eq!(after.position, before.position);
+                assert!((direction(after.rotation) - direction(before.rotation)).length() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn object_only_paste_is_valid_and_checks_destination_bounds() {
+        let world = World::empty();
+        let region = mask(&[([0, 0, 0], [8, 8, 8])]);
+        let target = selection([16, 8, 24], [24, 16, 32], 1, 1, 8);
+        let empty = Clipboard::copy_regions(&world, &region).unwrap();
+        assert_eq!(
+            empty.plan_paste(&world, &target).unwrap_err(),
+            EditError::NoChanges
+        );
+        let clip = Clipboard::copy_regions_with_objects(
+            &world,
+            &region,
+            &[object(1, ObjectKind::Spawn, [0.5, 0.0, 0.5], 0.0)],
+        )
+        .unwrap();
+        let plan = clip.plan_paste(&world, &target).unwrap();
+        assert!(plan.roots.is_empty());
+        assert_eq!(plan.selection_after, target);
+        assert_eq!(
+            clip.placed_objects([8192 * 8, 0, 0]).unwrap_err(),
+            EditError::OutsideWorld
+        );
+        let mut boundary = Clipboard::copy_regions_with_objects(
+            &world,
+            &region,
+            &[object(2, ObjectKind::Light, [0.0, 0.5, 0.5], 0.0)],
+        )
+        .unwrap();
+        boundary.mirror(0).unwrap();
+        let at_edge = selection([(WORLD_MAX - 1) * 8, 0, 0], [WORLD_MAX * 8, 8, 8], 1, 1, 8);
+        assert_eq!(
+            boundary.plan_paste(&world, &at_edge).unwrap_err(),
+            EditError::OutsideWorld
+        );
+    }
+
+    #[test]
+    fn clipboard_object_deserialization_rejects_invalid_data_and_limits() {
+        let clip = Clipboard::copy_regions_with_objects(
+            &World::empty(),
+            &mask(&[([0, 0, 0], [16, 16, 16])]),
+            &[object(1, ObjectKind::Light, [0.5, 0.5, 0.5], 0.0)],
+        )
+        .unwrap();
+        let json = serde_json::to_value(&clip).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Clipboard>(json.clone()).unwrap(),
+            clip
+        );
+        for position in [
+            serde_json::json!([-0.01, 0.5, 0.5]),
+            serde_json::json!([3.0, 0.5, 0.5]),
+            serde_json::json!([null, 0.5, 0.5]),
+        ] {
+            let mut bad = json.clone();
+            bad["objects"][0]["position"] = position;
+            assert!(serde_json::from_value::<Clipboard>(bad).is_err());
+        }
+        let mut bad = json.clone();
+        bad["objects"][0]["rotation"] = serde_json::json!(1_000_001.0);
+        assert!(serde_json::from_value::<Clipboard>(bad).is_err());
+        let mut bad = json.clone();
+        bad["objects"] =
+            serde_json::Value::Array(vec![json["objects"][0].clone(); MAX_CLIPBOARD_OBJECTS + 1]);
+        assert!(serde_json::from_value::<Clipboard>(bad).is_err());
+        let mut invalid = clip.clone();
+        invalid.objects[0].rotation = f32::NAN;
+        let previous = invalid.objects[0].position;
+        assert_eq!(invalid.rotate_y().unwrap_err(), EditError::InvalidObject);
+        assert_eq!(invalid.objects[0].position, previous);
+    }
     fn selection(min: CellPos, max: CellPos, axis: usize, sign: i32, grid: i32) -> EditSelection {
         EditSelection {
             min,
@@ -947,6 +1392,22 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn fine_grid_selects_inside_every_face_at_distant_coordinates() {
+        for coordinate in [-8191, -4096, 4096, 8190] {
+            for axis in 0..3 {
+                for sign in [-1, 1] {
+                    let hit = hit([coordinate; 3], axis, sign);
+                    let selected = EditSelection::from_hit(&hit, 1).unwrap();
+                    let expected = coordinate * 8 + if sign > 0 { 7 } else { 0 };
+                    assert_eq!(selected.min[axis], expected);
+                    assert_eq!(selected.max[axis], expected + 1);
+                    assert!(hit.bounds.contains(selected.bounds()));
+                }
+            }
+        }
+    }
+
     #[test]
     fn negative_coordinates_and_fine_grid_select_correct_face() {
         let s = EditSelection::from_hit(&hit([-2, 3, -4], 1, 1), 4).unwrap();

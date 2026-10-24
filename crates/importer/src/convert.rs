@@ -1,10 +1,10 @@
 use crate::{
-    transform::{world_bounds, ImportTransform, RegionOverlap},
+    transform::{ImportTransform, RegionOverlap},
     Cube, Inventory, Map,
 };
 use sauerteig_core::{
-    Cell, CellEdit, CellFragment, FineBox, ObjectKind, RootEdit, Shape, Vec3, World, WorldObject,
-    FINE_UNITS, SHAPE_FACES, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
+    Cell, CellEdit, CellFragment, ObjectKind, RootEdit, Shape, Vec3, World, WorldBounds,
+    WorldObject, SHAPE_FACES, WORLD_FORMAT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,10 +37,24 @@ impl Default for ImportOptions {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportedWorld {
+    #[serde(default = "legacy_format_version")]
+    pub format_version: u32,
+    #[serde(default)]
+    pub bounds: WorldBounds,
+    #[serde(default)]
+    pub regions: Vec<CellFragment>,
+    #[serde(default)]
     pub revision: u64,
+    #[serde(default)]
     pub cells: Vec<CellEdit>,
+    #[serde(default)]
     pub roots: Vec<RootEdit>,
+    #[serde(default)]
     pub objects: Vec<WorldObject>,
+}
+
+fn legacy_format_version() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -62,6 +76,7 @@ pub struct ImportReport {
     pub unsupported_leaves_omitted: Vec<GeometryIssue>,
     pub imported_coarse_cells: usize,
     pub imported_detailed_roots: usize,
+    pub imported_regions: usize,
     pub imported_fragments: usize,
     pub texture_slot_mapping: BTreeMap<u16, u8>,
     pub unmapped_texture_slot_faces: BTreeMap<u16, usize>,
@@ -86,6 +101,7 @@ impl ImportReport {
             unsupported_leaves_omitted: Vec::new(),
             imported_coarse_cells: 0,
             imported_detailed_roots: 0,
+            imported_regions: 0,
             imported_fragments: 0,
             texture_slot_mapping: options.materials.clone(),
             unmapped_texture_slot_faces: BTreeMap::new(),
@@ -98,13 +114,13 @@ impl ImportReport {
                 "Original source files are untouched. No CubeScript is executed, and no referenced asset or include is loaded automatically.".into(),
                 "Imported geometry uses dynamic lighting. Baked lightmaps, merged render surfaces, PVS, blend maps and sky rendering are not imported.".into(),
                 "Texture slot references and virtual-slot metadata are retained in this report. Unmapped slots use neutral material 0; texture imagery is not inside OGZ.".into(),
-                "The current Cell has one material, so a multi-textured cube uses its most frequent face texture (lowest slot breaks ties). Per-face legacy appearance is not preserved.".into(),
+                "Each logical cube face retains its mapped material. World face order [-X,+X,-Y,+Y,-Z,+Z] maps to legacy face slots [0,1,4,5,3,2].".into(),
                 "Lights retain placement only: radius, color and spotlight attributes remain in the entity report. Mapmodels, pickups, triggers, sounds and volume effects need later adapters.".into(),
             ],
         }
     }
 
-    fn material_for(&mut self, cube: &Cube, materials: &BTreeMap<u16, u8>) -> u8 {
+    fn face_materials_for(&mut self, cube: &Cube, materials: &BTreeMap<u16, u8>) -> [u8; 6] {
         let mut counts = BTreeMap::new();
         for slot in cube.textures {
             *counts.entry(slot).or_insert(0) += 1;
@@ -113,32 +129,12 @@ impl ImportReport {
             }
         }
         self.leaves_with_multiple_face_textures += usize::from(counts.len() > 1);
-        // BTreeMap order makes the lowest slot win tied face counts.
-        let mut selected = 0;
-        let mut best = 0;
-        for (&slot, &count) in &counts {
-            if count > best {
-                selected = slot;
-                best = count;
-            }
-        }
-        *materials.get(&selected).unwrap_or(&0)
+        [0, 1, 4, 5, 3, 2].map(|face| *materials.get(&cube.textures[face]).unwrap_or(&0))
     }
 }
 
-fn region_error(outside: usize, clipped: usize) -> String {
-    format!(
-        "map does not fit the current {}×{}×{}m world: {outside} leaves outside and \
-         {clipped} crossing its boundary. Nothing was written. Set an explicit \
-         --center and --crop to import a region, or choose an exact larger scale.",
-        WORLD_MAX - WORLD_MIN,
-        WORLD_HEIGHT,
-        WORLD_MAX - WORLD_MIN,
-    )
-}
-
-/// Converts geometry without resampling. Large authored shapes are clipped into
-/// the engine's one-metre roots; their original eighth-corner positions remain.
+/// Converts geometry without resampling. Each authored octree leaf stays one
+/// compact region; its original corner positions and logical face materials remain.
 /// Texture imagery, scripts, mapmodels and baked render data are not executed.
 pub fn convert(
     map: &Map,
@@ -152,24 +148,27 @@ pub fn convert(
     {
         return Err("material mapping contains an invalid Sauerteig material ID".into());
     }
-    let world_bounds = world_bounds();
-    let mut report = ImportReport::new(map, options, &transform);
+    let mut bounds = transform.bounds;
+    // An entity outside the nominal legacy cube is still part of a full import.
+    // Include it in the explicit bounds instead of silently discarding it.
     if !options.crop {
-        let mut outside = 0;
-        let mut clipped = 0;
-        for cube in map.cubes.iter().filter(|c| !c.is_empty()) {
-            match transform.overlap(cube) {
-                RegionOverlap::Outside => outside += 1,
-                RegionOverlap::Clipped => clipped += 1,
-                RegionOverlap::Inside => {}
+        for entity in &map.entities {
+            let position = transform.position(entity.position).to_array();
+            for (axis, coordinate) in position.into_iter().enumerate() {
+                if !coordinate.is_finite() || coordinate.abs() > 1_048_576.0 {
+                    return Err("entity position exceeds supported import coordinates".into());
+                }
+                bounds.min[axis] = bounds.min[axis].min(coordinate.floor() as i32);
+                bounds.max[axis] = bounds.max[axis].max(coordinate.floor() as i32 + 1);
             }
         }
-        if outside != 0 || clipped != 0 {
-            return Err(region_error(outside, clipped));
-        }
     }
-    let mut by_root: BTreeMap<[i32; 3], Vec<CellFragment>> = BTreeMap::new();
-    let mut fragments = 0usize;
+    if !bounds.is_valid() {
+        return Err("map exceeds supported compact world bounds; choose an explicit --center, --units-per-metre, or --crop region".into());
+    }
+    let world_bounds = bounds.fine_box();
+    let mut report = ImportReport::new(map, options, &transform);
+    let mut regions = Vec::new();
     for cube in &map.cubes {
         if cube.is_empty() {
             continue;
@@ -186,8 +185,8 @@ pub fn convert(
         if bounds != source_bounds {
             report.leaves_clipped_at_region += 1;
         }
-        let material = report.material_for(cube, &options.materials);
-        let cell = match cube_cell(cube, material) {
+        let face_materials = report.face_materials_for(cube, &options.materials);
+        let mut cell = match cube_cell(cube, face_materials[0]) {
             Ok(cell) => cell,
             Err(reason) => {
                 if !options.skip_unsupported {
@@ -205,57 +204,41 @@ pub fn convert(
                 continue;
             }
         };
-        let root_min = bounds.min.map(|v| v.div_euclid(FINE_UNITS));
-        let root_max = bounds.max.map(|v| (v - 1).div_euclid(FINE_UNITS));
-        for x in root_min[0]..=root_max[0] {
-            for y in root_min[1]..=root_max[1] {
-                for z in root_min[2]..=root_max[2] {
-                    fragments += 1;
-                    if fragments > 786_432 {
-                        return Err("conversion exceeds the server's 786432-fragment budget; choose a smaller region or less detailed source".into());
-                    }
-                    let pos = [x, y, z];
-                    by_root.entry(pos).or_default().push(CellFragment {
-                        bounds: bounds.intersection(FineBox::root(pos)).unwrap(),
-                        origin: source_bounds.min,
-                        size: (source_bounds.max[0] - source_bounds.min[0]) as u32,
-                        cell,
-                    });
-                }
-            }
+        if face_materials
+            .iter()
+            .any(|&material| material != cell.material)
+        {
+            cell.face_materials = Some(face_materials);
         }
+        regions.push(CellFragment {
+            bounds,
+            origin: source_bounds.min,
+            size: (source_bounds.max[0] - source_bounds.min[0]) as u32,
+            cell,
+        });
     }
     if !options.crop && (report.leaves_outside_region > 0 || report.leaves_clipped_at_region > 0) {
-        return Err(region_error(
-            report.leaves_outside_region,
-            report.leaves_clipped_at_region,
-        ));
+        return Err("source geometry lies outside its declared legacy world bounds".into());
     }
-    let roots: Vec<_> = by_root
-        .into_iter()
-        .map(|(pos, fragments)| RootEdit { pos, fragments })
-        .collect();
-    let world = World::from_parts(&[], &roots)
+    let world = World::from_compact_parts(bounds, &regions, &[], &[])
         .map_err(|e| format!("imported geometry validation failed: {e}"))?;
+    let regions = world.regions();
     let cells = world.cells();
-    let roots = world.detailed_roots();
+    let roots = world.root_overrides();
     report.imported_coarse_cells = cells.len();
     report.imported_detailed_roots = roots.len();
+    report.imported_regions = regions.len();
     report.imported_fragments =
-        cells.len() + roots.iter().map(|r| r.fragments.len()).sum::<usize>();
+        regions.len() + cells.len() + roots.iter().map(|r| r.fragments.len()).sum::<usize>();
     if report.imported_fragments == 0 {
         return Err("the chosen region contains no importable geometry".into());
     }
     let mut objects = Vec::new();
     for entity in &map.entities {
         let position = transform.position(entity.position);
-        if position.x < WORLD_MIN as f32
-            || position.x >= WORLD_MAX as f32
-            || position.y < 0.0
-            || position.y >= WORLD_HEIGHT as f32
-            || position.z < WORLD_MIN as f32
-            || position.z >= WORLD_MAX as f32
-        {
+        if (0..3).any(|axis| {
+            position[axis] < bounds.min[axis] as f32 || position[axis] >= bounds.max[axis] as f32
+        }) {
             report.entities_outside_region += 1;
             continue;
         }
@@ -291,6 +274,9 @@ pub fn convert(
     }
     Ok((
         ImportedWorld {
+            format_version: WORLD_FORMAT_VERSION,
+            bounds,
+            regions,
             revision: 0,
             cells,
             roots,
@@ -431,14 +417,18 @@ mod tests {
         let map = map(vec![ramp()]);
         let (save, report) = convert(&map, &options()).unwrap();
         assert!(report.unsupported_leaves_omitted.is_empty());
-        assert!(save
-            .roots
-            .iter()
-            .flat_map(|r| &r.fragments)
-            .any(|f| f.size == 64));
+        assert_eq!(save.regions.len(), 1);
+        assert_eq!(save.regions[0].size, 64);
+        assert!(save.cells.is_empty() && save.roots.is_empty());
         let bytes = serde_json::to_vec(&save).unwrap();
         let restored: ImportedWorld = serde_json::from_slice(&bytes).unwrap();
-        let world = World::from_parts(&restored.cells, &restored.roots).unwrap();
+        let world = World::from_compact_parts(
+            restored.bounds,
+            &restored.regions,
+            &restored.cells,
+            &restored.roots,
+        )
+        .unwrap();
         for x in [0.125, 1.25, 3.375, 6.875] {
             let hit = world
                 .raycast(Vec3::new(x, 12.0, -3.5), -Vec3::Y, 20.0)
@@ -459,13 +449,66 @@ mod tests {
             textures: [0; 6],
             volume_material: 0,
         };
-        let map = map(vec![cube]);
+        let mut map = map(vec![cube]);
+        map.header.world_size = 1024;
         let mut opts = options();
-        assert!(convert(&map, &opts).unwrap_err().contains("does not fit"));
+        let (full, report) = convert(&map, &opts).unwrap();
+        assert_eq!(full.regions.len(), 1);
+        assert_eq!(full.regions[0].size, 1024);
+        assert_eq!(report.leaves_clipped_at_region, 0);
+        assert_eq!(full.bounds.min, [0, 0, -128]);
+        assert_eq!(full.bounds.max, [128, 128, 0]);
         opts.crop = true;
-        let (_, report) = convert(&map, &opts).unwrap();
+        let (cropped, report) = convert(&map, &opts).unwrap();
+        assert_eq!(cropped.bounds, WorldBounds::default());
+        assert_eq!(cropped.regions.len(), 1);
         assert_eq!(report.leaves_clipped_at_region, 1);
         assert!(report.crop_requested);
+    }
+
+    #[test]
+    fn all_legacy_face_slots_follow_the_geometry_rotation() {
+        let mut cube = ramp();
+        cube.textures = [10, 11, 12, 13, 14, 15];
+        let mut opts = options();
+        opts.materials = (0..6)
+            .map(|material| (material as u16 + 10, material))
+            .collect();
+        let (save, report) = convert(&map(vec![cube]), &opts).unwrap();
+        let cell = save.regions[0].cell;
+        assert_eq!(cell.face_materials, Some([0, 1, 4, 5, 3, 2]));
+        assert!(report.unmapped_texture_slot_faces.is_empty());
+        assert_eq!(report.leaves_with_multiple_face_textures, 1);
+        let restored: ImportedWorld =
+            serde_json::from_slice(&serde_json::to_vec(&save).unwrap()).unwrap();
+        assert_eq!(restored.regions[0].cell, cell);
+    }
+
+    #[test]
+    fn old_imported_worlds_default_to_legacy_bounds_and_material() {
+        let save: ImportedWorld = serde_json::from_str(
+            r#"{"cells":[{"pos":[0,0,0],"cell":{"material":3,"heights":[8,8,8,8]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(save.format_version, 1);
+        assert_eq!(save.bounds, WorldBounds::default());
+        assert!(save.regions.is_empty() && save.roots.is_empty());
+        assert_eq!(save.cells[0].cell.unwrap().material_for_face(5), 3);
+    }
+
+    #[test]
+    fn full_import_keeps_entities_outside_the_nominal_source_cube() {
+        let mut map = map(vec![ramp()]);
+        map.entities.push(crate::Entity {
+            position: [520.0, -8.0, 600.0],
+            attributes: [0; 5],
+            kind: 3,
+            extra: Vec::new(),
+        });
+        let (save, report) = convert(&map, &options()).unwrap();
+        assert_eq!(report.entities_outside_region, 0);
+        assert_eq!(save.objects.len(), 1);
+        assert_eq!(save.bounds.max, [66, 76, 2]);
     }
     #[test]
     fn unsupported_shape_and_subgrid_scale_never_silently_disappear() {

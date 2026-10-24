@@ -1,6 +1,6 @@
 use crate::{
     Cell, CellPos, ChunkKey, Mesh, RayHit, Shape, Vec3, Vertex, World, CHUNK_SIZE, MATERIAL_COLORS,
-    SHAPE_FACES, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
+    SHAPE_FACES,
 };
 
 const EPS: f32 = 1.0e-5;
@@ -136,6 +136,21 @@ fn surfaces(world: &World, pos: CellPos, cell: Cell, mut emit: impl FnMut([Vec3;
 impl World {
     pub fn mesh_chunk(&self, key: ChunkKey) -> Mesh {
         let mut mesh = Mesh::default();
+        if let Some(ids) = self.compact.batches.get(&key) {
+            for &id in ids {
+                let root = &self.compact.regions[id].active;
+                for triangle in &root.triangles {
+                    append_triangle(
+                        &mut mesh,
+                        triangle.points,
+                        root.fragments[triangle.fragment]
+                            .cell
+                            .material_for_face(triangle.face),
+                    );
+                }
+            }
+            return mesh;
+        }
         for z in 0..CHUNK_SIZE {
             for y in 0..CHUNK_SIZE {
                 for x in 0..CHUNK_SIZE {
@@ -149,7 +164,9 @@ impl World {
                             append_triangle(
                                 &mut mesh,
                                 triangle.points,
-                                root.fragments[triangle.fragment].cell.material,
+                                root.fragments[triangle.fragment]
+                                    .cell
+                                    .material_for_face(triangle.face),
                             );
                         }
                         continue;
@@ -157,21 +174,8 @@ impl World {
                     let Some(cell) = self.get(pos) else {
                         continue;
                     };
-                    let color = MATERIAL_COLORS[cell.material as usize];
-                    surfaces(self, pos, cell, |triangle, _| {
-                        let cross = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
-                        if cross.length_squared() <= EPS * EPS {
-                            return;
-                        }
-                        let normal = cross.normalize().to_array();
-                        let start = mesh.vertices.len() as u32;
-                        mesh.vertices.extend(triangle.map(|position| Vertex {
-                            position: position.to_array(),
-                            normal,
-                            color,
-                            material: cell.material,
-                        }));
-                        mesh.indices.extend([start, start + 1, start + 2]);
+                    surfaces(self, pos, cell, |triangle, face| {
+                        append_triangle(&mut mesh, triangle, cell.material_for_face(face));
                     });
                 }
             }
@@ -189,22 +193,68 @@ impl World {
             return None;
         }
         let direction = direction.normalize();
-        let bounds_min = Vec3::new(WORLD_MIN as f32, 0.0, WORLD_MIN as f32);
-        let bounds_max = Vec3::new(WORLD_MAX as f32, WORLD_HEIGHT as f32, WORLD_MAX as f32);
+        let bounds_min = self.bounds.world_min();
+        let bounds_max = self.bounds.world_max();
+        let mut compact_hit: Option<RayHit> = None;
+        for id in self.compact.ray_candidates(origin, direction, max_distance) {
+            let root = &self.compact.regions[id].active;
+            for triangle in &root.triangles {
+                let Some(t) = ray_triangle(origin, direction, triangle.points) else {
+                    continue;
+                };
+                if t < 0.0 || t > max_distance || compact_hit.is_some_and(|h| h.distance <= t) {
+                    continue;
+                }
+                let point = origin + direction * t;
+                let epsilon = point_epsilon(point);
+                if self.contains_point(point - direction * epsilon)
+                    && self.contains_point(point + direction * epsilon)
+                {
+                    continue;
+                }
+                let normal = (triangle.points[1] - triangle.points[0])
+                    .cross(triangle.points[2] - triangle.points[0])
+                    .normalize();
+                let fragment = &root.fragments[triangle.fragment];
+                let inside = (point - normal * epsilon).clamp(
+                    fragment.bounds.world_min() + Vec3::splat(epsilon),
+                    fragment.bounds.world_max() - Vec3::splat(epsilon),
+                );
+                let pos = inside.floor().as_ivec3().to_array();
+                let bounds = fragment
+                    .bounds
+                    .intersection(crate::FineBox::root(pos))
+                    .expect("ray owner lies within its fragment");
+                compact_hit = Some(RayHit {
+                    pos,
+                    bounds,
+                    face: triangle.face,
+                    normal,
+                    point,
+                    distance: t,
+                });
+            }
+        }
+        if !self.has_local_geometry() {
+            return compact_hit;
+        }
         let (enter, exit) = ray_box_interval(origin, direction, bounds_min, bounds_max)?;
         let mut distance = enter.max(0.0);
-        let end = exit.min(max_distance);
+        let end = exit
+            .min(max_distance)
+            .min(compact_hit.map_or(f32::INFINITY, |h| h.distance));
         if distance > end {
             return None;
         }
         // Bias only cell selection, never the reported ray distance.
-        let p = origin + direction * (distance + EPS);
+        let p = origin + direction * distance;
+        let p = p + direction * point_epsilon(p);
         let mut cell_pos = p.floor().as_ivec3().to_array();
         let mut step = [0; 3];
         let mut t_max = [f32::INFINITY; 3];
         let mut t_delta = [f32::INFINITY; 3];
         for axis in 0..3 {
-            if direction[axis].abs() <= EPS {
+            if direction[axis] == 0.0 {
                 continue;
             }
             step[axis] = if direction[axis] > 0.0 { 1 } else { -1 };
@@ -212,7 +262,7 @@ impl World {
             t_max[axis] = (boundary - origin[axis]) / direction[axis];
             t_delta[axis] = 1.0 / direction[axis].abs();
         }
-        while distance <= end + EPS && Self::is_valid_pos(cell_pos) {
+        while distance <= end + EPS && self.contains_pos(cell_pos) {
             let next = t_max[0].min(t_max[1]).min(t_max[2]).min(end);
             let mut hit: Option<RayHit> = None;
             let mut test_triangle = |triangle: [Vec3; 3], face, bounds| {
@@ -233,8 +283,9 @@ impl World {
                 // Test this exact hit, never its centroid or a convex hull.
                 // Sample along the ray, not a single face normal: at a
                 // concave crease that normal can enter the other face.
-                if self.contains_point(point - direction * (EPS * 8.0))
-                    && self.contains_point(point + direction * (EPS * 8.0))
+                let epsilon = point_epsilon(point);
+                if self.contains_point(point - direction * epsilon)
+                    && self.contains_point(point + direction * epsilon)
                 {
                     return;
                 }
@@ -275,18 +326,34 @@ impl World {
             }
             distance = next;
         }
-        None
+        compact_hit
     }
 
     pub fn intersects_box(&self, min: Vec3, max: Vec3) -> bool {
         if !min.is_finite() || !max.is_finite() || min.cmpge(max).any() {
             return false;
         }
+        let query = crate::FineBox {
+            min: (min * 8.0).floor().as_ivec3().to_array(),
+            max: (max * 8.0).ceil().as_ivec3().to_array(),
+        };
+        let Some(query) = query.intersection(self.bounds.fine_box()) else {
+            return false;
+        };
+        let volume: i64 = (0..3)
+            .map(|a| i64::from(query.max[a] - query.min[a]))
+            .product();
+        if self.has_regions() || volume > crate::MAX_QUERY_ROOTS as i64 * 512 {
+            return self
+                .fragments_in(query)
+                .iter()
+                .any(|f| crate::fine::fragment_intersects_box(f, min, max));
+        }
         let lo = min.floor().as_ivec3();
         let hi = max.ceil().as_ivec3();
-        for z in lo.z.max(WORLD_MIN)..hi.z.min(WORLD_MAX) {
-            for y in lo.y.max(0)..hi.y.min(WORLD_HEIGHT) {
-                for x in lo.x.max(WORLD_MIN)..hi.x.min(WORLD_MAX) {
+        for z in lo.z.max(self.bounds.min[2])..hi.z.min(self.bounds.max[2]) {
+            for y in lo.y.max(self.bounds.min[1])..hi.y.min(self.bounds.max[1]) {
+                for x in lo.x.max(self.bounds.min[0])..hi.x.min(self.bounds.max[0]) {
                     let pos = [x, y, z];
                     if self.fine.get(&pos).is_some_and(|r| {
                         r.fragments
@@ -316,10 +383,26 @@ impl World {
                     && cell_contains(f.cell, (point - f.world_origin()) / f.world_size())
             });
         }
-        self.get(pos).is_some_and(|cell| {
-            cell_contains(cell, point - Vec3::from_array(pos.map(|v| v as f32)))
-        })
+        if let Some(cell) = self.get(pos) {
+            return cell_contains(cell, point - Vec3::from_array(pos.map(|v| v as f32)));
+        }
+        if self.overrides.contains(&pos) {
+            return false;
+        }
+        self.compact
+            .query(crate::FineBox::root(pos))
+            .into_iter()
+            .any(|id| {
+                let f = &self.compact.regions[id].source;
+                point.cmpge(f.bounds.world_min()).all()
+                    && point.cmple(f.bounds.world_max()).all()
+                    && cell_contains(f.cell, (point - f.world_origin()) / f.world_size())
+            })
     }
+}
+
+fn point_epsilon(point: Vec3) -> f32 {
+    (point.abs().max_element() * f32::EPSILON * 2.0).max(EPS * 8.0)
 }
 
 /// Exact maximum of a piecewise linear top over an axis-aligned footprint.
@@ -406,7 +489,7 @@ pub(crate) fn ray_box_interval(
     let mut enter = f32::NEG_INFINITY;
     let mut exit = f32::INFINITY;
     for axis in 0..3 {
-        if direction[axis].abs() <= EPS {
+        if direction[axis] == 0.0 {
             if origin[axis] < min[axis] || origin[axis] > max[axis] {
                 return None;
             }
@@ -428,33 +511,32 @@ pub(crate) fn ray_box_interval(
 }
 
 fn ray_triangle(origin: Vec3, direction: Vec3, [a, b, c]: [Vec3; 3]) -> Option<f32> {
+    // Double precision and metre-based edge tolerance keep kilometre triangles
+    // from accepting hits centimetres outside their authored boundary.
+    let [a, b, c] = [a, b, c].map(|p| p.as_dvec3());
+    let direction = direction.as_dvec3();
     let edge1 = b - a;
     let edge2 = c - a;
     let p = direction.cross(edge2);
     let det = edge1.dot(p);
-    // Subdivision can leave a small, perfectly valid triangle. Compare the
-    // ray angle to its area instead of imposing a minimum world-space area.
     let area = edge1.cross(edge2).length();
-    if area < 1.0e-12 || det.abs() < area * 1.0e-7 {
+    if area < 1.0e-12 || det.abs() < area * 1.0e-12 {
         return None;
     }
     let inv = 1.0 / det;
-    let t = origin - a;
+    let t = origin.as_dvec3() - a;
     let u = t.dot(p) * inv;
-    if !(-EPS..=1.0 + EPS).contains(&u) {
-        return None;
-    }
     let q = t.cross(edge1);
     let v = direction.dot(q) * inv;
-    if v < -EPS || u + v > 1.0 + EPS {
+    let tolerance = EPS as f64 / area;
+    if u < -tolerance * edge2.length()
+        || v < -tolerance * edge1.length()
+        || u + v > 1.0 + tolerance * (c - b).length()
+    {
         return None;
     }
     let distance = edge2.dot(q) * inv;
-    if distance >= -EPS {
-        Some(distance.max(0.0))
-    } else {
-        None
-    }
+    (distance >= -(EPS as f64)).then_some(distance.max(0.0) as f32)
 }
 
 // General cells retain their actual triangulated boundary, including concave

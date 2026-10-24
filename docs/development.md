@@ -44,8 +44,9 @@ copies licenses and provenance manifests into `web/dist`. Rebuild after changes
 to client code, assets, or the browser shell. Restart the server if the browser
 files did not exist when it started.
 
-On macOS, `./scripts/build-macos-app.sh` packages an unsigned development app in
-`.local/Sauerteig.app`; it connects to a separately running server. Both build
+On macOS, `./scripts/build-macos-app.sh` builds the browser client and packages an
+unsigned development app in `.local/Sauerteig.app`. Local hosting is linked into
+the native app; browser files are bundled in its Resources directory. Both build
 scripts honor `CARGO_TARGET_DIR`.
 
 GitHub Actions checks formatting and Clippy, tests the workspace, builds native and browser
@@ -53,6 +54,20 @@ clients on Linux, and uploads the browser files. Integration tests bind ephemera
 loopback ports and use temporary world files.
 
 ## Hosting and saves
+
+The native home screen manages named worlds and starts a server for the selected
+world on an available port. Local hosting binds loopback unless the LAN checkbox
+is selected. **Save and leave**, or closing the window, closes the game connection
+and waits for the server's final save. A save error remains visible. A world lock
+prevents two app instances from hosting or duplicating the same managed save.
+
+Managed saves live under the application-data directory in `worlds/<id>/`, with
+separate display metadata and an opaque `world.json`. Import and duplicate copy
+the source; they never move or overwrite it. The home screen remembers player
+name, server address, and last world. Explicit `--server` launches still join
+directly, for example `cargo run -p sauerteig-client -- --server localhost:3000`.
+
+The standalone server remains available for dedicated hosting:
 
 | Server option | Default | Environment variable |
 | --- | --- | --- |
@@ -62,7 +77,9 @@ loopback ports and use temporary world files.
 | `--no-edit` | Editing allowed | — |
 
 World changes save after a short delay, on explicit save, and on graceful
-shutdown. An existing file is loaded at startup; an unused path starts a fresh
+shutdown, using buffered writes and an atomic file replacement. Leaving a session
+waits for queued edits, an ordered server acknowledgment, and local document writes.
+An existing file is loaded at startup; an unused path starts a fresh
 arena. Stop the server before replacing its save file.
 
 For a trusted LAN session:
@@ -79,18 +96,23 @@ Names are display labels, with no account authentication.
 
 Shared geometry and objects live in the server's JSON save. Blueprints and
 settings are client-local: IndexedDB for the browser's site origin, or the OS
-application-data folder on desktop. On macOS this is
+application-data folder on desktop. Remembered browser session choices use
+localStorage for that origin. On macOS the application-data folder is
 `~/Library/Application Support/Sauerteig`; `SAUERTEIG_DATA_DIR` overrides it.
 
 ## Rendering and assets
 
-Rendering meshes are derived from the editable geometry. An edit rebuilds dirty
-chunks and their face neighbors; raycasts and collision use the same cell shapes.
+Rendering meshes are derived from the editable geometry. Imported large leaves
+remain compact and use a spatial query index. Local metre-root edits mask the
+authored base without expanding the whole map. An edit rebuilds affected mesh
+batches, local chunks, and their face neighbors; raycasts and collision use the
+same cell shapes. Camera and shadow passes cull using actual mesh bounds.
 The [core contract](../crates/core/CONTRACT.md) describes the geometry and protocol
 invariants.
 
-Lighting is dynamic. The sun and eight nearby fixtures cast shadows, with 512 px
-shadow maps for fixtures and light-volume culling. Ambient fill keeps unlit areas
+Lighting is dynamic. The sun shadow window follows the player with texel-snapped
+motion; eight nearby fixtures cast shadows with 512 px maps and light-volume
+culling. Ambient fill keeps unlit areas
 readable; there is no baked map lighting or global illumination. Guides, tracers,
 and the first-person weapon do not cast shadows.
 
@@ -112,8 +134,11 @@ For repeatable CPU measurements:
 ```sh
 cargo run --release -p sauerteig-core --example profile_world
 cargo run --release -p sauerteig-core --example profile_fine
+cargo run --release -p sauerteig-import --example profile_ogz -- path/to/map.ogz
 ```
 
-These report meshing, edit, movement, and ray-query timings. They exclude GPU
+These report meshing, edit, movement, and ray-query timings. The OGZ profile also
+reports original-scale storage, load time, query percentiles, and dirty remeshing.
+They exclude GPU
 execution and networking. F3 shows rendering counts and CPU edit/remesh timing,
 including GPU upload submission; it does not measure GPU completion or latency.

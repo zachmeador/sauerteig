@@ -1,6 +1,7 @@
 use crate::{Cube, ImportOptions};
 use sauerteig_core::{
-    FineBox, Vec3, FINE_UNITS, MAX_FRAGMENT_SOURCE_SIZE, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
+    FineBox, Vec3, WorldBounds, FINE_UNITS, MAX_FRAGMENT_SOURCE_SIZE, WORLD_HEIGHT, WORLD_MAX,
+    WORLD_MIN,
 };
 
 /// One exact scale and rotation for geometry, entities, and crop reporting.
@@ -10,6 +11,7 @@ pub(crate) struct ImportTransform {
     center_fine: [i32; 3],
     pub center: [f64; 3],
     pub source_region: [[f64; 3]; 2],
+    pub bounds: WorldBounds,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,7 +39,7 @@ impl ImportTransform {
         }
         let source_units_per_metre = f64::from(units);
         let half_height = f64::from(WORLD_HEIGHT) / 2.0;
-        let source_region = [
+        let crop_region = [
             [
                 center[0] + f64::from(WORLD_MIN) * source_units_per_metre,
                 center[1] - f64::from(WORLD_MAX) * source_units_per_metre,
@@ -49,11 +51,32 @@ impl ImportTransform {
                 center[2] + half_height * source_units_per_metre,
             ],
         ];
+        let source_region = if options.crop {
+            crop_region
+        } else {
+            [[0.0; 3], [f64::from(world_size); 3]]
+        };
+        let source_size = f64::from(world_size) / source_units_per_metre;
+        let min = [
+            -center[0] / source_units_per_metre,
+            half_height - center[2] / source_units_per_metre,
+            center[1] / source_units_per_metre - source_size,
+        ];
+        let max = min.map(|value| value + source_size);
+        let bounds = if options.crop {
+            WorldBounds::default()
+        } else {
+            WorldBounds {
+                min: min.map(|value| value.floor() as i32),
+                max: max.map(|value| value.ceil() as i32),
+            }
+        };
         Ok(Self {
             units_per_metre: units,
             center_fine,
             center,
             source_region,
+            bounds,
         })
     }
 
@@ -130,17 +153,6 @@ impl ImportTransform {
     }
 }
 
-pub(crate) fn world_bounds() -> FineBox {
-    FineBox {
-        min: [WORLD_MIN * FINE_UNITS, 0, WORLD_MIN * FINE_UNITS],
-        max: [
-            WORLD_MAX * FINE_UNITS,
-            WORLD_HEIGHT * FINE_UNITS,
-            WORLD_MAX * FINE_UNITS,
-        ],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +162,7 @@ mod tests {
         let options = ImportOptions {
             units_per_metre: 16,
             center: Some([128.0, 256.0, 384.0]),
+            crop: true,
             ..ImportOptions::default()
         };
         let transform = ImportTransform::new(1024, &options).unwrap();

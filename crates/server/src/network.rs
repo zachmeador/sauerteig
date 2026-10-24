@@ -2,7 +2,7 @@
 
 use crate::{
     persistence::{load_world, write_world},
-    Config, Session, MAX_PLAYERS, SAVE_DELAY,
+    Config, Session, MAX_PLAYERS, MAX_WORLD_SNAPSHOT_BYTES, SAVE_DELAY,
 };
 use axum::{
     extract::{
@@ -28,12 +28,9 @@ use tokio::{
 use tower_http::services::ServeDir;
 
 pub(super) const MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-// A Welcome may contain every legal cell, including explicit corner shapes.
-// Allow 256 JSON bytes per cell, plus objects and players. The remaining space
-// covers the envelope and WebSocket framing/buffered writes.
-// This is a growth limit, not an allocation per connection. Incoming messages
-// retain their separate 16 MiB limit.
-pub(super) const OUTBOUND_WRITE_BYTES: usize = 256 * 1024 * 1024;
+// Leave framing and pending-write headroom above the native client's message
+// limit. Session and save-file validation keep every world snapshot below it.
+pub(super) const OUTBOUND_WRITE_BYTES: usize = MAX_WORLD_SNAPSHOT_BYTES + 32 * 1024;
 
 struct App {
     session: Mutex<Session>,
@@ -105,6 +102,10 @@ async fn connection(mut socket: WebSocket, app: Arc<App>) {
     let mut last_packet = Instant::now();
     let mut ping = tokio::time::interval(Duration::from_secs(15));
     loop {
+        // A delayed Welcome may finish after shutdown was already sent.
+        if *stopped.borrow() {
+            break;
+        }
         tokio::select! {
             biased;
             _ = stopped.changed() => break,
@@ -128,7 +129,8 @@ async fn connection(mut socket: WebSocket, app: Arc<App>) {
                             Ok(message) => {
                                 let request = match &message {
                                     ClientMessage::Edit { request, .. }
-                                    | ClientMessage::EditRoots { request, .. } => Some(*request),
+                                    | ClientMessage::EditRoots { request, .. }
+                                    | ClientMessage::EditTransaction { request, .. } => Some(*request),
                                     _ => None,
                                 };
                                 (request, session.handle(id, message))
@@ -201,6 +203,9 @@ pub async fn serve(
         let mut timer = tokio::time::interval(Duration::from_secs_f64(1.0 / 60.0));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
+            if *stop.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = timer.tick() => tick_app.session.lock().unwrap().step(),
@@ -213,6 +218,9 @@ pub async fn serve(
         let mut timer = tokio::time::interval(Duration::from_secs(1));
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
+            if *stop.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = timer.tick() => {
@@ -238,4 +246,55 @@ pub async fn serve(
     let _ = save_task.await;
     save_current(&app, true).await?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_opened_after_shutdown_closes_without_another_stop_signal() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = Config {
+            world_path: std::env::temp_dir().join(format!(
+                "sauerteig-early-stop-{}-{stamp}",
+                std::process::id()
+            )),
+            ..Config::default()
+        };
+        let (stopped, _) = watch::channel(true);
+        let app = Arc::new(App {
+            session: Mutex::new(Session::new(load_world(&config.world_path).unwrap(), true)),
+            save_lock: tokio::sync::Mutex::new(()),
+            config,
+            stopped,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let router = Router::new()
+            .route("/ws", get(upgrade))
+            .with_state(app.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(endpoint).await.unwrap();
+        // Model shutdown winning before a delayed WebSocket upgrade or Welcome
+        // write completes. No second stop notification is ever sent.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(message) = socket.next().await {
+                if matches!(
+                    message.unwrap(),
+                    tokio_tungstenite::tungstenite::Message::Close(_)
+                ) {
+                    return;
+                }
+            }
+        })
+        .await;
+        server.abort();
+        closed.expect("a late connection must not keep graceful shutdown waiting");
+        assert!(app.session.lock().unwrap().peers.is_empty());
+    }
 }

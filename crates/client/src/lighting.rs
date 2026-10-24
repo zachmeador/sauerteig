@@ -1,7 +1,5 @@
-use glam::{Mat4, Vec3, Vec4};
-use sauerteig_core::{
-    ChunkKey, ObjectKind, WorldObject, CHUNK_SIZE, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
-};
+use glam::{Mat4, Vec3};
+use sauerteig_core::{ObjectKind, WorldObject};
 
 pub const LOCAL_LIGHTS: usize = 8;
 pub const LOCAL_SHADOW_SIZE: u32 = 512;
@@ -9,7 +7,6 @@ pub const LIGHT_RANGE: f32 = 12.0;
 pub const LIGHT_NEAR: f32 = 0.12;
 pub const LIGHT_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_3;
 const LAMP_OFFSET: f32 = 0.28;
-const CULL_EPSILON: f32 = 1.0e-4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalLight {
@@ -72,74 +69,68 @@ pub fn closest_lights(objects: &[WorldObject], eye: Vec3) -> [Option<LocalLight>
     nearby.map(|entry| entry.map(|(_, _, light)| light))
 }
 
-fn box_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
-    std::array::from_fn(|i| {
-        Vec3::new(
-            if i & 1 == 0 { min.x } else { max.x },
-            if i & 2 == 0 { min.y } else { max.y },
-            if i & 4 == 0 { min.z } else { max.z },
-        )
-    })
-}
-
-/// Conservative rejection only: retain intersecting chunks even when none of
-/// their corners lies inside the light's frustum. The spherical range test
-/// matches illumination falloff, while the six planes match WebGPU's ZO clip.
-pub fn chunk_in_light(key: ChunkKey, light: &LocalLight) -> bool {
-    let min = Vec3::from_array(key.map(|v| (v * CHUNK_SIZE) as f32));
-    let max = min + Vec3::splat(CHUNK_SIZE as f32);
-    let closest = light.position.clamp(min, max);
-    if closest.distance_squared(light.position) > LIGHT_RANGE * LIGHT_RANGE + CULL_EPSILON {
-        return false;
-    }
-    let clip = box_corners(min, max).map(|p| light.view_proj * p.extend(1.0));
-    // A linear clip-plane inequality reaches its extrema at box corners.
-    // Rejecting only if all eight corners fail one plane cannot lose a caster.
-    let planes: [fn(Vec4) -> f32; 6] = [
-        |p| p.x + p.w,
-        |p| p.w - p.x,
-        |p| p.y + p.w,
-        |p| p.w - p.y,
-        |p| p.z,
-        |p| p.w - p.z,
-    ];
-    !planes
-        .iter()
-        .any(|plane| clip.iter().all(|&p| plane(p) < -CULL_EPSILON))
-}
-
-/// Fit the entire editable volume, anchored to world coordinates so walking
-/// cannot move the shadow texel grid. `sun` points from the world toward the sun.
-pub fn sun_shadow_matrix(sun: Vec3) -> Mat4 {
-    const PADDING: f32 = 2.0;
-    let min = Vec3::new(WORLD_MIN as f32, 0.0, WORLD_MIN as f32);
-    let max = Vec3::new(WORLD_MAX as f32, WORLD_HEIGHT as f32, WORLD_MAX as f32);
-    let center = (min + max) * 0.5;
-    let radius = (max - center).length();
+/// A bounded sun-shadow window follows the camera on large maps. Snap its light-space
+/// origin to texels so small camera motions do not make stationary shadows crawl.
+pub fn sun_shadow_matrix(sun: Vec3, focus: Vec3) -> Mat4 {
+    const HALF_WIDTH: f32 = 96.0;
+    const DEPTH: f32 = 256.0;
+    const RESOLUTION: f32 = 2048.0;
     let sun = sun.try_normalize().unwrap_or(Vec3::Y);
     let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
-    let view = Mat4::look_at_rh(center + sun * (radius + PADDING + 1.0), center, up);
-    let mut view_min = Vec3::splat(f32::INFINITY);
-    let mut view_max = Vec3::splat(f32::NEG_INFINITY);
-    for corner in box_corners(min, max) {
-        let p = view.transform_point3(corner);
-        view_min = view_min.min(p);
-        view_max = view_max.max(p);
-    }
-    let projection = Mat4::orthographic_rh(
-        view_min.x - PADDING,
-        view_max.x + PADDING,
-        view_min.y - PADDING,
-        view_max.y + PADDING,
-        -view_max.z - PADDING,
-        -view_min.z + PADDING,
-    );
-    projection * view
+    let view = Mat4::look_to_rh(Vec3::ZERO, -sun, up);
+    let mut center = view.transform_point3(focus);
+    let texel = 2.0 * HALF_WIDTH / RESOLUTION;
+    center.x = (center.x / texel).round() * texel;
+    center.y = (center.y / texel).round() * texel;
+    Mat4::orthographic_rh(
+        center.x - HALF_WIDTH,
+        center.x + HALF_WIDTH,
+        center.y - HALF_WIDTH,
+        center.y + HALF_WIDTH,
+        -center.z - DEPTH,
+        -center.z + DEPTH,
+    ) * view
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::culling::{Bounds, Frustum};
+    use sauerteig_core::{ChunkKey, CHUNK_SIZE, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN};
+
+    fn box_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
+        std::array::from_fn(|i| {
+            Vec3::new(
+                if i & 1 == 0 { min.x } else { max.x },
+                if i & 2 == 0 { min.y } else { max.y },
+                if i & 4 == 0 { min.z } else { max.z },
+            )
+        })
+    }
+
+    fn chunk_in_light(key: ChunkKey, light: &LocalLight) -> bool {
+        let min = Vec3::from_array(key.map(|v| (v * CHUNK_SIZE) as f32));
+        let bounds = Bounds {
+            min,
+            max: min + Vec3::splat(CHUNK_SIZE as f32),
+        };
+        bounds.within_radius(light.position, LIGHT_RANGE)
+            && Frustum::new(light.view_proj).intersects(bounds)
+    }
+
+    #[test]
+    fn sun_shadows_follow_distant_players_and_snap_small_camera_motion() {
+        let focus = Vec3::new(3000.0, 800.0, -4000.0);
+        let matrix = sun_shadow_matrix(Vec3::Y, focus);
+        for corner in box_corners(focus - Vec3::splat(40.0), focus + Vec3::splat(40.0)) {
+            let p = ndc(matrix, corner);
+            assert!(p.x.abs() < 1.0 && p.y.abs() < 1.0 && p.z > 0.0 && p.z < 1.0);
+        }
+        assert_eq!(
+            sun_shadow_matrix(Vec3::Y, Vec3::ZERO),
+            sun_shadow_matrix(Vec3::Y, Vec3::X * 0.001)
+        );
+    }
 
     fn fixture(id: u32, position: Vec3) -> WorldObject {
         WorldObject {
@@ -243,7 +234,7 @@ mod tests {
             Vec3::new(WORLD_MAX as f32, WORLD_HEIGHT as f32, WORLD_MAX as f32),
         );
         for sun in [Vec3::new(-0.44, 0.76, 0.34), Vec3::Y, -Vec3::Y, Vec3::X] {
-            let matrix = sun_shadow_matrix(sun);
+            let matrix = sun_shadow_matrix(sun, Vec3::new(0.0, WORLD_HEIGHT as f32 * 0.5, 0.0));
             for corner in corners {
                 let p = ndc(matrix, corner);
                 assert!(p.x > -1.0 && p.x < 1.0, "sun {sun:?}, {p:?}");

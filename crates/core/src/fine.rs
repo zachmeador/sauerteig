@@ -176,7 +176,10 @@ pub fn canonical_root_fragments(pos: CellPos, fragments: &[CellFragment]) -> Vec
                 bounds: fragment.bounds,
                 origin: root.min,
                 size: 8,
-                cell: Cell::solid(fragment.cell.material),
+                cell: Cell {
+                    face_materials: fragment.cell.face_materials,
+                    ..Cell::solid(fragment.cell.material)
+                },
             });
         } else {
             others.push(fragment.clone());
@@ -188,9 +191,7 @@ pub fn canonical_root_fragments(pos: CellPos, fragments: &[CellFragment]) -> Vec
     // Validation established disjoint boxes inside this root, so matching
     // integer volume proves full coverage even for a non-grid partition.
     if others.is_empty()
-        && solids
-            .iter()
-            .all(|f| f.cell.material == solids[0].cell.material)
+        && solids.iter().all(|f| f.cell == solids[0].cell)
         && solids
             .iter()
             .map(|f| {
@@ -211,6 +212,7 @@ pub fn canonical_root_fragments(pos: CellPos, fragments: &[CellFragment]) -> Vec
             solids.sort_by_key(|f| {
                 (
                     f.cell.material,
+                    f.cell.face_materials,
                     f.bounds.min[u],
                     f.bounds.max[u],
                     f.bounds.min[v],
@@ -222,7 +224,7 @@ pub fn canonical_root_fragments(pos: CellPos, fragments: &[CellFragment]) -> Vec
             let mut merged: Vec<CellFragment> = Vec::with_capacity(solids.len());
             for fragment in solids.drain(..) {
                 if let Some(last) = merged.last_mut() {
-                    if last.cell.material == fragment.cell.material
+                    if last.cell == fragment.cell
                         && [u, v].into_iter().all(|a| {
                             last.bounds.min[a] == fragment.bounds.min[a]
                                 && last.bounds.max[a] == fragment.bounds.max[a]
@@ -249,31 +251,25 @@ pub fn canonical_root_fragments(pos: CellPos, fragments: &[CellFragment]) -> Vec
 
 impl World {
     pub fn from_parts(cells: &[CellEdit], roots: &[RootEdit]) -> Result<Self, String> {
-        let mut seen = BTreeSet::new();
-        for c in cells {
-            if !Self::is_valid_pos(c.pos)
-                || c.cell.is_some_and(|v| !v.is_valid())
-                || !seen.insert(c.pos)
-            {
-                return Err("Invalid or repeated coarse cell.".into());
-            }
-        }
-        if roots.iter().any(|r| seen.contains(&r.pos)) {
-            return Err("A saved root has both coarse and detailed geometry.".into());
-        }
-        let mut world = Self::from_cells(cells);
-        world.apply_root_edits(roots)?;
-        Ok(world)
+        Self::from_compact_parts(crate::WorldBounds::default(), &[], cells, roots)
     }
     pub fn root_fragments(&self, pos: CellPos) -> Vec<CellFragment> {
-        self.fine.get(&pos).map_or_else(
-            || {
-                self.get(pos)
-                    .map(|cell| vec![CellFragment::from_cell(pos, cell)])
-                    .unwrap_or_default()
-            },
-            |r| r.fragments.clone(),
-        )
+        if let Some(root) = self.fine.get(&pos) {
+            return root.fragments.clone();
+        }
+        if let Some(cell) = self.get(pos) {
+            return vec![CellFragment::from_cell(pos, cell)];
+        }
+        if self.overrides.contains(&pos) || !self.contains_pos(pos) {
+            return Vec::new();
+        }
+        let bounds = FineBox::root(pos);
+        self.compact
+            .query(bounds)
+            .into_iter()
+            .filter_map(|id| self.compact.regions[id].source.clipped(bounds))
+            .filter(|f| fragment_intersects_box(f, bounds.world_min(), bounds.world_max()))
+            .collect()
     }
     pub fn detailed_roots(&self) -> Vec<RootEdit> {
         self.fine
@@ -284,34 +280,16 @@ impl World {
             })
             .collect()
     }
+    /// Legacy convenience for bounded selections. Use try_roots_in to report limits.
     pub fn roots_in(&self, bounds: FineBox) -> Vec<RootEdit> {
-        if bounds.is_empty() {
-            return Vec::new();
-        }
-        // Enumerate occupied storage, never the volume of a user's selection.
-        let mut roots: Vec<_> = self
-            .cells()
-            .into_iter()
-            .filter(|c| FineBox::root(c.pos).intersection(bounds).is_some())
-            .map(|c| RootEdit {
-                pos: c.pos,
-                fragments: vec![CellFragment::from_cell(c.pos, c.cell.unwrap())],
-            })
-            .collect();
-        roots.extend(
-            self.fine
-                .iter()
-                .filter(|(pos, _)| FineBox::root(**pos).intersection(bounds).is_some())
-                .map(|(&pos, r)| RootEdit {
-                    pos,
-                    fragments: r.fragments.clone(),
-                }),
-        );
-        roots.sort_by_key(|r| r.pos);
-        roots
+        self.try_roots_in(bounds, crate::MAX_QUERY_ROOTS)
+            .unwrap_or_default()
     }
     pub fn apply_root_edits(&mut self, edits: &[RootEdit]) -> Result<Vec<ChunkKey>, String> {
         validate_root_edits(edits)?;
+        if edits.iter().any(|e| !self.contains_pos(e.pos)) {
+            return Err("Edit lies outside this world.".into());
+        }
         // Compile every replacement before mutating anything; clipping failures
         // cannot leave a half-applied collaborative operation.
         enum Prepared {
@@ -368,24 +346,47 @@ impl World {
                 }),
             ));
         }
-        let mut dirty = BTreeSet::new();
+        let changed: BTreeSet<_> = prepared
+            .iter()
+            .zip(edits)
+            .filter_map(|((pos, value), edit)| {
+                let previous = self.root_fragments(*pos);
+                if previous == edit.fragments {
+                    return None;
+                }
+                let same = match value {
+                    Prepared::Coarse(cell) => {
+                        previous == vec![CellFragment::from_cell(*pos, *cell)]
+                    }
+                    Prepared::Detailed(root) => previous == root.fragments,
+                };
+                (!same).then_some(*pos)
+            })
+            .collect();
+        let positions: Vec<_> = changed.iter().copied().collect();
+        let masks = self.compact.prepare_masks(&positions)?;
+        let mut dirty = self.dirty_region_keys(&positions);
+        self.compact.apply_masks(masks);
         for (pos, prepared) in prepared {
+            if !changed.contains(&pos) {
+                continue;
+            }
             match prepared {
                 Prepared::Coarse(cell) => {
                     if self.get(pos) == Some(cell) && !self.fine.contains_key(&pos) {
                         continue;
                     }
-                    self.set(pos, Some(cell));
+                    self.set_storage(pos, Some(cell));
                 }
                 Prepared::Detailed(root) => {
-                    if self.root_fragments(pos) == root.fragments {
-                        continue;
-                    }
-                    self.set(pos, None);
+                    self.set_storage(pos, None);
                     if !root.fragments.is_empty() {
                         self.fine.insert(pos, root);
                     }
                 }
+            }
+            if self.has_regions() {
+                self.overrides.insert(pos);
             }
             let key = Self::cell_chunk(pos);
             dirty.insert(key);
@@ -414,7 +415,7 @@ pub(crate) fn fragment_intersects_box(fragment: &CellFragment, min: Vec3, max: V
         )
 }
 
-fn clip_fragment(fragment: &CellFragment) -> Result<Vec<([Vec3; 3], u8)>, String> {
+pub(crate) fn clip_fragment(fragment: &CellFragment) -> Result<Vec<([Vec3; 3], u8)>, String> {
     // The common fine floor/wall/box needs no polygon clipping or cap solving.
     if fragment.cell.is_full() {
         let min = fragment.bounds.world_min();

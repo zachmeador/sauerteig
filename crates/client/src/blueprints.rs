@@ -4,9 +4,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 
-pub const BLUEPRINT_VERSION: u32 = 1;
+pub const BLUEPRINT_VERSION: u32 = 2;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Blueprint {
     pub id: u64,
     pub name: String,
@@ -14,7 +14,7 @@ pub struct Blueprint {
     pub clipboard: Clipboard,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BlueprintLibrary {
     version: u32,
     next_id: u64,
@@ -187,7 +187,7 @@ impl<'de> Deserialize<'de> for BlueprintLibrary {
             entries: Vec<Blueprint>,
         }
         let mut raw = Raw::deserialize(deserializer)?;
-        if raw.version != BLUEPRINT_VERSION {
+        if !(1..=BLUEPRINT_VERSION).contains(&raw.version) {
             return Err(serde::de::Error::custom(
                 BlueprintError::UnsupportedVersion(raw.version),
             ));
@@ -208,7 +208,7 @@ impl<'de> Deserialize<'de> for BlueprintLibrary {
             ));
         }
         Ok(Self {
-            version: raw.version,
+            version: BLUEPRINT_VERSION,
             next_id: raw.next_id,
             entries: raw.entries,
         })
@@ -222,7 +222,7 @@ mod tests {
         editor::EditSelection,
         regions::{RegionBox, RegionSet},
     };
-    use sauerteig_core::{Cell, World};
+    use sauerteig_core::{Cell, ObjectKind, Vec3, World, WorldObject};
     fn captured() -> Clipboard {
         let mut world = World::empty();
         world.set([0, 0, 0], Some(Cell::solid(2)));
@@ -262,7 +262,7 @@ mod tests {
         library.save("Room", "Test", captured()).unwrap();
         let json = library.to_json().unwrap();
         assert_eq!(BlueprintLibrary::from_json(&json).unwrap(), library);
-        let future = json.replacen("\"version\":1", "\"version\":2", 1);
+        let future = json.replacen("\"version\":2", "\"version\":3", 1);
         assert!(BlueprintLibrary::from_json(&future).is_err());
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let entry = value["entries"][0].clone();
@@ -280,5 +280,48 @@ mod tests {
             .unwrap()
             .plan_paste(&World::empty(), &selection)
             .is_ok());
+    }
+
+    #[test]
+    fn legacy_geometry_library_migrates_and_objects_survive_blueprint_storage() {
+        let mut legacy = BlueprintLibrary::new();
+        legacy.save("Old room", "", captured()).unwrap();
+        let mut json = serde_json::to_value(&legacy).unwrap();
+        json["version"] = serde_json::json!(1);
+        json["entries"][0]["clipboard"]
+            .as_object_mut()
+            .unwrap()
+            .remove("objects");
+        let migrated = BlueprintLibrary::from_json(&json.to_string()).unwrap();
+        assert_eq!(migrated.version, BLUEPRINT_VERSION);
+        assert!(migrated.load(1).unwrap().objects().is_empty());
+
+        let selection = RegionSet::from_boxes([RegionBox::new([0; 3], [16; 3]).unwrap()]).unwrap();
+        let objects = vec![
+            WorldObject {
+                id: 9,
+                kind: ObjectKind::Light,
+                position: Vec3::new(0.5, 1.5, 0.5),
+                rotation: 0.25,
+            },
+            WorldObject {
+                id: 42,
+                kind: ObjectKind::Spawn,
+                position: Vec3::new(1.5, 0.0, 1.5),
+                rotation: 1.0,
+            },
+        ];
+        let mut clipboard =
+            Clipboard::copy_regions_with_objects(&World::empty(), &selection, &objects).unwrap();
+        clipboard.rotate_y().unwrap();
+        clipboard.mirror(2).unwrap();
+        let mut library = migrated;
+        let id = library
+            .save("Lit room", "Rooms", clipboard.clone())
+            .unwrap();
+        let restored = BlueprintLibrary::from_json(&library.to_json().unwrap()).unwrap();
+        assert_eq!(restored, library);
+        assert_eq!(restored.load(id).unwrap(), clipboard);
+        assert_eq!(restored.load(id).unwrap().objects().len(), 2);
     }
 }

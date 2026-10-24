@@ -124,6 +124,7 @@ fn half_unit_stairs_are_walkable_without_jumping() {
                     heights: [if step % 2 == 0 { 4 } else { 8 }; 4],
                     diagonal: false,
                     shape: None,
+                    face_materials: None,
                 }),
             );
         }
@@ -161,6 +162,7 @@ fn ramps_do_not_behave_like_full_height_blocks() {
                     heights: [low, low + 4, low + 4, low],
                     diagonal: false,
                     shape: None,
+                    face_materials: None,
                 }),
             );
         }
@@ -199,6 +201,7 @@ fn jumping_hits_a_ceiling_then_lands() {
                     heights: [1, 4, 8, 4],
                     diagonal: false,
                     shape: None,
+                    face_materials: None,
                 }),
             );
         }

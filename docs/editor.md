@@ -27,8 +27,8 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Cycle and apply material | Y+wheel |
 | Choose material | 1–8 |
 | Browse materials and props | T, or Esc → Assets |
-| Undo your latest geometry edit | U or Z |
-| Redo your latest undone geometry edit | Shift+U or Shift+Z |
+| Undo your latest geometry or object edit | U or Z |
+| Redo your latest undone edit | Shift+U or Shift+Z |
 | Copy / paste selected volumes | C / V |
 | Save, organize, or load blueprints | B, or Esc → Blueprints |
 | Settings, including scroll inversion | F2, or Esc → Settings |
@@ -36,6 +36,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Mirror the clipboard along X / Z | M / Shift+M |
 | Place selected prop / light / spawn | P / L / O |
 | Remove an aimed object | Delete / Backspace |
+| Switch geometry / object selection | Q |
 | Show controls / performance stats | F1 / F3 |
 | Save the shared world on the server | Ctrl+S or Cmd+S |
 
@@ -49,28 +50,39 @@ Fine carving preserves the original shape of existing sloped and warped surfaces
 
 Materials 1–8 are **Concrete**, **Gunmetal**, **Rusted Steel**, **Worn Concrete**,
 **Hazard Paint**, **Amber Light**, **Rock**, and **Earth**. Use Y+wheel to cycle and
-apply them, or T to browse thumbnails and paint a persistent selection. Texture
+apply them, or T to browse thumbnails and paint a persistent selection. Painting
+changes the selection's active face direction; other faces keep their materials.
+Floors, ceilings, and each wall direction can have independent surfaces. Texture
 scale uses world coordinates, so subdividing a surface does not shrink its pattern.
 
 T also chooses a wall lamp, hanging lamp, utility box, pipe, rock, or a procedural tree. P places the chosen prop. Wall lamps align to walls; hanging
 lamps mount to ceilings, or stand two metres above an aimed floor. Both lamps
 join the dynamic lighting budget. Props are decorative: use cube geometry for
-collision underneath large barriers. Props do not yet belong to blueprints or
-geometry undo history.
+collision underneath large barriers.
+
+Press **Q** in edit mode to select objects. Click a prop, lamp, or spawn to select
+it; the object panel exposes position and yaw. Arrow keys move it by the current
+grid step, Shift+Up/Down moves vertically, R rotates 90°, H moves it to the aimed
+surface, and Insert duplicates it. Delete removes it. These actions share undo
+and redo with geometry. Release the mouse with Esc to use the numeric controls.
 
 ## Volumes and blueprints
 
 Selections can contain several volumes: select the main building, then add its
 annex with Alt+drag. Overlaps count once. Subtract volumes with Alt+Shift+drag.
-Copy captures geometry and empty space inside that union. Paste replaces only
+Copy captures geometry, empty space, and objects whose pivots lie inside that
+union. Paste replaces only
 those volumes, leaving the gaps between them alone. Blue outlines preview the
 clipboard at the active selection's minimum corner; V commits the placement.
-R and M transform both the geometry and its selection mask.
+R and M transform geometry, face materials, the selection mask, and object
+positions/facing. Object meshes retain their original shape when mirrored.
+Pasted objects receive new identities; existing objects at the destination stay.
 
 Press B to save a selection as a named blueprint. The library supports folders,
 search, renaming, moving, duplication, deletion, and loading back into the
-clipboard for placement. Blueprints currently contain geometry only; trees,
-lights, and other objects are not captured. Libraries and settings are local to
+clipboard for placement. Blueprints include props, lights, and spawns together
+with geometry, so a building keeps its fixtures. Older geometry-only blueprints
+still load. Libraries and settings are local to
 each client, separate from the shared map. Browser data lives in IndexedDB for
 that site origin. Desktop data uses the OS application data folder (on macOS,
 `~/Library/Application Support/Sauerteig`); `SAUERTEIG_DATA_DIR` overrides it.
@@ -84,6 +96,7 @@ exceed those limits. Undo history is bounded by both operation count and stored
 geometry complexity.
 
 Changes are shared immediately. Personal undo is rejected if someone has
-subsequently changed the same cells. Redo checks ownership too, including edits
+subsequently changed the same cells or objects. A combined paste is one atomic
+edit and one undo entry. Redo checks ownership too, including edits
 that restored an identical value. A new edit clears your redo history. Adding
 geometry through an active fighter is also rejected.

@@ -33,6 +33,7 @@ fn snapshots_roundtrip_only_occupied_cells_and_reject_bad_geometry() {
             heights: [0, 4, 8, 4],
             diagonal: false,
             shape: None,
+            face_materials: None,
         }),
     );
     world.set([1, 2, 3], Some(Cell::solid(5)));
@@ -42,8 +43,9 @@ fn snapshots_roundtrip_only_occupied_cells_and_reject_bad_geometry() {
     assert_eq!(restored.cells(), world.cells());
     let malformed = r#"[{"pos":[0,0,0],"cell":{"material":0,"heights":[9,8,8,8]}}]"#;
     assert!(serde_json::from_str::<World>(malformed).is_err());
-    assert!(!World::is_valid_pos([0, -1, 0]));
-    assert!(!World::is_valid_pos([64, 0, 0]));
+    assert!(!world.contains_pos([0, -1, 0]));
+    assert!(!world.contains_pos([64, 0, 0]));
+    assert!(!World::is_valid_pos([8192, 0, 0]));
 }
 
 #[test]
@@ -81,6 +83,7 @@ fn invalid_set_does_not_erase_existing_cell() {
             heights: [0; 4],
             diagonal: false,
             shape: None,
+            face_materials: None,
         }),
     );
     world.set(
@@ -114,6 +117,7 @@ fn rays_mesh_and_collision_share_the_deformed_top() {
         heights: [0, 8, 8, 0],
         diagonal: false,
         shape: None,
+        face_materials: None,
     };
     world.set([0, 0, 0], Some(cell));
     for x in [0.125, 0.375, 0.625, 0.875] {
@@ -144,6 +148,7 @@ fn warped_top_keeps_the_fixed_diagonal_instead_of_bilinear_height() {
         heights: [8, 0, 8, 0],
         diagonal: false,
         shape: None,
+        face_materials: None,
     };
     world.set([0, 0, 0], Some(cell));
     close(cell.height_at(0.5, 0.5), 1.0);
@@ -164,6 +169,7 @@ fn alternate_diagonal_matches_height_rays_and_collision() {
         heights: [0, 8, 0, 8],
         diagonal: true,
         shape: None,
+        face_materials: None,
         ..Cell::solid(0)
     };
     let mut world = World::empty();
@@ -193,6 +199,7 @@ fn touching_opposite_diagonals_hide_only_the_occupied_half() {
             heights: [8, 0, 0, 0],
             diagonal: true,
             shape: None,
+            face_materials: None,
             ..Cell::solid(0)
         }),
     );
@@ -214,6 +221,7 @@ fn diagonal_serialization_is_backward_compatible() {
     let changed = Cell {
         diagonal: true,
         shape: None,
+        face_materials: None,
         ..old
     };
     let restored: Cell = serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
@@ -230,6 +238,7 @@ fn collapsed_half_of_a_cell_has_no_phantom_top_or_bottom() {
             heights: [0, 8, 0, 0],
             diagonal: false,
             shape: None,
+            face_materials: None,
         }),
     );
     assert!(world
@@ -280,6 +289,7 @@ fn partial_neighbors_expose_only_the_step_between_them() {
             heights: [4; 4],
             diagonal: false,
             shape: None,
+            face_materials: None,
         }),
     );
     world.set([1, 0, 0], Some(Cell::solid(2)));

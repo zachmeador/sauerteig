@@ -1,4 +1,4 @@
-use crate::{spawn_point, CellEdit, RootEdit, Vec3, EYE_HEIGHT};
+use crate::{spawn_point, CellEdit, CellFragment, RootEdit, Vec3, WorldBounds, EYE_HEIGHT};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -67,12 +67,28 @@ pub enum ObjectKind {
     Rock,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorldObject {
     pub id: u32,
     pub position: Vec3,
     pub kind: ObjectKind,
     pub rotation: f32,
+}
+
+/// Object data without a server-owned identifier. Copies receive fresh IDs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObjectPlacement {
+    pub kind: ObjectKind,
+    pub position: Vec3,
+    pub rotation: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ObjectEdit {
+    Create { object: ObjectPlacement },
+    Update { id: u32, object: ObjectPlacement },
+    Delete { id: u32 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +131,13 @@ pub enum ClientMessage {
         base_revision: u64,
         roots: Vec<RootEdit>,
     },
+    /// Geometry and objects are validated, applied, and undone as one action.
+    EditTransaction {
+        request: u64,
+        base_revision: u64,
+        roots: Vec<RootEdit>,
+        objects: Vec<ObjectEdit>,
+    },
     PlaceObject {
         kind: ObjectKind,
         position: Vec3,
@@ -125,12 +148,19 @@ pub enum ClientMessage {
     },
     Undo,
     Redo,
+    /// Acknowledge all earlier messages on this connection before leaving.
+    Sync {
+        request: u64,
+    },
     Save,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    Synced {
+        request: u64,
+    },
     ModeChanged {
         request: u32,
         editing: bool,
@@ -138,6 +168,12 @@ pub enum ServerMessage {
     Welcome {
         id: u64,
         revision: u64,
+        #[serde(default = "legacy_format_version")]
+        format_version: u32,
+        #[serde(default)]
+        bounds: WorldBounds,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regions: Vec<CellFragment>,
         cells: Vec<CellEdit>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         roots: Vec<RootEdit>,
@@ -159,6 +195,11 @@ pub enum ServerMessage {
         revision: u64,
         roots: Vec<RootEdit>,
     },
+    TransactionPatch {
+        revision: u64,
+        roots: Vec<RootEdit>,
+        objects: Vec<WorldObject>,
+    },
     EditResult {
         request: u64,
         error: Option<String>,
@@ -176,4 +217,8 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+}
+
+fn legacy_format_version() -> u32 {
+    1
 }

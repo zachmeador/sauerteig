@@ -1,8 +1,12 @@
+pub(crate) mod culling;
 mod props;
 
-use self::props::{instance_layout, PropRenderer};
+use self::{
+    culling::{Bounds, Frustum},
+    props::{instance_layout, PropRenderer},
+};
 use crate::lighting::{
-    chunk_in_light, closest_lights, sun_shadow_matrix, LIGHT_RANGE, LOCAL_LIGHTS, LOCAL_SHADOW_SIZE,
+    closest_lights, sun_shadow_matrix, LIGHT_RANGE, LOCAL_LIGHTS, LOCAL_SHADOW_SIZE,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -52,6 +56,7 @@ pub struct GpuMesh {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
     count: u32,
+    bounds: Bounds,
 }
 impl GpuMesh {
     fn new(device: &wgpu::Device, vertices: &[GpuVertex], indices: &[u32]) -> Option<Self> {
@@ -70,6 +75,7 @@ impl GpuMesh {
                 usage: wgpu::BufferUsages::INDEX,
             }),
             count: indices.len() as u32,
+            bounds: Bounds::from_positions(vertices.iter().map(|v| Vec3::from_array(v.position))),
         })
     }
     fn dynamic(device: &wgpu::Device) -> Self {
@@ -85,6 +91,10 @@ impl GpuMesh {
             vertex: buffer("dynamic vertices", wgpu::BufferUsages::VERTEX),
             index: buffer("dynamic indices", wgpu::BufferUsages::INDEX),
             count: 0,
+            bounds: Bounds {
+                min: Vec3::ZERO,
+                max: Vec3::ZERO,
+            },
         }
     }
     fn update(
@@ -164,6 +174,7 @@ pub struct Renderer {
     dynamic: GpuMesh,
     pub egui: egui_wgpu::Renderer,
     pub triangles: usize,
+    visible_world_triangles: usize,
     pub adapter_name: String,
 }
 impl Renderer {
@@ -503,11 +514,12 @@ impl Renderer {
             dynamic,
             egui,
             triangles: 0,
+            visible_world_triangles: 0,
             adapter_name,
         })
     }
     pub fn visible_triangles(&self) -> usize {
-        self.triangles + self.props.visible_triangles()
+        self.visible_world_triangles + self.props.visible_triangles()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -570,15 +582,19 @@ impl Renderer {
             0.06,
             180.0,
         );
+        let view_projection = proj * view;
+        let camera_frustum = Frustum::new(view_projection);
         let sun = Vec3::new(-0.44, 0.76, 0.34).normalize();
+        let sun_projection = sun_shadow_matrix(sun, eye);
+        let sun_frustum = Frustum::new(sun_projection);
         let encode_srgb = if self.config.format.is_srgb() {
             0.0
         } else {
             1.0
         };
         let mut uniform = CameraUniform {
-            view_proj: (proj * view).to_cols_array_2d(),
-            light_view_proj: sun_shadow_matrix(sun).to_cols_array_2d(),
+            view_proj: view_projection.to_cols_array_2d(),
+            light_view_proj: sun_projection.to_cols_array_2d(),
             eye_time: [eye.x, eye.y, eye.z, time],
             sun: [sun.x, sun.y, sun.z, encode_srgb],
             fog: [0.105, 0.125, 0.135, 0.00005],
@@ -586,6 +602,12 @@ impl Renderer {
             point_colors: [[0.0; 4]; 8],
             local_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); LOCAL_LIGHTS],
         };
+        self.visible_world_triangles = self
+            .chunks
+            .values()
+            .filter(|mesh| camera_frustum.intersects(mesh.bounds))
+            .map(|mesh| mesh.count as usize / 3)
+            .sum();
         let nearby = closest_lights(objects, eye);
         self.props.prepare(&self.queue, objects, eye, &nearby);
         for (i, light) in nearby.iter().enumerate() {
@@ -647,7 +669,9 @@ impl Renderer {
             pass.set_bind_group(0, &self.camera_group, &[]);
             pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             for mesh in self.chunks.values() {
-                mesh.draw(&mut pass);
+                if sun_frustum.intersects(mesh.bounds) {
+                    mesh.draw(&mut pass);
+                }
             }
             if let Some(mesh) = &self.objects {
                 mesh.draw(&mut pass);
@@ -679,8 +703,11 @@ impl Renderer {
             pass.set_pipeline(&self.local_shadow_pipeline);
             pass.set_bind_group(0, &shadow.group, &[]);
             pass.set_vertex_buffer(1, self.identity_instance.slice(..));
-            for (key, mesh) in &self.chunks {
-                if chunk_in_light(*key, light) {
+            let light_frustum = Frustum::new(light.view_proj);
+            for mesh in self.chunks.values() {
+                if mesh.bounds.within_radius(light.position, LIGHT_RANGE)
+                    && light_frustum.intersects(mesh.bounds)
+                {
                     mesh.draw(&mut pass);
                 }
             }
@@ -726,7 +753,9 @@ impl Renderer {
             pass.set_bind_group(2, &self.materials.group, &[]);
             pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             for mesh in self.chunks.values() {
-                mesh.draw(&mut pass);
+                if camera_frustum.intersects(mesh.bounds) {
+                    mesh.draw(&mut pass);
+                }
             }
             if let Some(mesh) = &self.objects {
                 mesh.draw(&mut pass);

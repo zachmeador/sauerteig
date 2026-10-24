@@ -10,8 +10,9 @@ use persistence::SavedWorld;
 use sauerteig_core::{
     forward, player_intersects_fragment, ray_player, simulate_player, spawn_point,
     validate_root_edits, Cell, CellEdit, CellFragment, CellPos, ClientMessage, FineBox, InputFrame,
-    ObjectKind, Player, Projectile, RootEdit, ServerMessage, ShotEffect, Vec3, World, WorldObject,
-    FIXED_DT, PLAYER_HEIGHT, PLAYER_RADIUS, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
+    ObjectEdit, ObjectKind, ObjectPlacement, Player, Projectile, RootEdit, ServerMessage,
+    ShotEffect, Vec3, World, WorldObject, FIXED_DT, PLAYER_HEIGHT, PLAYER_RADIUS,
+    WORLD_FORMAT_VERSION,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -26,11 +27,17 @@ const MAX_EDIT_FRAGMENTS: usize = 65_536;
 const MAX_HISTORY_COMPLEXITY: usize = 262_144;
 // A full legacy world still fits. Fine detail spends this same occupied-geometry
 // budget; it cannot expand all unit roots into hundreds of millions of leaves.
-const MAX_WORLD_FRAGMENTS: usize =
-    ((WORLD_MAX - WORLD_MIN) * (WORLD_MAX - WORLD_MIN) * WORLD_HEIGHT) as usize;
+const MAX_WORLD_FRAGMENTS: usize = 786_432;
 const EDIT_BURST: f64 = 131_072.0;
 const EDIT_RATE: f64 = 65_536.0;
 const MAX_OBJECTS: usize = 1024;
+// Native ewebsock uses tungstenite's 64 MiB message limit. Geometry uses a
+// conservative wire-size budget; reserve room for objects, players and metadata.
+const MAX_WORLD_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_ENVELOPE_BYTES: usize = 1024 * 1024;
+const MAX_GEOMETRY_BYTES: usize = MAX_WORLD_SNAPSHOT_BYTES - SNAPSHOT_ENVELOPE_BYTES;
+const SNAPSHOT_LIMIT_ERROR: &str =
+    "This world exceeds the 64 MiB snapshot limit. Reduce geometry detail or import a smaller map.";
 const MAX_PROJECTILES: usize = 64;
 const MAX_INPUT_BACKLOG: usize = 64;
 const SAVE_DELAY: Duration = Duration::from_millis(750);
@@ -53,12 +60,22 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone)]
+struct ObjectState {
+    id: u32,
+    value: Option<WorldObject>,
+}
+
 struct UndoEntry {
     revision: u64,
     before: Vec<RootEdit>,
     after: Vec<RootEdit>,
     previous_revisions: Vec<Option<u64>>,
     root_patch: bool,
+    transaction_patch: bool,
+    objects_before: Vec<ObjectState>,
+    objects_after: Vec<ObjectState>,
+    previous_object_revisions: Vec<Option<u64>>,
     complexity: usize,
 }
 
@@ -85,6 +102,23 @@ struct FlyingRocket {
     ticks_left: u16,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RootCost {
+    fragments: usize,
+    bytes: usize,
+}
+impl RootCost {
+    fn new(root: &RootEdit, keep_empty: bool) -> Self {
+        if root.fragments.is_empty() && !keep_empty {
+            return Self::default();
+        }
+        Self {
+            fragments: root.fragments.len().max(1),
+            bytes: json_bytes(root) + 1,
+        }
+    }
+}
+
 struct Session {
     world: World,
     objects: Vec<WorldObject>,
@@ -93,7 +127,11 @@ struct Session {
     // Unlike undo ownership, this clock never rewinds. A stale root replacement
     // must also be rejected after another builder edited and then cleared it.
     root_changed_at: HashMap<CellPos, u64>,
+    object_revisions: HashMap<u32, u64>,
+    object_changed_at: HashMap<u32, u64>,
     geometry_fragments: usize,
+    geometry_root_costs: HashMap<CellPos, RootCost>,
+    geometry_bytes: usize,
     peers: HashMap<u64, Peer>,
     rockets: Vec<FlyingRocket>,
     tick: u64,
@@ -113,27 +151,63 @@ impl Session {
             .map(|e| (e.pos, saved.revision))
             .chain(saved.roots.iter().map(|e| (e.pos, saved.revision)))
             .collect();
-        let world = World::from_parts(&saved.cells, &saved.roots).expect("validated saved world");
-        let geometry_fragments = world.cells().len()
-            + world
-                .detailed_roots()
-                .iter()
-                .map(|root| root.fragments.len())
+        let world =
+            World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)
+                .expect("validated saved world");
+        let geometry_root_costs: HashMap<_, _> = world
+            .cells()
+            .iter()
+            .map(|cell| {
+                (
+                    cell.pos,
+                    RootCost::new(&legacy_root(cell.clone()), world.has_regions()),
+                )
+            })
+            .chain(
+                world
+                    .root_overrides()
+                    .iter()
+                    .map(|root| (root.pos, RootCost::new(root, world.has_regions()))),
+            )
+            .collect();
+        let geometry_fragments = world.region_count()
+            + geometry_root_costs
+                .values()
+                .map(|cost| cost.fragments)
                 .sum::<usize>();
+        let geometry_bytes = world
+            .regions()
+            .iter()
+            .map(|fragment| json_bytes(fragment) + 1)
+            .sum::<usize>()
+            + geometry_root_costs
+                .values()
+                .map(|cost| cost.bytes)
+                .sum::<usize>();
+        let object_revisions: HashMap<_, _> = saved
+            .objects
+            .iter()
+            .map(|o| (o.id, saved.revision))
+            .collect();
         let next_object = saved
             .objects
             .iter()
             .map(|o| o.id)
             .max()
             .unwrap_or(0)
-            .saturating_add(1);
+            .saturating_add(1)
+            .max(saved.next_object);
         Self {
             world,
             objects: saved.objects,
             revision: saved.revision,
             root_changed_at: cell_revisions.clone(),
             cell_revisions,
+            object_changed_at: object_revisions.clone(),
+            object_revisions,
             geometry_fragments,
+            geometry_root_costs,
+            geometry_bytes,
             peers: HashMap::new(),
             rockets: Vec::new(),
             tick: 0,
@@ -149,9 +223,13 @@ impl Session {
     fn saved(&self) -> SavedWorld {
         SavedWorld {
             revision: self.revision,
+            format_version: WORLD_FORMAT_VERSION,
+            bounds: self.world.bounds(),
+            regions: self.world.regions(),
             cells: self.world.cells(),
-            roots: self.world.detailed_roots(),
+            roots: self.world.root_overrides(),
             objects: self.objects.clone(),
+            next_object: self.next_object,
         }
     }
 
@@ -203,8 +281,11 @@ impl Session {
             ServerMessage::Welcome {
                 id,
                 revision: self.revision,
+                format_version: WORLD_FORMAT_VERSION,
+                bounds: self.world.bounds(),
+                regions: self.world.regions(),
                 cells: self.world.cells(),
-                roots: self.world.detailed_roots(),
+                roots: self.world.root_overrides(),
                 objects: self.objects.clone(),
                 players: self.players(),
                 editing_allowed: self.editing_allowed,
@@ -342,47 +423,45 @@ impl Session {
             } => {
                 self.edit_roots(id, base_revision, roots)?;
             }
+            ClientMessage::EditTransaction {
+                base_revision,
+                roots,
+                objects,
+                ..
+            } => {
+                self.commit_transaction(id, roots, objects, Some(base_revision), true, true)?;
+            }
             ClientMessage::PlaceObject {
                 kind,
                 position,
                 rotation,
             } => {
-                self.require_editor(id)?;
-                validate_object_position(position, rotation)?;
-                if self.objects.len() >= MAX_OBJECTS {
-                    return Err("The room has reached its object limit.".into());
-                }
-                if self.next_object == u32::MAX {
-                    return Err("No object IDs remain.".into());
-                }
-                self.charge_edit(id, 1)?;
-                self.objects.push(WorldObject {
-                    id: self.next_object,
-                    kind,
-                    position,
-                    rotation,
-                });
-                self.next_object += 1;
-                self.changed();
-                self.broadcast(ServerMessage::Objects {
-                    revision: self.revision,
-                    objects: self.objects.clone(),
-                });
+                self.commit_transaction(
+                    id,
+                    vec![],
+                    vec![ObjectEdit::Create {
+                        object: ObjectPlacement {
+                            kind,
+                            position,
+                            rotation,
+                        },
+                    }],
+                    None,
+                    false,
+                    false,
+                )?;
             }
             ClientMessage::RemoveObject { id: object_id } => {
-                self.require_editor(id)?;
-                self.charge_edit(id, 1)?;
-                let old_len = self.objects.len();
-                self.objects.retain(|o| o.id != object_id);
-                if old_len == self.objects.len() {
-                    return Err("That object no longer exists.".into());
-                }
-                self.changed();
-                self.broadcast(ServerMessage::Objects {
-                    revision: self.revision,
-                    objects: self.objects.clone(),
-                });
+                self.commit_transaction(
+                    id,
+                    vec![],
+                    vec![ObjectEdit::Delete { id: object_id }],
+                    None,
+                    false,
+                    false,
+                )?;
             }
+            ClientMessage::Sync { request } => self.send(id, ServerMessage::Synced { request }),
             ClientMessage::Undo => self.undo(id)?,
             ClientMessage::Redo => self.redo(id)?,
             ClientMessage::Save => {
@@ -401,6 +480,9 @@ impl Session {
     }
 
     fn require_editor(&self, id: u64) -> Result<(), String> {
+        if self.revision == u64::MAX {
+            return Err("The room has exhausted its edit revisions.".into());
+        }
         if !self.editing_allowed || !self.peers[&id].player.editing {
             return Err("Enter edit mode before changing the world.".into());
         }
@@ -447,8 +529,32 @@ impl Session {
         base_revision: Option<u64>,
         root_patch: bool,
     ) -> Result<(), String> {
-        self.require_editor(id)?;
         validate_root_request(&roots)?;
+        self.commit_transaction(id, roots, vec![], base_revision, root_patch, false)
+    }
+
+    fn commit_transaction(
+        &mut self,
+        id: u64,
+        roots: Vec<RootEdit>,
+        objects: Vec<ObjectEdit>,
+        base_revision: Option<u64>,
+        root_patch: bool,
+        transaction_patch: bool,
+    ) -> Result<(), String> {
+        self.require_editor(id)?;
+        if roots.is_empty() && objects.is_empty() {
+            return Err("An edit must change geometry or objects.".into());
+        }
+        if !roots.is_empty() {
+            validate_root_request(&roots)?;
+        }
+        if roots.iter().any(|root| !self.world.contains_pos(root.pos)) {
+            return Err("These cells are outside the world bounds.".into());
+        }
+        if objects.len() > MAX_OBJECTS * 2 {
+            return Err("An edit may contain at most 2,048 object changes.".into());
+        }
         if let Some(base_revision) = base_revision {
             if base_revision > self.revision {
                 return Err("Edit revision is ahead of the server.".into());
@@ -461,58 +567,147 @@ impl Session {
                 return Err("These cells changed after the edit began; try again.".into());
             }
         }
-        self.charge_edit(id, roots_complexity(&roots))?;
-        self.validate_fighter_overlap(&roots)?;
+        // Resolve every object before mutating either part of the world. IDs
+        // are reserved locally and become consumed only on a successful commit.
+        let mut next_object = self.next_object;
+        let mut seen = HashSet::new();
+        let mut objects_before = Vec::new();
+        let mut objects_after = Vec::new();
+        for edit in objects {
+            let (object_id, placement) = match edit {
+                ObjectEdit::Create { object } => {
+                    if next_object == u32::MAX {
+                        return Err("No object IDs remain.".into());
+                    }
+                    let object_id = next_object;
+                    next_object += 1;
+                    (object_id, Some(object))
+                }
+                ObjectEdit::Update { id, object } => {
+                    if !self.objects.iter().any(|o| o.id == id) {
+                        return Err("That object no longer exists.".into());
+                    }
+                    (id, Some(object))
+                }
+                ObjectEdit::Delete { id } => {
+                    if !self.objects.iter().any(|o| o.id == id) {
+                        return Err("That object no longer exists.".into());
+                    }
+                    (id, None)
+                }
+            };
+            if !seen.insert(object_id) {
+                return Err("An object may be changed only once per edit.".into());
+            }
+            if base_revision.is_some_and(|base| {
+                self.object_changed_at
+                    .get(&object_id)
+                    .is_some_and(|&r| r > base)
+            }) {
+                return Err("This object changed after the edit began; try again.".into());
+            }
+            let value = if let Some(object) = placement {
+                validate_object_position(object.position, object.rotation)?;
+                if !self
+                    .world
+                    .contains_pos(object.position.floor().as_ivec3().to_array())
+                {
+                    return Err("Object must be inside the world bounds.".into());
+                }
+                Some(WorldObject {
+                    id: object_id,
+                    kind: object.kind,
+                    position: object.position,
+                    rotation: object.rotation,
+                })
+            } else {
+                None
+            };
+            let before = self.objects.iter().find(|o| o.id == object_id).cloned();
+            if before != value {
+                objects_before.push(ObjectState {
+                    id: object_id,
+                    value: before,
+                });
+                objects_after.push(ObjectState {
+                    id: object_id,
+                    value,
+                });
+            }
+        }
+        self.validate_object_count(&objects_after)?;
         let roots: Vec<_> = roots
             .into_iter()
+            .map(|root| RootEdit {
+                pos: root.pos,
+                fragments: sauerteig_core::canonical_root_fragments(root.pos, &root.fragments),
+            })
             .filter(|root| self.world.root_fragments(root.pos) != root.fragments)
             .collect();
-        if roots.is_empty() {
+        if roots.is_empty() && objects_after.is_empty() {
             return Ok(());
         }
-        let mut before = Vec::with_capacity(roots.len());
-        let mut before_complexity = 0;
-        for root in &roots {
-            let fragments = self.world.root_fragments(root.pos);
-            before_complexity += fragments.len().max(1);
-            if before_complexity > MAX_EDIT_FRAGMENTS {
-                return Err("This edit replaces too much detailed geometry at once; use a smaller selection.".into());
-            }
-            before.push(RootEdit {
+        self.validate_fighter_overlap(&roots)?;
+        let before: Vec<_> = roots
+            .iter()
+            .map(|root| RootEdit {
                 pos: root.pos,
-                fragments,
-            });
+                fragments: self.world.root_fragments(root.pos),
+            })
+            .collect();
+        if roots_complexity(&before) > MAX_EDIT_FRAGMENTS {
+            return Err(
+                "This edit replaces too much detailed geometry at once; use a smaller selection."
+                    .into(),
+            );
         }
         let previous_revisions: Vec<_> = roots
             .iter()
             .map(|e| self.cell_revisions.get(&e.pos).copied())
             .collect();
-        if !self.apply_roots(&roots)? {
+        let previous_object_revisions = objects_before
+            .iter()
+            .map(|o| self.object_revisions.get(&o.id).copied())
+            .collect();
+        self.charge_edit(id, roots_complexity(&roots) + objects_after.len())?;
+        let geometry_changed = self.apply_roots(&roots)?;
+        if !geometry_changed && objects_after.is_empty() {
             return Ok(());
         }
-        let after: Vec<_> = roots
-            .iter()
-            .map(|e| RootEdit {
-                pos: e.pos,
-                fragments: self.world.root_fragments(e.pos),
-            })
-            .collect();
-        // Exact clipping can discard a fragment that contains no solid
-        // geometry. Such a root must not acquire ownership or an undo entry.
+        if !geometry_changed {
+            self.changed();
+        }
         let mut changed_before = Vec::new();
         let mut changed_after = Vec::new();
         let mut changed_previous = Vec::new();
-        for ((before, after), previous) in before.into_iter().zip(after).zip(previous_revisions) {
+        for (before, previous) in before.into_iter().zip(previous_revisions) {
+            let after = RootEdit {
+                pos: before.pos,
+                fragments: self.world.root_fragments(before.pos),
+            };
             if before != after {
                 changed_before.push(before);
                 changed_after.push(after);
                 changed_previous.push(previous);
             }
         }
-        let before = changed_before;
-        let after = changed_after;
-        let previous_revisions = changed_previous;
-        let complexity = roots_complexity(&before) + roots_complexity(&after);
+        let (before, roots, previous_revisions) = (changed_before, changed_after, changed_previous);
+        self.apply_object_states(&objects_after);
+        self.next_object = next_object;
+        let complexity =
+            roots_complexity(&before) + roots_complexity(&roots) + objects_before.len() * 2;
+        let entry = UndoEntry {
+            revision: self.revision,
+            before,
+            after: roots.clone(),
+            previous_revisions,
+            root_patch,
+            transaction_patch,
+            objects_before,
+            objects_after,
+            previous_object_revisions,
+            complexity,
+        };
         let peer = self.peers.get_mut(&id).unwrap();
         peer.redo.clear();
         let undo = &mut peer.undo;
@@ -523,16 +718,40 @@ impl Session {
             };
             history_complexity -= discarded.complexity;
         }
-        undo.push_back(UndoEntry {
-            revision: self.revision,
-            before,
-            after: after.clone(),
-            previous_revisions,
-            root_patch,
-            complexity,
-        });
-        self.broadcast_roots(after, root_patch);
+        let object_patch = !entry.objects_after.is_empty();
+        undo.push_back(entry);
+        self.broadcast_change(roots, root_patch, transaction_patch, object_patch);
         Ok(())
+    }
+
+    fn validate_object_count(&self, states: &[ObjectState]) -> Result<(), String> {
+        let removed = states
+            .iter()
+            .filter(|s| self.objects.iter().any(|o| o.id == s.id))
+            .count();
+        let added = states.iter().filter(|s| s.value.is_some()).count();
+        if self.objects.len() - removed + added > MAX_OBJECTS {
+            return Err("The room has reached its object limit.".into());
+        }
+        Ok(())
+    }
+
+    fn apply_object_states(&mut self, states: &[ObjectState]) {
+        for state in states {
+            if let Some(index) = self.objects.iter().position(|o| o.id == state.id) {
+                if let Some(object) = &state.value {
+                    self.objects[index] = object.clone();
+                } else {
+                    self.objects.remove(index);
+                }
+            } else if let Some(object) = &state.value {
+                self.objects.push(object.clone());
+            }
+            // Deleted IDs keep their ownership token and monotonic clock.
+            self.object_revisions.insert(state.id, self.revision);
+            self.object_changed_at.insert(state.id, self.revision);
+        }
+        self.objects.sort_by_key(|o| o.id);
     }
 
     fn undo(&mut self, id: u64) -> Result<(), String> {
@@ -547,14 +766,24 @@ impl Session {
         {
             return Err("Cannot undo: a later edit changed these cells.".into());
         }
+        if entry
+            .objects_before
+            .iter()
+            .any(|o| self.object_revisions.get(&o.id) != Some(&entry.revision))
+        {
+            return Err("Cannot undo: a later edit changed these objects.".into());
+        }
         self.validate_fighter_overlap(&entry.before)?;
+        self.validate_object_count(&entry.objects_before)?;
         let edits = entry.before.clone();
-        self.charge_edit(id, roots_complexity(&edits))?;
-        self.apply_roots(&edits)?;
+        let objects = entry.objects_before.clone();
+        self.charge_edit(id, roots_complexity(&edits) + objects.len())?;
+        if !self.apply_roots(&edits)? {
+            self.changed();
+        }
+        self.apply_object_states(&objects);
         let entry = self.peers.get_mut(&id).unwrap().undo.pop_back().unwrap();
-        // Restore the exact ownership lineage as well as the value. Blindly
-        // assigning an older personal revision would erase intervening edits
-        // made by another builder when the user undoes a second time.
+        // Restore ownership lineage; monotonic stale-snapshot clocks never rewind.
         for (e, previous) in edits.iter().zip(&entry.previous_revisions) {
             if let Some(revision) = previous {
                 self.cell_revisions.insert(e.pos, *revision);
@@ -562,9 +791,16 @@ impl Session {
                 self.cell_revisions.remove(&e.pos);
             }
         }
-        let root_patch = entry.root_patch;
+        for (object, previous) in objects.iter().zip(&entry.previous_object_revisions) {
+            if let Some(revision) = previous {
+                self.object_revisions.insert(object.id, *revision);
+            } else {
+                self.object_revisions.remove(&object.id);
+            }
+        }
+        let (root_patch, transaction_patch) = (entry.root_patch, entry.transaction_patch);
         self.peers.get_mut(&id).unwrap().redo.push(entry);
-        self.broadcast_roots(edits, root_patch);
+        self.broadcast_change(edits, root_patch, transaction_patch, !objects.is_empty());
         Ok(())
     }
 
@@ -581,21 +817,57 @@ impl Session {
         {
             return Err("Cannot redo: a later edit changed these cells.".into());
         }
+        if entry
+            .objects_before
+            .iter()
+            .zip(&entry.previous_object_revisions)
+            .any(|(o, previous)| self.object_revisions.get(&o.id).copied() != *previous)
+        {
+            return Err("Cannot redo: a later edit changed these objects.".into());
+        }
         self.validate_fighter_overlap(&entry.after)?;
+        self.validate_object_count(&entry.objects_after)?;
         let edits = entry.after.clone();
-        self.charge_edit(id, roots_complexity(&edits))?;
-        self.apply_roots(&edits)?;
+        let objects = entry.objects_after.clone();
+        self.charge_edit(id, roots_complexity(&edits) + objects.len())?;
+        if !self.apply_roots(&edits)? {
+            self.changed();
+        }
+        self.apply_object_states(&objects);
         let entry = self.peers.get_mut(&id).unwrap().redo.pop().unwrap();
-        // World revisions still increase. Cell ownership restores the original
-        // operation token, so a chain of overlapping undos can be replayed while
-        // retaining the same protection against another builder's edits.
         for edit in &edits {
             self.cell_revisions.insert(edit.pos, entry.revision);
         }
-        let root_patch = entry.root_patch;
+        for object in &objects {
+            self.object_revisions.insert(object.id, entry.revision);
+        }
+        let (root_patch, transaction_patch) = (entry.root_patch, entry.transaction_patch);
         self.peers.get_mut(&id).unwrap().undo.push_back(entry);
-        self.broadcast_roots(edits, root_patch);
+        self.broadcast_change(edits, root_patch, transaction_patch, !objects.is_empty());
         Ok(())
+    }
+
+    fn broadcast_change(
+        &mut self,
+        roots: Vec<RootEdit>,
+        root_patch: bool,
+        transaction_patch: bool,
+        object_patch: bool,
+    ) {
+        if transaction_patch {
+            self.broadcast(ServerMessage::TransactionPatch {
+                revision: self.revision,
+                roots,
+                objects: self.objects.clone(),
+            });
+        } else if object_patch {
+            self.broadcast(ServerMessage::Objects {
+                revision: self.revision,
+                objects: self.objects.clone(),
+            });
+        } else {
+            self.broadcast_roots(roots, root_patch);
+        }
     }
 
     fn validate_fighter_overlap(&self, roots: &[RootEdit]) -> Result<(), String> {
@@ -637,21 +909,63 @@ impl Session {
             .iter()
             .map(|r| self.world.root_fragments(r.pos))
             .collect();
-        let removed = previous.iter().map(Vec::len).sum::<usize>();
-        let added = roots.iter().map(|r| r.fragments.len()).sum::<usize>();
-        if self.geometry_fragments - removed + added > MAX_WORLD_FRAGMENTS {
+        let removed: Vec<_> = roots
+            .iter()
+            .map(|root| {
+                self.geometry_root_costs
+                    .get(&root.pos)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let added: Vec<_> = roots
+            .iter()
+            .map(|root| RootCost::new(root, self.world.has_regions()))
+            .collect();
+        if self.geometry_fragments - removed.iter().map(|cost| cost.fragments).sum::<usize>()
+            + added.iter().map(|cost| cost.fragments).sum::<usize>()
+            > MAX_WORLD_FRAGMENTS
+        {
             return Err("The room has reached its detailed geometry limit.".into());
         }
-        let changed_chunks = self.world.apply_root_edits(&roots)?;
-        if changed_chunks.is_empty() {
-            return Ok(false);
+        if self.geometry_bytes - removed.iter().map(|cost| cost.bytes).sum::<usize>()
+            + added.iter().map(|cost| cost.bytes).sum::<usize>()
+            > MAX_GEOMETRY_BYTES
+        {
+            return Err(SNAPSHOT_LIMIT_ERROR.into());
         }
+        self.world.apply_root_edits(&roots)?;
         let after: Vec<_> = roots
             .iter()
             .map(|r| self.world.root_fragments(r.pos))
             .collect();
-        let actual = after.iter().map(Vec::len).sum::<usize>();
-        self.geometry_fragments = self.geometry_fragments - removed + actual;
+        let mut changed = false;
+        for ((root, before), after) in roots.iter().zip(&previous).zip(&after) {
+            if before != after {
+                changed = true;
+                let cost = RootCost::new(
+                    &RootEdit {
+                        pos: root.pos,
+                        fragments: after.clone(),
+                    },
+                    self.world.has_regions(),
+                );
+                let old = if cost.fragments == 0 {
+                    self.geometry_root_costs
+                        .remove(&root.pos)
+                        .unwrap_or_default()
+                } else {
+                    self.geometry_root_costs
+                        .insert(root.pos, cost)
+                        .unwrap_or_default()
+                };
+                self.geometry_fragments = self.geometry_fragments - old.fragments + cost.fragments;
+                self.geometry_bytes = self.geometry_bytes - old.bytes + cost.bytes;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
         self.changed();
         for ((root, before), after) in roots.iter().zip(previous).zip(after) {
             if before != after {
@@ -680,11 +994,12 @@ impl Session {
 
     fn blocked(&self, player: &Player) -> bool {
         let p = player.position;
+        let body_min = p - Vec3::new(PLAYER_RADIUS, 0.0, PLAYER_RADIUS);
+        let body_max = p + Vec3::new(PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_RADIUS);
+        let bounds = self.world.bounds();
         if !p.is_finite()
-            || p.y < 0.0
-            || p.y + PLAYER_HEIGHT >= sauerteig_core::WORLD_HEIGHT as f32
-            || p.x.abs() + PLAYER_RADIUS >= sauerteig_core::WORLD_MAX as f32
-            || p.z.abs() + PLAYER_RADIUS >= sauerteig_core::WORLD_MAX as f32
+            || body_min.cmplt(bounds.world_min()).any()
+            || body_max.cmpge(bounds.world_max()).any()
         {
             return true;
         }
@@ -718,7 +1033,12 @@ impl Session {
             }
         }
         // Last resort for a map whose authored spawn areas were all filled in.
-        Vec3::new(0.5, sauerteig_core::WORLD_HEIGHT as f32 - 3.0, 0.5)
+        let bounds = self.world.bounds();
+        Vec3::new(
+            (bounds.min[0] + bounds.max[0]) as f32 * 0.5,
+            bounds.max[1] as f32 - 3.0,
+            (bounds.min[2] + bounds.max[2]) as f32 * 0.5,
+        )
     }
 
     fn step(&mut self) {
@@ -740,10 +1060,11 @@ impl Session {
             };
             simulate_player(&self.world, &mut peer.player, &input, FIXED_DT);
         }
+        let fall_limit = self.world.bounds().min[1] as f32 - 8.0;
         let fallen: Vec<_> = self
             .peers
             .iter()
-            .filter(|(_, p)| !p.player.editing && p.player.position.y < -8.0)
+            .filter(|(_, p)| !p.player.editing && p.player.position.y < fall_limit)
             .map(|(&id, _)| id)
             .collect();
         for id in fallen {
@@ -1032,3 +1353,58 @@ fn validate_object_position(position: Vec3, rotation: f32) -> Result<(), String>
 
 #[cfg(test)]
 mod tests;
+
+/// Count JSON without allocating a complete copy of a large map or root.
+fn json_bytes(value: &impl serde::Serialize) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).expect("valid world JSON");
+    counter.0
+}
+
+fn snapshot_geometry_bytes(
+    regions: &[CellFragment],
+    cells: &[CellEdit],
+    roots: &[RootEdit],
+) -> usize {
+    // RootEdit is more verbose than a legacy coarse cell, so this bounds both
+    // snapshot encodings and remains valid when a cell becomes a detailed root.
+    regions
+        .iter()
+        .map(|fragment| json_bytes(fragment) + 1)
+        .sum::<usize>()
+        + cells
+            .iter()
+            .map(|cell| json_bytes(&legacy_root(cell.clone())) + 1)
+            .sum::<usize>()
+        + roots
+            .iter()
+            .map(|root| {
+                let normalized = RootEdit {
+                    pos: root.pos,
+                    fragments: sauerteig_core::canonical_root_fragments(root.pos, &root.fragments),
+                };
+                json_bytes(&normalized) + 1
+            })
+            .sum::<usize>()
+}
+
+fn validate_snapshot_geometry(
+    regions: &[CellFragment],
+    cells: &[CellEdit],
+    roots: &[RootEdit],
+) -> Result<(), String> {
+    if snapshot_geometry_bytes(regions, cells, roots) > MAX_GEOMETRY_BYTES {
+        return Err(SNAPSHOT_LIMIT_ERROR.into());
+    }
+    Ok(())
+}

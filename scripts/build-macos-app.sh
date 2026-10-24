@@ -14,11 +14,16 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+# Local hosting is linked into the client. Include the browser build so a
+# browser on this computer can join its local session without another server.
+"$SAUERTEIG_ROOT/scripts/build-web.sh"
 cargo build --release --locked -p sauerteig-client --bin sauerteig-client
 
 sauerteig_app="$SAUERTEIG_ROOT/.local/Sauerteig.app"
 mkdir -p "$sauerteig_app/Contents/MacOS"
 mkdir -p "$sauerteig_app/Contents/Resources"
+mkdir -p "$sauerteig_app/Contents/Resources/web"
+cp -R web/dist/. "$sauerteig_app/Contents/Resources/web/"
 cp LICENSE THIRD_PARTY_NOTICES.md "$sauerteig_app/Contents/Resources/"
 mkdir -p "$sauerteig_app/Contents/Resources/asset-provenance"
 cp assets/materials/manifest.json "$sauerteig_app/Contents/Resources/asset-provenance/materials.json"
@@ -58,4 +63,4 @@ cat > "$sauerteig_app/Contents/Info.plist" <<'PLIST'
 PLIST
 
 echo "Local development app ready: $sauerteig_app"
-echo "The app is unsigned. Start sauerteig-server separately before opening it."
+echo "The app is unsigned. Open it to continue, create a world, or join a server."

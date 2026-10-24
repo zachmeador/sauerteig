@@ -1,3 +1,5 @@
+#[path = "game_objects.rs"]
+mod object_tools;
 #[path = "game_panels.rs"]
 mod panels;
 use crate::audio::{Audio, Cue};
@@ -7,6 +9,7 @@ use crate::regions::{RegionBox, RegionSet};
 use crate::user_data::{Document, Preferences, Storage, StorageEvent};
 use crate::{render::Renderer, scene::Geometry};
 use glam::Vec3;
+use object_tools::{ObjectSelection, PendingObjectEdit};
 use sauerteig_core::*;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use winit::{
@@ -18,6 +21,21 @@ use winit::{
 const PAPER: egui::Color32 = egui::Color32::from_rgb(214, 216, 211);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(164, 174, 169);
 const COPPER: egui::Color32 = egui::Color32::from_rgb(192, 135, 66);
+// Leave room below the server's 64-frame backlog when a map load or save stalls
+// its tick loop. Retrying skipped wall time would refill the queue immediately.
+const MAX_PENDING_INPUTS: usize = 24;
+
+fn take_input_tick(accumulator: &mut f32, outstanding: usize) -> bool {
+    if outstanding >= MAX_PENDING_INPUTS {
+        *accumulator = 0.0;
+        return false;
+    }
+    if *accumulator < FIXED_DT {
+        return false;
+    }
+    *accumulator -= FIXED_DT;
+    true
+}
 
 #[derive(Default)]
 struct ModeState {
@@ -28,6 +46,24 @@ struct ModeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturated_input_window_discards_catchup_and_resumes_after_acknowledgement() {
+        let mut accumulator = FIXED_DT * 6.0;
+        let mut outstanding = MAX_PENDING_INPUTS - 1;
+        assert!(take_input_tick(&mut accumulator, outstanding));
+        outstanding += 1;
+        assert!(!take_input_tick(&mut accumulator, outstanding));
+        assert_eq!(accumulator, 0.0);
+
+        // A delayed consumed-input snapshot frees a slot. There is no old
+        // catchup burst; only newly elapsed time produces another prediction.
+        outstanding -= 1;
+        assert!(!take_input_tick(&mut accumulator, outstanding));
+        accumulator += FIXED_DT;
+        assert!(take_input_tick(&mut accumulator, outstanding));
+        assert_eq!(accumulator, 0.0);
+    }
 
     #[test]
     fn old_snapshots_cannot_restore_a_previous_mode_even_after_ack() {
@@ -164,6 +200,10 @@ pub struct Game {
     edit_request: u64,
     edit_queue: VecDeque<EditIntent>,
     clipboard: Option<Clipboard>,
+    object_mode: bool,
+    object_selection: Option<ObjectSelection>,
+    pending_object: Option<PendingObjectEdit>,
+    sync: Option<(u64, bool)>,
     wheel_remainder: f32,
     viewport: [f32; 2],
     show_help: bool,
@@ -243,6 +283,10 @@ impl Game {
             edit_request: 0,
             edit_queue: VecDeque::new(),
             clipboard: None,
+            object_mode: false,
+            object_selection: None,
+            pending_object: None,
+            sync: None,
             wheel_remainder: 0.0,
             viewport: [1280.0, 800.0],
             show_help: false,
@@ -292,6 +336,28 @@ impl Game {
             }
         }
     }
+    pub(crate) fn edits_pending(&self) -> bool {
+        self.editing_busy()
+    }
+
+    /// A FIFO server barrier also waits for preceding Undo/Redo messages, which
+    /// do not have edit request acknowledgements. The launcher handles a lost
+    /// connection separately instead of waiting for an unreachable response.
+    pub(crate) fn request_sync(&mut self) -> Option<u64> {
+        if !self.connected || self.socket.is_none() || self.editing_busy() {
+            return None;
+        }
+        self.edit_request = self.edit_request.wrapping_add(1);
+        let request = self.edit_request;
+        self.sync = Some((request, false));
+        self.send(ClientMessage::Sync { request });
+        Some(request)
+    }
+
+    pub(crate) fn synced(&self, request: u64) -> bool {
+        self.sync == Some((request, true))
+    }
+
     fn notify(&mut self, message: impl Into<String>) {
         self.notice = message.into();
         self.notice_until = self.time + 4.0;
@@ -346,11 +412,19 @@ impl Game {
                         Err(error) => log::warn!("Invalid server message: {error}"),
                     }
                 }
-                ewebsock::WsEvent::Closed | ewebsock::WsEvent::Error(_) => {
+                event @ (ewebsock::WsEvent::Closed | ewebsock::WsEvent::Error(_)) => {
+                    match &event {
+                        ewebsock::WsEvent::Error(error) => {
+                            log::warn!("World connection failed: {error}")
+                        }
+                        _ => log::info!("World connection closed; scheduling reconnect"),
+                    }
+                    self.sync = None;
                     self.socket = None;
                     self.connected = false;
                     self.pending.clear();
                     self.pending_edit = None;
+                    self.pending_object = None;
                     self.clear_selection();
                     self.firing = false;
                     self.status = "Connection lost · reconnecting…".into();
@@ -360,8 +434,7 @@ impl Game {
             }
         }
         self.accumulator = (self.accumulator + dt).min(FIXED_DT * 6.0);
-        while self.accumulator >= FIXED_DT {
-            self.accumulator -= FIXED_DT;
+        while take_input_tick(&mut self.accumulator, self.pending.len()) {
             if self.connected {
                 self.seq = self.seq.wrapping_add(1);
                 let axis = |positive, negative| {
@@ -387,9 +460,6 @@ impl Game {
                 };
                 simulate_player(&self.world, &mut self.local, &input, FIXED_DT);
                 self.pending.push_back(input);
-                if self.pending.len() > 120 {
-                    self.pending.pop_front();
-                }
                 self.send(ClientMessage::Input { input });
             }
         }
@@ -418,11 +488,22 @@ impl Game {
                 revision,
                 cells,
                 roots,
+                bounds,
+                regions,
+                format_version,
                 objects,
                 players,
                 editing_allowed,
             } => {
-                let Ok(world) = World::from_parts(&cells, &roots) else {
+                if format_version > WORLD_FORMAT_VERSION {
+                    self.notify(
+                        "This server uses a newer world format. Update the client to join.",
+                    );
+                    self.socket = None;
+                    self.connected = false;
+                    return;
+                }
+                let Ok(world) = World::from_compact_parts(bounds, &regions, &cells, &roots) else {
                     self.notify("Server sent invalid world geometry.");
                     self.socket = None;
                     self.connected = false;
@@ -450,11 +531,13 @@ impl Game {
                 self.pending.clear();
                 self.camera_offset = Vec3::ZERO;
                 self.connected = true;
+                self.sync = None;
                 self.status = "Connected".into();
                 renderer.rebuild_all(&self.world);
                 self.rebuild_objects(renderer);
                 self.clear_selection();
                 self.pending_edit = None;
+                self.pending_object = None;
             }
             ServerMessage::Snapshot {
                 revision,
@@ -493,6 +576,11 @@ impl Game {
                 }
                 self.players = players;
                 self.projectiles = projectiles;
+            }
+            ServerMessage::Synced { request } => {
+                if self.sync.is_some_and(|(pending, _)| pending == request) {
+                    self.sync = Some((request, true));
+                }
             }
             ServerMessage::ModeChanged { request, editing } => {
                 if let Some(editing) = self.mode.acknowledge(request, editing) {
@@ -540,7 +628,42 @@ impl Game {
                     }
                 }
             }
+            ServerMessage::TransactionPatch {
+                revision,
+                roots,
+                objects,
+            } => {
+                if revision <= self.revision {
+                    return;
+                }
+                let start = web_time::Instant::now();
+                match self.world.apply_root_edits(&roots) {
+                    Ok(chunks) => {
+                        if let Some(pending) = &mut self.pending_object {
+                            pending.observe_patch(&self.objects, &objects);
+                        }
+                        self.objects = objects;
+                        self.revision = revision;
+                        renderer.rebuild(&self.world, &chunks);
+                        self.rebuild_objects(renderer);
+                        self.last_edit_ms = start.elapsed().as_secs_f32() * 1000.0;
+                        self.peak_edit_ms = self.peak_edit_ms.max(self.last_edit_ms);
+                        if self.local.editing {
+                            self.audio.play(Cue::Edit);
+                        }
+                    }
+                    Err(error) => {
+                        self.notify(format!("Invalid transaction patch: {error}"));
+                        self.socket = None;
+                        self.connected = false;
+                        self.reconnect_at = self.time + 1.0;
+                    }
+                }
+            }
             ServerMessage::Objects { revision, objects } => {
+                if revision <= self.revision {
+                    return;
+                }
                 self.revision = revision;
                 self.objects = objects;
                 self.rebuild_objects(renderer);
@@ -740,11 +863,55 @@ impl Game {
                         KeyCode::Digit6 => self.material = 5,
                         KeyCode::Digit7 => self.material = 6,
                         KeyCode::Digit8 => self.material = 7,
+                        KeyCode::KeyQ if self.local.editing => {
+                            self.set_object_mode(!self.object_mode)
+                        }
+                        KeyCode::KeyH if self.local.editing && self.object_mode => {
+                            self.move_object_to_aim()
+                        }
+                        KeyCode::Insert if self.local.editing && self.object_mode => {
+                            self.duplicate_object()
+                        }
+                        KeyCode::ArrowLeft if self.local.editing && self.object_mode => {
+                            self.nudge_object(0, -1.0)
+                        }
+                        KeyCode::ArrowRight if self.local.editing && self.object_mode => {
+                            self.nudge_object(0, 1.0)
+                        }
+                        KeyCode::ArrowUp | KeyCode::ArrowDown
+                            if self.local.editing && self.object_mode =>
+                        {
+                            let vertical = self.keys.contains(&KeyCode::ShiftLeft)
+                                || self.keys.contains(&KeyCode::ShiftRight);
+                            self.nudge_object(
+                                if vertical { 1 } else { 2 },
+                                if key == KeyCode::ArrowUp {
+                                    if vertical {
+                                        1.0
+                                    } else {
+                                        -1.0
+                                    }
+                                } else if vertical {
+                                    -1.0
+                                } else {
+                                    1.0
+                                },
+                            );
+                        }
+                        KeyCode::KeyR if self.local.editing && self.object_mode => self
+                            .rotate_object(
+                                self.keys.contains(&KeyCode::ShiftLeft)
+                                    || self.keys.contains(&KeyCode::ShiftRight),
+                            ),
                         KeyCode::KeyC if self.local.editing => self.copy_selection(),
                         KeyCode::KeyV if self.local.editing => self.paste_selection(),
                         KeyCode::KeyR if self.local.editing => self.transform_clipboard(true),
                         KeyCode::KeyM if self.local.editing => self.transform_clipboard(false),
                         KeyCode::KeyU | KeyCode::KeyZ if self.local.editing => {
+                            if self.editing_busy() {
+                                self.notify("Wait for the current edit before undoing.");
+                                return;
+                            }
                             self.clear_selection();
                             let redo = self.keys.contains(&KeyCode::ShiftLeft)
                                 || self.keys.contains(&KeyCode::ShiftRight);
@@ -797,6 +964,12 @@ impl Game {
                 }
                 if self.local.editing {
                     self.update_selection();
+                    if self.object_mode {
+                        if *button == MouseButton::Left {
+                            self.pick_object();
+                        }
+                        return;
+                    }
                     match button {
                         MouseButton::Left => {
                             self.begin_selection(self.keys.contains(&KeyCode::ShiftLeft))
@@ -899,6 +1072,7 @@ impl Game {
             })
     }
     fn clear_selection(&mut self) {
+        self.object_selection = None;
         self.regions = RegionSet::new();
         self.selecting_subtract = false;
         self.selection = None;
@@ -991,6 +1165,9 @@ impl Game {
             self.change_grid(up);
             return;
         }
+        if self.object_mode {
+            return;
+        }
         let intent = if self.keys.contains(&KeyCode::KeyY) {
             self.material = (self.material as i32 + if up { 1 } else { -1 })
                 .rem_euclid(MATERIAL_NAMES.len() as i32) as u8;
@@ -1008,7 +1185,11 @@ impl Game {
         }
     }
     fn process_edit_queue(&mut self) {
-        if !self.connected || !self.local.editing || self.pending_edit.is_some() {
+        if !self.connected
+            || !self.local.editing
+            || self.pending_edit.is_some()
+            || self.pending_object.is_some()
+        {
             return;
         }
         let Some(intent) = self.edit_queue.pop_front() else {
@@ -1022,6 +1203,20 @@ impl Game {
         let regions_after = match &intent {
             EditIntent::Paste(clipboard) => clipboard.mask().translated(selection.min).ok(),
             _ => None,
+        };
+        let objects = match &intent {
+            EditIntent::Paste(clipboard) => match clipboard.placed_objects(selection.min) {
+                Ok(objects) => objects
+                    .into_iter()
+                    .map(|object| ObjectEdit::Create { object })
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    self.edit_queue.clear();
+                    self.notify(error.to_string());
+                    return;
+                }
+            },
+            _ => Vec::new(),
         };
         let plan = match intent {
             EditIntent::Extrude => selection.plan_extrude(&self.world, self.material),
@@ -1038,7 +1233,14 @@ impl Game {
         match plan {
             Ok(plan) => {
                 self.edit_request = self.edit_request.wrapping_add(1);
-                let message = if !plan.roots.is_empty() {
+                let message = if !objects.is_empty() {
+                    ClientMessage::EditTransaction {
+                        request: self.edit_request,
+                        base_revision: self.revision,
+                        roots: plan.roots.clone(),
+                        objects,
+                    }
+                } else if !plan.roots.is_empty() {
                     ClientMessage::EditRoots {
                         request: self.edit_request,
                         base_revision: self.revision,
@@ -1081,17 +1283,23 @@ impl Game {
         }
     }
     fn copy_selection(&mut self) {
-        if self.pending_edit.is_some() || !self.edit_queue.is_empty() {
+        if self.editing_busy() {
             self.notify("Wait for the current edit before copying.");
             return;
         }
-        match Clipboard::copy_regions(&self.world, &self.selected_regions()) {
+        match Clipboard::copy_regions_with_objects(
+            &self.world,
+            &self.selected_regions(),
+            &self.objects,
+        ) {
             Ok(clipboard) => {
                 let [x, y, z] = clipboard.dims().map(|v| v as f32 / 8.0);
+                let objects = clipboard.objects().len();
                 self.clipboard = Some(clipboard);
+                self.object_mode = false;
                 self.paste_preview = true;
                 self.notify(format!(
-                    "Copied {x} × {y} × {z} m. Select a destination and press V."
+                    "Copied {x} × {y} × {z} m and {objects} objects. Select a destination and press V."
                 ));
             }
             Err(error) => self.notify(error.to_string()),
@@ -1103,6 +1311,11 @@ impl Game {
             return;
         };
         if self.edit_queue.len() < 32 {
+            if self.object_mode || self.object_selection.is_some() {
+                self.selection_generation = self.selection_generation.wrapping_add(1);
+            }
+            self.object_mode = false;
+            self.object_selection = None;
             self.edit_queue.push_back(EditIntent::Paste(clipboard));
         }
     }
@@ -1136,6 +1349,22 @@ impl Game {
         }
     }
     fn finish_edit(&mut self, request: u64, error: Option<String>) {
+        if self
+            .pending_object
+            .as_ref()
+            .is_some_and(|pending| pending.request == request)
+        {
+            let pending = self.pending_object.take().unwrap();
+            if let Some(error) = error {
+                self.notify(error);
+            } else if pending.generation == self.selection_generation {
+                let id = pending
+                    .created
+                    .or_else(|| self.object_selection.as_ref().map(|selection| selection.id));
+                self.select_object(id);
+            }
+            return;
+        }
         if !self
             .pending_edit
             .as_ref()
@@ -1158,65 +1387,6 @@ impl Game {
             } else {
                 self.selection = Some(pending.plan.selection_after);
             }
-        }
-    }
-    fn place(&mut self, kind: ObjectKind) {
-        if let Some(hit) = &self.selected {
-            let (position, rotation) = match kind {
-                ObjectKind::WallLamp if hit.normal.y.abs() < 0.7 => (
-                    hit.point + hit.normal * 0.02,
-                    hit.normal.x.atan2(hit.normal.z),
-                ),
-                ObjectKind::HangingLamp => (
-                    hit.point + Vec3::Y * if hit.normal.y > 0.5 { 2.0 } else { -0.02 },
-                    self.local.yaw,
-                ),
-                ObjectKind::Light => (hit.point + Vec3::Y * 1.5, self.local.yaw),
-                _ => (hit.point + Vec3::Y * 0.02, self.local.yaw),
-            };
-            self.send(ClientMessage::PlaceObject {
-                kind,
-                position,
-                rotation,
-            });
-        }
-    }
-    fn remove_object(&mut self) {
-        let (eye, dir) = self.edit_ray();
-        let id = self
-            .objects
-            .iter()
-            .filter_map(|o| {
-                if crate::props::definition(o.kind).is_some() {
-                    return crate::props::ray_distance(
-                        o.kind,
-                        o.position.to_array(),
-                        o.rotation,
-                        eye.to_array(),
-                        dir.to_array(),
-                    )
-                    .filter(|&distance| {
-                        distance <= 30.0 && self.world.raycast(eye, dir, distance).is_none()
-                    })
-                    .map(|distance| (o.id, distance));
-                }
-                let delta = o.position - eye;
-                let along = delta.dot(dir);
-                let radius = if matches!(o.kind, ObjectKind::Tree) {
-                    2.0
-                } else {
-                    0.8
-                };
-                if along > 0.0 && along < 30.0 && (delta - dir * along).length() < radius {
-                    Some((o.id, along))
-                } else {
-                    None
-                }
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|x| x.0);
-        if let Some(id) = id {
-            self.send(ClientMessage::RemoveObject { id });
         }
     }
     pub fn geometry(&self) -> Geometry {
@@ -1270,6 +1440,22 @@ impl Game {
             );
         }
         if self.local.editing {
+            if let Some(selection) = &self.object_selection {
+                if let Some(object) = self.objects.iter().find(|object| object.id == selection.id) {
+                    Self::draw_object_outline(&mut mesh, object, [0.95, 0.72, 0.25]);
+                    let draft = WorldObject {
+                        id: object.id,
+                        kind: selection.draft.kind,
+                        position: selection.draft.position,
+                        rotation: selection.draft.rotation,
+                    };
+                    if draft != *object {
+                        Self::draw_object_outline(&mut mesh, &draft, [0.25, 0.65, 0.95]);
+                    }
+                }
+            }
+        }
+        if self.local.editing && !self.object_mode {
             for bounds in self.regions.boxes() {
                 self.draw_volume(&mut mesh, *bounds, [0.25, 0.75, 0.62]);
             }
@@ -1279,6 +1465,17 @@ impl Game {
                 }
                 if self.paste_preview {
                     if let Some(clipboard) = &self.clipboard {
+                        let offset =
+                            Vec3::from_array(selection.min.map(|value| value as f32 / 8.0));
+                        for object in clipboard.objects() {
+                            let object = WorldObject {
+                                id: 0,
+                                kind: object.kind,
+                                position: object.position + offset,
+                                rotation: object.rotation,
+                            };
+                            Self::draw_object_outline(&mut mesh, &object, [0.25, 0.55, 0.9]);
+                        }
                         for bounds in clipboard.mask().boxes() {
                             if let Ok(bounds) = bounds.translated(selection.min) {
                                 self.draw_volume(&mut mesh, bounds, [0.25, 0.55, 0.9]);
@@ -1581,14 +1778,18 @@ impl Game {
             painter.text(
                 egui::pos2(24.0, bottom - 22.0),
                 egui::Align2::LEFT_BOTTOM,
-                "LMB DRAG select   WHEEL push/pull   G+WHEEL grid   SPACE clear",
+                if self.object_mode {
+                    "LMB select object   ARROWS move   R rotate   INSERT duplicate   DELETE remove"
+                } else {
+                    "LMB DRAG select   WHEEL push/pull   G+WHEEL grid   SPACE clear"
+                },
                 mono(11.0),
                 MUTED,
             );
             painter.text(
                 egui::pos2(24.0, bottom),
                 egui::Align2::LEFT_BOTTOM,
-                "E play   T assets   B blueprints   U undo   F1 controls",
+                "E play   Q geometry/objects   T assets   B blueprints   U undo   F1 controls",
                 mono(11.0),
                 MUTED,
             );
@@ -1650,8 +1851,8 @@ impl Game {
                                 "Shift + MMB   select a face edge",
                                 "Y + wheel     change selected material",
                                 "1–8           choose material",
-                                "U / Z         undo geometry",
-                                "Shift U / Z   redo geometry",
+                                "U / Z         undo geometry / objects",
+                                "Shift U / Z   redo geometry / objects",
                                 "Alt + drag    add a selection volume",
                                 "Alt Shift drag subtract a volume",
                                 "C / V         copy / paste selected volumes",
@@ -1661,7 +1862,13 @@ impl Game {
                                 "M / Shift M   mirror clipboard X / Z",
                                 "T             materials and props",
                                 "P / L / O     place chosen prop / light / spawn",
-                                "Delete        remove aimed object",
+                                "Q             geometry / object mode",
+                                "Arrows        move selected object in X/Z",
+                                "Shift ↑/↓     raise / lower selected object",
+                                "R / Shift R   object rotation ±90°",
+                                "H             move object to aimed surface",
+                                "Insert        duplicate selected object",
+                                "Delete        remove selected / aimed object",
                                 "Ctrl/Cmd S    save",
                                 "Esc           release mouse",
                                 "F1            close controls",

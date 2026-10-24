@@ -88,11 +88,15 @@ impl Game {
         regions
     }
     fn save_blueprint(&mut self) {
-        if self.pending_edit.is_some() || !self.edit_queue.is_empty() {
+        if self.editing_busy() {
             self.library_status = "Wait for the current edit to finish.".into();
             return;
         }
-        let result = Clipboard::copy_regions(&self.world, &self.selected_regions());
+        let result = Clipboard::copy_regions_with_objects(
+            &self.world,
+            &self.selected_regions(),
+            &self.objects,
+        );
         match result {
             Ok(clipboard) => match self.library.save(
                 &self.library_ui.new_name,
@@ -198,7 +202,7 @@ impl Game {
                                 if let Some(entry) = self.library.get(id) {
                                     let dims = entry.clipboard.dims().map(|v| v as f32 / 8.0);
                                     ui.label(format!("{} × {} × {} m", dims[0], dims[1], dims[2]));
-                                    ui.label(format!("{} selection volumes", entry.clipboard.mask().boxes().len()));
+                                    ui.label(format!("{} selection volumes · {} objects", entry.clipboard.mask().boxes().len(), entry.clipboard.objects().len()));
                                     ui.add_space(8.0);
                                     ui.label("Name");
                                     ui.text_edit_singleline(&mut self.library_ui.edit_name);
@@ -236,6 +240,9 @@ impl Game {
                                         self.clipboard = self.library.load(id);
                                         self.paste_preview = true;
                                         self.show_blueprints = false;
+                                        self.object_mode = false;
+                                        self.object_selection = None;
+                                        self.selection_generation = self.selection_generation.wrapping_add(1);
                                         self.notify("Blueprint loaded. Select a destination; V places it. R rotates, M mirrors.");
                                         self.capture(window);
                                     }
@@ -252,7 +259,7 @@ impl Game {
                     });
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(&self.library_status).color(COPPER).small());
-                    ui.label(egui::RichText::new("Geometry only · stored on this device").color(MUTED).small());
+                    ui.label(egui::RichText::new("Geometry and objects · stored on this device").color(MUTED).small());
                     ui.horizontal(|ui| {
                         if !self.library_ready && ui.button("Retry loading").clicked() {
                             self.library_status = "Loading…".into();
@@ -270,13 +277,18 @@ impl Game {
             && !self.show_blueprints
             && !self.show_assets
         {
-            self.selection_panel(ctx);
+            if self.object_mode {
+                self.object_panel(ctx);
+            } else {
+                self.selection_panel(ctx);
+            }
         }
     }
     fn selection_panel(&mut self, ctx: &egui::Context) {
         egui::Window::new("Selection")
             .anchor(egui::Align2::LEFT_TOP, [24.0, 100.0]).collapsible(true).resizable(false).default_width(270.0)
             .show(ctx, |ui| {
+                if ui.button("Object mode (Q)").clicked() { self.set_object_mode(true); return; }
                 ui.horizontal(|ui| {
                     for (mode, name) in [(SelectionMode::Replace, "Replace"), (SelectionMode::Add, "Add"), (SelectionMode::Subtract, "Subtract")] {
                         ui.selectable_value(&mut self.selection_mode, mode, name);
@@ -304,7 +316,7 @@ impl Game {
                         }
                     });
                     if changed {
-                        if (0..3).all(|a| selection.max[a] <= [WORLD_MAX*8, WORLD_HEIGHT*8, WORLD_MAX*8][a]) {
+                        if (0..3).all(|a| selection.min[a] >= self.world.bounds().min[a] * 8 && selection.max[a] <= self.world.bounds().max[a] * 8) {
                             self.selection = Some(selection);
                             self.selection_generation = self.selection_generation.wrapping_add(1);
                             self.edit_queue.clear();
@@ -394,7 +406,7 @@ impl Game {
                                 .add_enabled(
                                     !self.selected_regions().is_empty()
                                         && self.edit_queue.len() < 32,
-                                    egui::Button::new("Paint selection"),
+                                    egui::Button::new("Paint faces"),
                                 )
                                 .clicked()
                             {
