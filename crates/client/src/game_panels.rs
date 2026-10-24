@@ -403,16 +403,14 @@ impl Game {
                         });
                         ui.separator();
                         ui.label("Props");
-                        for (kind, name) in [
-                            (ObjectKind::WallLamp, "Wall lamp"),
-                            (ObjectKind::HangingLamp, "Hanging lamp"),
-                            (ObjectKind::UtilityBox, "Utility box"),
-                            (ObjectKind::Pipe, "Pipe"),
-                            (ObjectKind::Rock, "Rock"),
-                            (ObjectKind::Tree, "Tree (prototype)"),
-                        ] {
-                            ui.selectable_value(&mut self.prop_kind, kind, name);
+                        for prop in &crate::props::PROPS {
+                            ui.selectable_value(&mut self.prop_kind, prop.kind, prop.name);
                         }
+                        ui.selectable_value(
+                            &mut self.prop_kind,
+                            ObjectKind::Tree,
+                            "Tree (prototype)",
+                        );
                         ui.label(
                             egui::RichText::new(
                                 "P places the selected prop. Wall lamps align to the aimed wall.",

@@ -923,7 +923,7 @@ impl Game {
             self.selection_mode
         };
         let extend = extend && !alt;
-        let Some(hit) = self.selected.clone() else {
+        let Some(hit) = self.selected else {
             return;
         };
         let result = if extend {
@@ -1187,17 +1187,9 @@ impl Game {
             .objects
             .iter()
             .filter_map(|o| {
-                let key = match o.kind {
-                    ObjectKind::WallLamp => Some("wall_lamp"),
-                    ObjectKind::HangingLamp => Some("hanging_lamp"),
-                    ObjectKind::UtilityBox => Some("utility_box"),
-                    ObjectKind::Pipe => Some("pipe"),
-                    ObjectKind::Rock => Some("rock"),
-                    _ => None,
-                };
-                if let Some(key) = key {
+                if crate::props::definition(o.kind).is_some() {
                     return crate::props::ray_distance(
-                        key,
+                        o.kind,
                         o.position.to_array(),
                         o.rotation,
                         eye.to_array(),

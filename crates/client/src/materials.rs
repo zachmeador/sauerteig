@@ -1,7 +1,8 @@
 //! Embedded, offline material library shared by native and WebGPU builds.
+use sauerteig_core::MATERIAL_NAMES;
 use wgpu::util::DeviceExt;
 
-pub const TERRAIN_COUNT: usize = 8;
+const TERRAIN_COUNT: usize = MATERIAL_NAMES.len();
 const SIZE: u32 = 512;
 const MIPS: u32 = 10;
 const MAX_MATERIALS: usize = 64;
@@ -15,9 +16,9 @@ pub struct TextureAsset {
     pub tile_metres: f32,
 }
 macro_rules! terrain {
-    ($key:literal, $name:literal, $metal:expr, $emit:expr, $tile:expr) => {
+    ($id:literal, $key:literal, $metal:expr, $emit:expr, $tile:expr) => {
         TextureAsset {
-            name: $name,
+            name: MATERIAL_NAMES[$id],
             albedo: include_bytes!(concat!("../../../assets/materials/", $key, "/albedo.png")),
             normal_roughness: include_bytes!(concat!(
                 "../../../assets/materials/",
@@ -31,14 +32,14 @@ macro_rules! terrain {
     };
 }
 pub static TERRAIN: [TextureAsset; TERRAIN_COUNT] = [
-    terrain!("concrete", "Concrete", 0.0, 0.0, 2.0),
-    terrain!("gunmetal", "Gunmetal", 0.85, 0.0, 1.0),
-    terrain!("rust", "Rusted Steel", 0.0, 0.0, 2.0),
-    terrain!("worn_concrete", "Worn Concrete", 0.0, 0.0, 2.0),
-    terrain!("hazard", "Hazard Paint", 0.15, 0.0, 1.0),
-    terrain!("amber", "Amber Light", 0.0, 1.0, 1.0),
-    terrain!("rock", "Rock", 0.0, 0.0, 2.0),
-    terrain!("earth", "Earth", 0.0, 0.0, 2.0),
+    terrain!(0, "concrete", 0.0, 0.0, 2.0),
+    terrain!(1, "gunmetal", 0.85, 0.0, 1.0),
+    terrain!(2, "rust", 0.0, 0.0, 2.0),
+    terrain!(3, "worn_concrete", 0.0, 0.0, 2.0),
+    terrain!(4, "hazard", 0.15, 0.0, 1.0),
+    terrain!(5, "amber", 0.0, 1.0, 1.0),
+    terrain!(6, "rock", 0.0, 0.0, 2.0),
+    terrain!(7, "earth", 0.0, 0.0, 2.0),
 ];
 
 pub struct Materials {

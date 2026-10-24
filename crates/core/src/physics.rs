@@ -82,7 +82,6 @@ fn support_between(world: &World, feet: Vec3, min_y: f32, max_y: f32) -> Option<
                 if let Some(shape) = cell.shape {
                     if let Some(height) = shape_support(
                         Vec3::new(x as f32, y as f32, z as f32),
-                        1.0,
                         shape,
                         min,
                         max,
@@ -138,7 +137,6 @@ fn first_ceiling(world: &World, feet: Vec3, old_head: f32, new_head: f32) -> Opt
                 if let Some(shape) = cell.shape {
                     if let Some(height) = shape_support(
                         Vec3::new(x as f32, y as f32, z as f32),
-                        1.0,
                         shape,
                         min,
                         max,

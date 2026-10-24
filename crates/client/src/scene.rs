@@ -111,6 +111,9 @@ impl Geometry {
             self.beam(p[a], p[b], 0.024, color, 1.0);
         }
     }
+    // Keep the primitive's independent dimensions and appearance explicit at
+    // its two call sites rather than introducing a one-off parameter struct.
+    #[allow(clippy::too_many_arguments)]
     fn ring(
         &mut self,
         base: Vec3,

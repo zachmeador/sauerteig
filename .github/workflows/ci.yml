@@ -15,11 +15,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Install Linux window dependencies
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libasound2-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Build server and native client

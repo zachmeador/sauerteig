@@ -1,4 +1,4 @@
-# Starter props
+# Prop models
 
 These five models and their derived textures are **CC0 1.0**, sourced from [Poly Haven](https://polyhaven.com/license). Sauerteig's code remains MIT licensed. The source authors, download URLs, source SHA-256 checksums, and cooked mesh measurements are recorded in [manifest.json](manifest.json).
 
@@ -16,7 +16,7 @@ Preparation preserves source UVs and normals while simplifying geometry, with an
 
 Seven material layers use 512×512 textures: base-color RGB plus ambient occlusion alpha, and OpenGL tangent-space normal RGB plus roughness alpha. Metallic is approximated by a scalar per material. Normal vectors are renormalized after downsampling. Source baked material AO adds surface crevices; it does not replace dynamic scene lighting or bake the map's shadows.
 
-The shipped meshes total **710,724 bytes** and the PNG textures **5,953,790 bytes**. Uncompressed GPU texture storage for all seven layers and complete mip chains is **19,573,400 bytes** (about 18.67 MiB), excluding mesh/instance buffers and driver overhead. These are file and allocation measurements, not an FPS claim.
+The shipped meshes total **710,724 bytes** and the PNG textures **5,953,790 bytes**. Uncompressed GPU texture storage for all seven layers and complete mip chains is **19,573,400 bytes** (about 18.67 MiB), excluding mesh/instance buffers and driver overhead.
 
 ## Rebuild
 
@@ -29,6 +29,6 @@ npm install --prefix .local/prop-tools meshoptimizer@1.0.1 --ignore-scripts
 .local/prop-tools/venv/bin/python scripts/prepare-props.py --offline
 ```
 
-Omit `--offline` to retrieve missing 1K glTF sources. Downloads are cached in ignored `.local/prop-sources`; every file is checked against the official API's source checksum before conversion. The output manifest retains SHA-256 hashes. The mesh format is documented beside its bounded decoder in `crates/client/src/props.rs`.
+Omit `--offline` to retrieve missing 1K glTF sources. Downloads are cached in ignored `.local/prop-sources`; every file is checked against the official API's source checksum before conversion. The output manifest retains SHA-256 hashes. The mesh format is documented beside its bounded decoder in [`props.rs`](../../crates/client/src/props.rs).
 
-The offline download helper is **Powered by Poly Haven** and identifies itself to the [public API](https://github.com/Poly-Haven/Public-API/blob/master/ToS.md). The game uses embedded files and makes no Poly Haven API calls. No website logos or preview renders are included.
+The download helper is **Powered by Poly Haven** and identifies itself to the [public API](https://github.com/Poly-Haven/Public-API/blob/master/ToS.md). The game uses embedded files and makes no Poly Haven API calls. No website logos or preview renders are included.

@@ -1,7 +1,10 @@
-use crate::{Cube, Inventory, Map};
+use crate::{
+    transform::{world_bounds, ImportTransform, RegionOverlap},
+    Cube, Inventory, Map,
+};
 use sauerteig_core::{
     Cell, CellEdit, CellFragment, FineBox, ObjectKind, RootEdit, Shape, Vec3, World, WorldObject,
-    MAX_FRAGMENT_SOURCE_SIZE, SHAPE_FACES, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
+    FINE_UNITS, SHAPE_FACES, WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -19,6 +22,7 @@ pub struct ImportOptions {
     /// Cube texture/vslot indices to current Sauerteig material IDs.
     pub materials: BTreeMap<u16, u8>,
 }
+
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
@@ -30,6 +34,7 @@ impl Default for ImportOptions {
         }
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImportedWorld {
     pub revision: u64,
@@ -37,12 +42,14 @@ pub struct ImportedWorld {
     pub roots: Vec<RootEdit>,
     pub objects: Vec<WorldObject>,
 }
+
 #[derive(Clone, Debug, Serialize)]
 pub struct GeometryIssue {
     pub source_origin: [i32; 3],
     pub source_size: u32,
     pub reason: String,
 }
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ImportReport {
     pub source: Inventory,
@@ -66,148 +73,47 @@ pub struct ImportReport {
     pub notes: Vec<String>,
 }
 
-/// Converts geometry without resampling. Large authored shapes are clipped into
-/// the engine's one-metre roots; their original eighth-corner positions remain.
-/// Texture imagery, scripts, mapmodels and baked render data are not executed.
-pub fn convert(
-    map: &Map,
-    options: &ImportOptions,
-) -> Result<(ImportedWorld, ImportReport), String> {
-    if !options.units_per_metre.is_power_of_two() || options.units_per_metre > 1024 {
-        return Err("units-per-metre must be a power of two from 1 through 1024".into());
-    }
-    if options
-        .materials
-        .values()
-        .any(|&m| !Cell::solid(m).is_valid())
-    {
-        return Err("material mapping contains an invalid Sauerteig material ID".into());
-    }
-    let size = f64::from(map.header.world_size);
-    let center = options.center.unwrap_or([size / 2.0; 3]);
-    let factor = 8.0 / f64::from(options.units_per_metre);
-    let mut center_fine = [0i32; 3];
-    for a in 0..3 {
-        let v = center[a] * factor;
-        if !v.is_finite() || v.fract().abs() > 1e-8 || v.abs() > 8_388_608.0 {
-            return Err("center must align to Sauerteig's eighth-metre grid and be within import coordinate limits".into());
-        }
-        center_fine[a] = v as i32;
-    }
-    let world_bounds = FineBox {
-        min: [WORLD_MIN * 8, 0, WORLD_MIN * 8],
-        max: [WORLD_MAX * 8, WORLD_HEIGHT * 8, WORLD_MAX * 8],
-    };
-    let inv = map.inventory();
-    let mut report = ImportReport {
-        source: inv, units_per_metre: options.units_per_metre, center_source_xyz: center,
-        retained_source_bounds: [
-            [center[0]+f64::from(WORLD_MIN)*f64::from(options.units_per_metre), center[1]-f64::from(WORLD_MAX)*f64::from(options.units_per_metre), center[2]-f64::from(WORLD_HEIGHT/2)*f64::from(options.units_per_metre)],
-            [center[0]+f64::from(WORLD_MAX)*f64::from(options.units_per_metre), center[1]-f64::from(WORLD_MIN)*f64::from(options.units_per_metre), center[2]+f64::from(WORLD_HEIGHT/2)*f64::from(options.units_per_metre)]
-        ], crop_requested: options.crop, leaves_outside_region:0, leaves_clipped_at_region:0,
-        unsupported_leaves_omitted:Vec::new(), imported_coarse_cells:0, imported_detailed_roots:0, imported_fragments:0,
-        texture_slot_mapping:options.materials.clone(), unmapped_texture_slot_faces:BTreeMap::new(), leaves_with_multiple_face_textures:0,
-        imported_lights:0, imported_spawns:0, entity_kinds_not_imported:BTreeMap::new(), entities_outside_region:0,
-        notes: vec![
-            "Original source files are untouched. No CubeScript is executed, and no referenced asset or include is loaded automatically.".into(),
-            "Imported geometry uses dynamic lighting. Baked lightmaps, merged render surfaces, PVS, blend maps and sky rendering are not imported.".into(),
-            "Texture slot references and virtual-slot metadata are retained in this report. Unmapped slots use neutral material 0; texture imagery is not inside OGZ.".into(),
-            "The current Cell has one material, so a multi-textured cube uses its most frequent face texture (lowest slot breaks ties). Per-face legacy appearance is not preserved.".into(),
-            "Lights retain placement only: radius, color and spotlight attributes remain in the entity report. Mapmodels, pickups, triggers, sounds and volume effects need later adapters.".into(),
-        ],
-    };
-    if !options.crop {
-        let mut outside = 0;
-        let mut clipped = 0;
-        for cube in map.cubes.iter().filter(|c| !c.is_empty()) {
-            let min = cube.origin.map(f64::from);
-            let max = min.map(|v| v + f64::from(cube.size));
-            if (0..3).any(|a| {
-                max[a] <= report.retained_source_bounds[0][a]
-                    || min[a] >= report.retained_source_bounds[1][a]
-            }) {
-                outside += 1;
-            } else if (0..3).any(|a| {
-                min[a] < report.retained_source_bounds[0][a]
-                    || max[a] > report.retained_source_bounds[1][a]
-            }) {
-                clipped += 1;
-            }
-        }
-        if outside != 0 || clipped != 0 {
-            return Err(format!("map does not fit the current {}×{}×{}m world: {outside} leaves outside and {clipped} crossing its boundary. Nothing was written. Set an explicit --center and --crop to import a region, or choose an exact larger scale.", WORLD_MAX-WORLD_MIN,WORLD_HEIGHT,WORLD_MAX-WORLD_MIN));
+impl ImportReport {
+    fn new(map: &Map, options: &ImportOptions, transform: &ImportTransform) -> Self {
+        Self {
+            source: map.inventory(),
+            units_per_metre: options.units_per_metre,
+            center_source_xyz: transform.center,
+            retained_source_bounds: transform.source_region,
+            crop_requested: options.crop,
+            leaves_outside_region: 0,
+            leaves_clipped_at_region: 0,
+            unsupported_leaves_omitted: Vec::new(),
+            imported_coarse_cells: 0,
+            imported_detailed_roots: 0,
+            imported_fragments: 0,
+            texture_slot_mapping: options.materials.clone(),
+            unmapped_texture_slot_faces: BTreeMap::new(),
+            leaves_with_multiple_face_textures: 0,
+            imported_lights: 0,
+            imported_spawns: 0,
+            entity_kinds_not_imported: BTreeMap::new(),
+            entities_outside_region: 0,
+            notes: vec![
+                "Original source files are untouched. No CubeScript is executed, and no referenced asset or include is loaded automatically.".into(),
+                "Imported geometry uses dynamic lighting. Baked lightmaps, merged render surfaces, PVS, blend maps and sky rendering are not imported.".into(),
+                "Texture slot references and virtual-slot metadata are retained in this report. Unmapped slots use neutral material 0; texture imagery is not inside OGZ.".into(),
+                "The current Cell has one material, so a multi-textured cube uses its most frequent face texture (lowest slot breaks ties). Per-face legacy appearance is not preserved.".into(),
+                "Lights retain placement only: radius, color and spotlight attributes remain in the entity report. Mapmodels, pickups, triggers, sounds and volume effects need later adapters.".into(),
+            ],
         }
     }
-    let mut by_root: BTreeMap<[i32; 3], Vec<CellFragment>> = BTreeMap::new();
-    let mut fragments = 0usize;
-    for cube in &map.cubes {
-        if cube.is_empty() {
-            continue;
-        }
-        // Test coarse source bounds before requiring sub-grid coordinate fidelity:
-        // a crop can safely omit a distant fine leaf without rounding its geometry.
-        let min = [
-            f64::from(cube.origin[0]),
-            f64::from(cube.origin[1]),
-            f64::from(cube.origin[2]),
-        ];
-        let max = min.map(|v| v + f64::from(cube.size));
-        if (0..3).any(|a| {
-            max[a] <= report.retained_source_bounds[0][a]
-                || min[a] >= report.retained_source_bounds[1][a]
-        }) {
-            report.leaves_outside_region += 1;
-            continue;
-        }
-        let size_numerator = cube.size.checked_mul(8).ok_or("source scale overflow")?;
-        if size_numerator % options.units_per_metre != 0 {
-            return Err(format!(
-                "leaf at {:?} is finer than 1/8m at this scale; choose fewer units per metre",
-                cube.origin
-            ));
-        }
-        let source_size = size_numerator / options.units_per_metre;
-        if source_size == 0 || source_size > MAX_FRAGMENT_SOURCE_SIZE {
-            return Err(format!("source leaf at {:?} exceeds supported authored size ({} eighths); choose a larger units-per-metre value", cube.origin, MAX_FRAGMENT_SOURCE_SIZE));
-        }
-        let mut scaled = [0; 3];
-        for a in 0..3 {
-            let n = cube.origin[a]
-                .checked_mul(8)
-                .ok_or("source origin overflow")?;
-            if n % options.units_per_metre as i32 != 0 {
-                return Err(format!(
-                    "leaf at {:?} cannot align to the 1/8m grid at this scale",
-                    cube.origin
-                ));
-            }
-            scaled[a] = n / options.units_per_metre as i32 - center_fine[a];
-        }
-        // Right-handed rotation from legacy Z-up to Y-up: (x,y,z)->(x,z,-y).
-        let origin = [
-            scaled[0],
-            scaled[2] + WORLD_HEIGHT * 4,
-            -scaled[1] - source_size as i32,
-        ];
-        let source_bounds = FineBox {
-            min: origin,
-            max: origin.map(|v| v + source_size as i32),
-        };
-        let Some(bounds) = source_bounds.intersection(world_bounds) else {
-            report.leaves_outside_region += 1;
-            continue;
-        };
-        if bounds != source_bounds {
-            report.leaves_clipped_at_region += 1;
-        }
+
+    fn material_for(&mut self, cube: &Cube, materials: &BTreeMap<u16, u8>) -> u8 {
         let mut counts = BTreeMap::new();
         for slot in cube.textures {
             *counts.entry(slot).or_insert(0) += 1;
-            if !options.materials.contains_key(&slot) {
-                *report.unmapped_texture_slot_faces.entry(slot).or_default() += 1;
+            if !materials.contains_key(&slot) {
+                *self.unmapped_texture_slot_faces.entry(slot).or_default() += 1;
             }
         }
-        report.leaves_with_multiple_face_textures += usize::from(counts.len() > 1);
+        self.leaves_with_multiple_face_textures += usize::from(counts.len() > 1);
+        // BTreeMap order makes the lowest slot win tied face counts.
         let mut selected = 0;
         let mut best = 0;
         for (&slot, &count) in &counts {
@@ -216,12 +122,80 @@ pub fn convert(
                 best = count;
             }
         }
-        let material = *options.materials.get(&selected).unwrap_or(&0);
+        *materials.get(&selected).unwrap_or(&0)
+    }
+}
+
+fn region_error(outside: usize, clipped: usize) -> String {
+    format!(
+        "map does not fit the current {}×{}×{}m world: {outside} leaves outside and \
+         {clipped} crossing its boundary. Nothing was written. Set an explicit \
+         --center and --crop to import a region, or choose an exact larger scale.",
+        WORLD_MAX - WORLD_MIN,
+        WORLD_HEIGHT,
+        WORLD_MAX - WORLD_MIN,
+    )
+}
+
+/// Converts geometry without resampling. Large authored shapes are clipped into
+/// the engine's one-metre roots; their original eighth-corner positions remain.
+/// Texture imagery, scripts, mapmodels and baked render data are not executed.
+pub fn convert(
+    map: &Map,
+    options: &ImportOptions,
+) -> Result<(ImportedWorld, ImportReport), String> {
+    let transform = ImportTransform::new(map.header.world_size, options)?;
+    if options
+        .materials
+        .values()
+        .any(|&m| !Cell::solid(m).is_valid())
+    {
+        return Err("material mapping contains an invalid Sauerteig material ID".into());
+    }
+    let world_bounds = world_bounds();
+    let mut report = ImportReport::new(map, options, &transform);
+    if !options.crop {
+        let mut outside = 0;
+        let mut clipped = 0;
+        for cube in map.cubes.iter().filter(|c| !c.is_empty()) {
+            match transform.overlap(cube) {
+                RegionOverlap::Outside => outside += 1,
+                RegionOverlap::Clipped => clipped += 1,
+                RegionOverlap::Inside => {}
+            }
+        }
+        if outside != 0 || clipped != 0 {
+            return Err(region_error(outside, clipped));
+        }
+    }
+    let mut by_root: BTreeMap<[i32; 3], Vec<CellFragment>> = BTreeMap::new();
+    let mut fragments = 0usize;
+    for cube in &map.cubes {
+        if cube.is_empty() {
+            continue;
+        }
+        if transform.overlap(cube) == RegionOverlap::Outside {
+            report.leaves_outside_region += 1;
+            continue;
+        }
+        let source_bounds = transform.cube_bounds(cube)?;
+        let Some(bounds) = source_bounds.intersection(world_bounds) else {
+            report.leaves_outside_region += 1;
+            continue;
+        };
+        if bounds != source_bounds {
+            report.leaves_clipped_at_region += 1;
+        }
+        let material = report.material_for(cube, &options.materials);
         let cell = match cube_cell(cube, material) {
             Ok(cell) => cell,
             Err(reason) => {
                 if !options.skip_unsupported {
-                    return Err(format!("unsupported solid at {:?} size {}: {reason}. Use --skip-unsupported only to explicitly omit it, or keep the original for future support.", cube.origin,cube.size));
+                    return Err(format!(
+                        "unsupported solid at {:?} size {}: {reason}. Use --skip-unsupported \
+                         only to explicitly omit it, or keep the original for future support.",
+                        cube.origin, cube.size
+                    ));
                 }
                 report.unsupported_leaves_omitted.push(GeometryIssue {
                     source_origin: cube.origin,
@@ -231,8 +205,8 @@ pub fn convert(
                 continue;
             }
         };
-        let root_min = bounds.min.map(|v| v.div_euclid(8));
-        let root_max = bounds.max.map(|v| (v - 1).div_euclid(8));
+        let root_min = bounds.min.map(|v| v.div_euclid(FINE_UNITS));
+        let root_max = bounds.max.map(|v| (v - 1).div_euclid(FINE_UNITS));
         for x in root_min[0]..=root_max[0] {
             for y in root_min[1]..=root_max[1] {
                 for z in root_min[2]..=root_max[2] {
@@ -243,8 +217,8 @@ pub fn convert(
                     let pos = [x, y, z];
                     by_root.entry(pos).or_default().push(CellFragment {
                         bounds: bounds.intersection(FineBox::root(pos)).unwrap(),
-                        origin,
-                        size: source_size,
+                        origin: source_bounds.min,
+                        size: (source_bounds.max[0] - source_bounds.min[0]) as u32,
                         cell,
                     });
                 }
@@ -252,7 +226,10 @@ pub fn convert(
         }
     }
     if !options.crop && (report.leaves_outside_region > 0 || report.leaves_clipped_at_region > 0) {
-        return Err(format!("map does not fit the current {}×{}×{}m world: {} leaves outside and {} crossing its boundary. Nothing was written. Set an explicit --center and --crop to import a region, or choose an exact larger scale.", WORLD_MAX-WORLD_MIN,WORLD_HEIGHT,WORLD_MAX-WORLD_MIN,report.leaves_outside_region,report.leaves_clipped_at_region));
+        return Err(region_error(
+            report.leaves_outside_region,
+            report.leaves_clipped_at_region,
+        ));
     }
     let roots: Vec<_> = by_root
         .into_iter()
@@ -271,13 +248,7 @@ pub fn convert(
     }
     let mut objects = Vec::new();
     for entity in &map.entities {
-        let p = entity.position.map(f64::from);
-        let position = Vec3::new(
-            ((p[0] - center[0]) / f64::from(options.units_per_metre)) as f32,
-            ((p[2] - center[2]) / f64::from(options.units_per_metre)) as f32
-                + WORLD_HEIGHT as f32 / 2.0,
-            (-(p[1] - center[1]) / f64::from(options.units_per_metre)) as f32,
-        );
+        let position = transform.position(entity.position);
         if position.x < WORLD_MIN as f32
             || position.x >= WORLD_MAX as f32
             || position.y < 0.0

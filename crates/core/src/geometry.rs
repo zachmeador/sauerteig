@@ -831,9 +831,9 @@ pub(crate) fn triangle_height_interval(
     )
 }
 
+/// Floor or ceiling support from a shape in a one-metre world cell.
 pub(crate) fn shape_support(
     origin: Vec3,
-    size: f32,
     shape: Shape,
     min: Vec3,
     max: Vec3,
@@ -842,7 +842,7 @@ pub(crate) fn shape_support(
     ceiling: bool,
 ) -> Option<f32> {
     let mut result: Option<f32> = None;
-    for (triangle, _) in shape_triangles(shape, origin, size).into_iter().flatten() {
+    for (triangle, _) in shape_triangles(shape, origin, 1.0).into_iter().flatten() {
         let normal = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
         if if ceiling {
             normal.y >= -EPS
@@ -869,6 +869,22 @@ pub(crate) fn shape_support(
     result
 }
 
+fn append_triangle(mesh: &mut Mesh, triangle: [Vec3; 3], material: u8) {
+    let cross = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
+    if cross.length_squared() <= 1.0e-16 {
+        return;
+    }
+    let normal = cross.normalize().to_array();
+    let start = mesh.vertices.len() as u32;
+    mesh.vertices.extend(triangle.map(|position| Vertex {
+        position: position.to_array(),
+        normal,
+        color: MATERIAL_COLORS[material as usize],
+        material,
+    }));
+    mesh.indices.extend([start, start + 1, start + 2]);
+}
+
 #[cfg(test)]
 mod shape_tests {
     use super::*;
@@ -882,11 +898,11 @@ mod shape_tests {
 
     #[test]
     fn every_face_accepts_corner_and_edge_shapes_with_matching_queries() {
-        for face in 0..6 {
+        for (face, corners) in SHAPE_FACES.iter().enumerate() {
             for edge in [false, true] {
                 let mut shape = Shape::solid();
                 let axis = face / 2;
-                for &corner in &SHAPE_FACES[face][..if edge { 2 } else { 1 }] {
+                for &corner in &corners[..if edge { 2 } else { 1 }] {
                     shape.vertices[corner][axis] = if face % 2 == 0 { 2 } else { 6 };
                 }
                 assert!(shape.is_valid(), "face {face}, edge {edge}");
@@ -919,7 +935,9 @@ mod shape_tests {
                 assert!(world
                     .mesh_chunk([0, 0, 0])
                     .vertices
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .any(|v| {
                         let triangle =
                             [v[0].position, v[1].position, v[2].position].map(Vec3::from_array);
@@ -1116,20 +1134,4 @@ mod shape_tests {
             serde_json::from_str(&serde_json::to_string(&world).unwrap()).unwrap();
         assert_eq!(restored.cells(), world.cells());
     }
-}
-
-fn append_triangle(mesh: &mut Mesh, triangle: [Vec3; 3], material: u8) {
-    let cross = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
-    if cross.length_squared() <= 1.0e-16 {
-        return;
-    }
-    let normal = cross.normalize().to_array();
-    let start = mesh.vertices.len() as u32;
-    mesh.vertices.extend(triangle.map(|position| Vertex {
-        position: position.to_array(),
-        normal,
-        color: MATERIAL_COLORS[material as usize],
-        material,
-    }));
-    mesh.indices.extend([start, start + 1, start + 2]);
 }

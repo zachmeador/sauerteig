@@ -520,7 +520,7 @@ fn filled(bounds: FineBox, size: u8, cell: Cell) -> Result<Vec<CellFragment>, Ed
     let lengths = checked_dims(bounds.min, bounds.max)?;
     let count: u128 = lengths
         .into_iter()
-        .map(|n| (n as u128 + size as u128 - 1) / size as u128)
+        .map(|n| (n as u128).div_ceil(size as u128))
         .product();
     if count > MAX_EDIT_FRAGMENTS as u128 {
         return Err(EditError::TooLarge);
@@ -689,8 +689,8 @@ impl Clipboard {
         let bounds = selection.bounds().ok_or(EditError::InvalidSelection)?;
         let dims = checked_dims(bounds.min, bounds.max)?;
         let mut offset = [0; 3];
-        for a in 0..3 {
-            offset[a] = bounds.min[a].checked_neg().ok_or(EditError::OutsideWorld)?;
+        for (value, min) in offset.iter_mut().zip(bounds.min) {
+            *value = min.checked_neg().ok_or(EditError::OutsideWorld)?;
         }
         let mask = selection
             .translated(offset)
@@ -887,8 +887,8 @@ fn transform_shape(shape: Shape, transform: impl Fn([u8; 3]) -> [u8; 3]) -> Shap
             .unwrap()
     });
     let mut result = Shape::solid();
-    for old in 0..8 {
-        result.vertices[mapping[old]] = transform(shape.vertices[old]);
+    for (new, vertex) in mapping.into_iter().zip(shape.vertices) {
+        result.vertices[new] = transform(vertex);
     }
     result.diagonals = 0;
     for (old_face, &corners) in SHAPE_FACES.iter().enumerate() {
@@ -1174,7 +1174,7 @@ mod tests {
     fn every_face_uses_the_same_corner_edge_and_shape_mapping() {
         let mut world = World::empty();
         world.set([0, 3, 0], Some(Cell::solid(0)));
-        for face in 0..6 {
+        for (face, vertices) in SHAPE_FACES.iter().enumerate() {
             let axis = face / 2;
             let sign = if face % 2 == 1 { 1 } else { -1 };
             let selection = EditSelection::from_hit(&hit([0, 3, 0], axis, sign), 8).unwrap();
@@ -1196,9 +1196,8 @@ mod tests {
                     .unwrap();
                     let actual = plan.roots[0].fragments[0].cell.as_shape();
                     let mut expected = Shape::solid();
-                    for index in 0..4 {
+                    for (index, &vertex) in vertices.iter().enumerate() {
                         if index == corner || edge && index == (corner + 1) % 4 {
-                            let vertex = SHAPE_FACES[face][index];
                             expected.vertices[vertex][axis] =
                                 (expected.vertices[vertex][axis] as i32 - sign) as u8;
                         }

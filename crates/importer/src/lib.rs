@@ -1,7 +1,8 @@
 //! Non-executing, bounded reader for Cube 2 OCTA map versions 29 through 33.
 //! Source format references are recorded in README.md; no engine code is linked.
 mod convert;
-pub use convert::*;
+mod transform;
+pub use convert::{convert, GeometryIssue, ImportOptions, ImportReport, ImportedWorld};
 
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};

@@ -1,6 +1,8 @@
 //! Embedded, offline-cooked CC0 props. Ordinary builds do not contact asset services.
 //! The source manifest and reproducible cooker live in assets/props and scripts.
 
+use sauerteig_core::{ObjectKind, MATERIAL_NAMES};
+
 #[derive(Clone, Copy, Debug)]
 pub struct PropVertex {
     pub position: [f32; 3],
@@ -17,13 +19,9 @@ pub struct PropMesh {
 }
 
 pub struct PropAsset {
-    pub key: &'static str,
-    pub name: &'static str,
+    pub definition: &'static PropDefinition,
     pub near: PropMesh,
     pub distant: PropMesh,
-    pub bounds_min: [f32; 3],
-    pub bounds_max: [f32; 3],
-    pub lod_distance: f32,
 }
 
 pub struct PropTexture {
@@ -79,96 +77,95 @@ static TEXTURES: [PropTexture; 7] = [
     texture!("14_rock", "rock_07", 0.0, 0.0),
 ];
 
-struct PropSource {
+pub struct PropDefinition {
+    pub kind: ObjectKind,
+    pub name: &'static str,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+    pub lod_distance: f32,
     key: &'static str,
-    name: &'static str,
     near: &'static [u8],
     distant: &'static [u8],
-    min: [f32; 3],
-    max: [f32; 3],
 }
-static SOURCES: [PropSource; 5] = [
-    PropSource {
+
+/// The same definitions drive the asset picker, mesh loading, and object picking.
+pub static PROPS: [PropDefinition; 5] = [
+    PropDefinition {
+        kind: ObjectKind::WallLamp,
         key: "wall_lamp",
         name: "Wall lamp",
         near: include_bytes!("../../../assets/props/wall_lamp.spm"),
         distant: include_bytes!("../../../assets/props/wall_lamp_distant.spm"),
-        min: [
-            -0.13672421872615814,
-            -0.21495330333709717,
-            1.702955643168025e-08,
-        ],
-        max: [0.13673660159111023, 0.21495330333709717, 0.1403784602880478],
+        bounds_min: [-0.13672422, -0.2149533, 1.7029556e-08],
+        bounds_max: [0.1367366, 0.2149533, 0.14037846],
+        lod_distance: 20.0,
     },
-    PropSource {
+    PropDefinition {
+        kind: ObjectKind::HangingLamp,
         key: "hanging_lamp",
         name: "Hanging lamp",
         near: include_bytes!("../../../assets/props/hanging_lamp.spm"),
         distant: include_bytes!("../../../assets/props/hanging_lamp_distant.spm"),
-        min: [
-            -0.27480319142341614,
-            -1.3400129079818726,
-            -0.27480337023735046,
-        ],
-        max: [0.2748033106327057, 0.015337205491960049, 0.2748030722141266],
+        bounds_min: [-0.2748032, -1.3400129, -0.27480337],
+        bounds_max: [0.2748033, 0.0153372055, 0.27480307],
+        lod_distance: 20.0,
     },
-    PropSource {
+    PropDefinition {
+        kind: ObjectKind::UtilityBox,
         key: "utility_box",
         name: "Utility box",
         near: include_bytes!("../../../assets/props/utility_box.spm"),
         distant: include_bytes!("../../../assets/props/utility_box_distant.spm"),
-        min: [-0.2600001096725464, 0.0, -0.21599999070167542],
-        max: [0.2600001096725464, 1.1203334331512451, 0.21599999070167542],
+        bounds_min: [-0.2600001, 0.0, -0.21599999],
+        bounds_max: [0.2600001, 1.1203334, 0.21599999],
+        lod_distance: 20.0,
     },
-    PropSource {
+    PropDefinition {
+        kind: ObjectKind::Pipe,
         key: "pipe",
         name: "Pipe",
         near: include_bytes!("../../../assets/props/pipe.spm"),
         distant: include_bytes!("../../../assets/props/pipe_distant.spm"),
-        min: [-0.1035519540309906, 0.0, -0.10316049307584763],
-        max: [0.1035519540309906, 1.9546396732330322, 0.10316049307584763],
+        bounds_min: [-0.103551954, 0.0, -0.10316049],
+        bounds_max: [0.103551954, 1.9546397, 0.10316049],
+        lod_distance: 20.0,
     },
-    PropSource {
+    PropDefinition {
+        kind: ObjectKind::Rock,
         key: "rock",
         name: "Rock",
         near: include_bytes!("../../../assets/props/rock.spm"),
         distant: include_bytes!("../../../assets/props/rock_distant.spm"),
-        min: [-0.6755276322364807, 0.0, -1.2811079025268555],
-        max: [0.6755276322364807, 1.1497611999511719, 1.2811079025268555],
+        bounds_min: [-0.67552763, 0.0, -1.2811079],
+        bounds_max: [0.67552763, 1.1497612, 1.2811079],
+        lod_distance: 20.0,
     },
 ];
 
 pub fn load() -> Result<Vec<PropAsset>, String> {
-    SOURCES
+    PROPS
         .iter()
         .map(|source| {
             Ok(PropAsset {
-                key: source.key,
-                name: source.name,
+                definition: source,
                 near: decode(source.near).map_err(|e| format!("{}: {e}", source.key))?,
                 distant: decode(source.distant)
                     .map_err(|e| format!("{} distant: {e}", source.key))?,
-                bounds_min: source.min,
-                bounds_max: source.max,
-                lod_distance: 20.0,
             })
         })
         .collect()
 }
 
-/// Local source bounds; no mesh allocation or decoding is needed for picking.
-pub fn bounds(key: &str) -> Option<([f32; 3], [f32; 3])> {
-    SOURCES
-        .iter()
-        .find(|source| source.key == key)
-        .map(|source| (source.min, source.max))
+/// No mesh allocation or decoding is needed to read a prop's metadata.
+pub fn definition(kind: ObjectKind) -> Option<&'static PropDefinition> {
+    PROPS.iter().find(|definition| definition.kind == kind)
 }
 
 /// Ray distance to the rotated prop's bounds, padded by 6 cm for small fixtures.
 /// Direction must be normalized if the result is to be interpreted as metres.
 /// A caller can compare this distance with the world ray hit to reject occluded props.
 pub fn ray_distance(
-    key: &str,
+    kind: ObjectKind,
     position: [f32; 3],
     rotation: f32,
     eye: [f32; 3],
@@ -184,7 +181,8 @@ pub fn ray_distance(
     {
         return None;
     }
-    let (min, max) = bounds(key)?;
+    let prop = definition(kind)?;
+    let (min, max) = (prop.bounds_min, prop.bounds_max);
     let (s, c) = rotation.sin_cos();
     let delta: [f32; 3] = std::array::from_fn(|i| eye[i] - position[i]);
     let origin = [
@@ -233,7 +231,7 @@ fn decode(data: &[u8]) -> Result<PropMesh, String> {
         || vertex_count > 100_000
         || index_count == 0
         || index_count > 300_000
-        || index_count % 3 != 0
+        || !index_count.is_multiple_of(3)
         || data.len() != 12 + vertex_count * 40 + index_count * 4
     {
         return Err("invalid mesh size".into());
@@ -255,7 +253,8 @@ fn decode(data: &[u8]) -> Result<PropMesh, String> {
             .chain(vertex.uv)
             .chain([vertex.emission])
             .all(f32::is_finite)
-            || !(8..15).contains(&vertex.material)
+            || !(MATERIAL_NAMES.len()..MATERIAL_NAMES.len() + TEXTURES.len())
+                .contains(&(vertex.material as usize))
         {
             return Err("invalid mesh vertex".into());
         }
@@ -278,7 +277,7 @@ mod tests {
     fn picking_reaches_the_fixture_below_its_mount_and_tall_prop_tops() {
         // The hanging lens is more than a metre below the mounting origin.
         let hit = ray_distance(
-            "hanging_lamp",
+            ObjectKind::HangingLamp,
             [0.0, 3.0, 0.0],
             0.0,
             [0.0, 1.8, 4.0],
@@ -286,9 +285,16 @@ mod tests {
         )
         .unwrap();
         assert!((3.6..4.0).contains(&hit));
-        assert!(ray_distance("pipe", [0.0; 3], 0.0, [0.0, 1.8, 4.0], [0.0, 0.0, -1.0]).is_some());
         assert!(ray_distance(
-            "hanging_lamp",
+            ObjectKind::Pipe,
+            [0.0; 3],
+            0.0,
+            [0.0, 1.8, 4.0],
+            [0.0, 0.0, -1.0]
+        )
+        .is_some());
+        assert!(ray_distance(
+            ObjectKind::HangingLamp,
             [0.0, 3.0, 0.0],
             0.0,
             [0.0, 0.5, 4.0],
@@ -301,10 +307,17 @@ mod tests {
     fn picking_rotates_asymmetric_bounds_and_ignores_behind_camera_objects() {
         let ray = [0.0, 0.0, -1.0];
         let eye = [1.0, 0.5, 4.0];
-        assert!(ray_distance("rock", [0.0; 3], 0.0, eye, ray).is_none());
-        assert!(ray_distance("rock", [0.0; 3], std::f32::consts::FRAC_PI_2, eye, ray).is_some());
-        assert!(ray_distance("rock", [0.0; 3], 0.0, [0.0, 0.5, -4.0], ray).is_none());
-        assert!(ray_distance("rock", [0.0; 3], 0.0, eye, [0.0; 3]).is_none());
+        assert!(ray_distance(ObjectKind::Rock, [0.0; 3], 0.0, eye, ray).is_none());
+        assert!(ray_distance(
+            ObjectKind::Rock,
+            [0.0; 3],
+            std::f32::consts::FRAC_PI_2,
+            eye,
+            ray
+        )
+        .is_some());
+        assert!(ray_distance(ObjectKind::Rock, [0.0; 3], 0.0, [0.0, 0.5, -4.0], ray).is_none());
+        assert!(ray_distance(ObjectKind::Rock, [0.0; 3], 0.0, eye, [0.0; 3]).is_none());
     }
 
     #[test]
@@ -312,15 +325,23 @@ mod tests {
         let assets = load().unwrap();
         assert_eq!(assets.len(), 5);
         for asset in assets {
-            assert!(asset.near.indices.len() / 3 <= 4_000, "{}", asset.key);
+            assert!(
+                asset.near.indices.len() / 3 <= 4_000,
+                "{}",
+                asset.definition.key
+            );
             assert!(asset.distant.indices.len() < asset.near.indices.len());
             for mesh in [&asset.near, &asset.distant] {
                 for vertex in &mesh.vertices {
                     let length_squared = vertex.normal.iter().map(|n| n * n).sum::<f32>();
                     assert!((length_squared - 1.0).abs() < 0.01);
                     for axis in 0..3 {
-                        assert!(vertex.position[axis] >= asset.bounds_min[axis] - 0.0001);
-                        assert!(vertex.position[axis] <= asset.bounds_max[axis] + 0.0001);
+                        assert!(
+                            vertex.position[axis] >= asset.definition.bounds_min[axis] - 0.0001
+                        );
+                        assert!(
+                            vertex.position[axis] <= asset.definition.bounds_max[axis] + 0.0001
+                        );
                     }
                 }
             }

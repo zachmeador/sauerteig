@@ -656,7 +656,7 @@ fn clip_plane(
         let indices = earcutr::earcut(&coordinates, &hole_indices, 2)
             .map_err(|e| format!("Subdivision cap triangulation failed: {e:?}"))?;
         let mut actual_area = 0.0;
-        for ids in indices.chunks_exact(3) {
+        for ids in indices.as_chunks::<3>().0 {
             let mut t = [points[ids[0]], points[ids[1]], points[ids[2]]];
             let cross = (t[1] - t[0]).cross(t[2] - t[0]);
             actual_area += cross[axis].abs() * 0.5;

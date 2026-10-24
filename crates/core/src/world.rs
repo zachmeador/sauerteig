@@ -6,8 +6,7 @@ pub type CellPos = [i32; 3];
 pub type ChunkKey = [i32; 3];
 const CHUNK_VOLUME: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
 
-/// Linear colors: concrete, gunmetal, rusted steel, worn concrete, hazard paint,
-/// and amber light. These slots stay stable in saved maps and the editor.
+/// Fallback colors for the stable material slots named by `MATERIAL_NAMES`.
 pub const MATERIAL_COLORS: [[f32; 3]; 8] = [
     [0.23, 0.245, 0.25],
     [0.070, 0.085, 0.095],
@@ -605,6 +604,26 @@ pub fn arena_objects() -> Vec<crate::WorldObject> {
     objects
 }
 
+/// A single network edit group at the editor's supported coarse grid sizes.
+/// The caller selects the origin; coordinates outside the world are omitted.
+pub fn block_edits(origin: CellPos, grid: i32, cell: Option<Cell>) -> Vec<CellEdit> {
+    if ![1, 2, 4, 8].contains(&grid) || cell.is_some_and(|c| !c.is_valid()) {
+        return Vec::new();
+    }
+    let mut edits = Vec::with_capacity((grid * grid * grid) as usize);
+    for z in 0..grid {
+        for y in 0..grid {
+            for x in 0..grid {
+                let pos = [origin[0] + x, origin[1] + y, origin[2] + z];
+                if World::is_valid_pos(pos) {
+                    edits.push(CellEdit { pos, cell });
+                }
+            }
+        }
+    }
+    edits
+}
+
 #[cfg(test)]
 mod foundry_tests {
     use super::*;
@@ -709,24 +728,4 @@ mod foundry_tests {
             crossing.position
         );
     }
-}
-
-/// A single network edit group at the editor's supported coarse grid sizes.
-/// The caller selects the origin; coordinates outside the world are omitted.
-pub fn block_edits(origin: CellPos, grid: i32, cell: Option<Cell>) -> Vec<CellEdit> {
-    if ![1, 2, 4, 8].contains(&grid) || cell.is_some_and(|c| !c.is_valid()) {
-        return Vec::new();
-    }
-    let mut edits = Vec::with_capacity((grid * grid * grid) as usize);
-    for z in 0..grid {
-        for y in 0..grid {
-            for x in 0..grid {
-                let pos = [origin[0] + x, origin[1] + y, origin[2] + z];
-                if World::is_valid_pos(pos) {
-                    edits.push(CellEdit { pos, cell });
-                }
-            }
-        }
-    }
-    edits
 }
