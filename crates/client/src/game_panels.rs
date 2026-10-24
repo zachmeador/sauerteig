@@ -1,0 +1,319 @@
+use super::*;
+
+impl Game {
+    pub(super) fn poll_storage(&mut self) {
+        for event in self.storage.poll() {
+            match event {
+                StorageEvent::Loaded(Document::Settings, value) => {
+                    match value
+                        .map(|json| serde_json::from_str::<Preferences>(&json))
+                        .transpose()
+                    {
+                        Ok(preferences) => {
+                            self.preferences = preferences.unwrap_or_default();
+                            self.settings_ready = true;
+                            self.settings_status = "Saved locally".into();
+                        }
+                        Err(error) => {
+                            self.settings_status = format!("Cannot read settings: {error}")
+                        }
+                    }
+                }
+                StorageEvent::Loaded(Document::Blueprints, value) => {
+                    match value
+                        .map(|json| BlueprintLibrary::from_json(&json))
+                        .transpose()
+                    {
+                        Ok(library) => {
+                            self.library = library.unwrap_or_default();
+                            self.library_ready = true;
+                            self.library_status = "Saved locally".into();
+                        }
+                        Err(error) => self.library_status = format!("Cannot read library: {error}"),
+                    }
+                }
+                StorageEvent::Saved(document) => {
+                    let status = match document {
+                        Document::Settings => &mut self.settings_status,
+                        Document::Blueprints => &mut self.library_status,
+                    };
+                    *status = "Saved locally".into();
+                }
+                StorageEvent::Failed(document, message) => {
+                    let status = match document {
+                        Document::Settings => &mut self.settings_status,
+                        Document::Blueprints => &mut self.library_status,
+                    };
+                    *status = format!("Local storage failed: {message}");
+                }
+            }
+        }
+    }
+    fn persist_library(&mut self) {
+        match self.library.to_json() {
+            Ok(json) => {
+                self.storage.save(Document::Blueprints, json);
+                self.library_status = "Saving…".into();
+            }
+            Err(error) => self.library_status = error.to_string(),
+        }
+    }
+    fn persist_settings(&mut self) {
+        match serde_json::to_string(&self.preferences) {
+            Ok(json) => {
+                self.storage.save(Document::Settings, json);
+                self.settings_status = "Saving…".into();
+            }
+            Err(error) => self.settings_status = error.to_string(),
+        }
+    }
+    pub(super) fn selected_regions(&self) -> RegionSet {
+        let mut regions = self.regions.clone();
+        let selection = self.selection.clone().or_else(|| {
+            if regions.is_empty() {
+                self.active_selection()
+            } else {
+                None
+            }
+        });
+        if let Some(selection) = selection {
+            if let Ok(bounds) = RegionBox::new(selection.min, selection.max) {
+                if self.selecting_subtract {
+                    let _ = regions.subtract(bounds);
+                } else {
+                    let _ = regions.add(bounds);
+                }
+            }
+        }
+        regions
+    }
+    fn save_blueprint(&mut self) {
+        if self.pending_edit.is_some() || !self.edit_queue.is_empty() {
+            self.library_status = "Wait for the current edit to finish.".into();
+            return;
+        }
+        let result = Clipboard::copy_regions(&self.world, &self.selected_regions());
+        match result {
+            Ok(clipboard) => match self.library.save(
+                &self.library_ui.new_name,
+                &self.library_ui.new_folder,
+                clipboard,
+            ) {
+                Ok(id) => {
+                    self.select_blueprint(id);
+                    self.library_ui.new_name.clear();
+                    self.persist_library();
+                }
+                Err(error) => self.library_status = error.to_string(),
+            },
+            Err(error) => self.library_status = error.to_string(),
+        }
+    }
+    fn select_blueprint(&mut self, id: u64) {
+        if let Some(entry) = self.library.get(id) {
+            self.library_ui.selected = Some(id);
+            self.library_ui.edit_name = entry.name.clone();
+            self.library_ui.edit_folder = entry.folder.clone();
+            self.library_ui.confirm_delete = false;
+        }
+    }
+    pub(super) fn local_panels(&mut self, ctx: &egui::Context, window: &Window) {
+        if self.show_settings {
+            let mut open = true;
+            egui::Window::new("Settings")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(390.0)
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(self.settings_ready, |ui| {
+                        if ui
+                            .checkbox(
+                                &mut self.preferences.invert_scroll,
+                                "Invert editor scroll direction",
+                            )
+                            .changed()
+                        {
+                            self.wheel_remainder = 0.0;
+                            self.persist_settings();
+                        }
+                        ui.add_space(6.0);
+                        ui.label(if self.preferences.invert_scroll {
+                            "Wheel up adds geometry; wheel down removes it."
+                        } else {
+                            "Wheel down adds geometry; wheel up removes it."
+                        });
+                        ui.label("Also reverses grid, shaping, and material wheel controls.");
+                    });
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(&self.settings_status)
+                            .small()
+                            .color(MUTED),
+                    );
+                    if !self.settings_ready && ui.button("Retry loading").clicked() {
+                        self.settings_status = "Loading…".into();
+                        self.storage.load(Document::Settings);
+                    }
+                    if self.settings_ready
+                        && self.settings_status.starts_with("Local storage failed")
+                        && ui.button("Retry save").clicked()
+                    {
+                        self.persist_settings();
+                    }
+                    if ui.button("Back").clicked() {
+                        self.show_settings = false;
+                    }
+                });
+            self.show_settings &= open;
+        }
+        if self.show_blueprints {
+            let mut open = true;
+            egui::Window::new("Blueprints")
+                .open(&mut open).collapsible(false).resizable(true)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -10.0]).default_size([720.0, 470.0])
+                .min_width(560.0)
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(self.library_ready, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Search");
+                            ui.add(egui::TextEdit::singleline(&mut self.library_ui.search).hint_text("Name or folder").desired_width(260.0));
+                            ui.label(format!("{} blueprints", self.library.entries().len()));
+                        });
+                        ui.separator();
+                        ui.columns(2, |columns| {
+                            let rows: Vec<_> = self.library.search(&self.library_ui.search, None).into_iter()
+                                .map(|b| (b.id, b.name.clone(), b.folder.clone())).collect();
+                            egui::ScrollArea::vertical().id_salt("blueprint-list").max_height(285.0).min_scrolled_height(220.0)
+                                .show(&mut columns[0], |ui| {
+                                    if rows.is_empty() { ui.label("No blueprints here yet."); }
+                                    for (id, name, folder) in rows {
+                                        let label = if folder.is_empty() { name } else { format!("{folder} / {name}") };
+                                        if ui.selectable_label(self.library_ui.selected == Some(id), label).clicked() { self.select_blueprint(id); }
+                                    }
+                                });
+                            let ui = &mut columns[1];
+                            if let Some(id) = self.library_ui.selected {
+                                if let Some(entry) = self.library.get(id) {
+                                    let dims = entry.clipboard.dims().map(|v| v as f32 / 8.0);
+                                    ui.label(format!("{} × {} × {} m", dims[0], dims[1], dims[2]));
+                                    ui.label(format!("{} selection volumes", entry.clipboard.mask().boxes().len()));
+                                    ui.add_space(8.0);
+                                    ui.label("Name");
+                                    ui.text_edit_singleline(&mut self.library_ui.edit_name);
+                                    ui.label("Folder");
+                                    ui.add(egui::TextEdit::singleline(&mut self.library_ui.edit_folder).hint_text("Structures / Foundry"));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Update").clicked() {
+                                            match self.library.rename(id, &self.library_ui.edit_name) {
+                                                Ok(()) => { let _ = self.library.move_to(id, &self.library_ui.edit_folder); self.persist_library(); }
+                                                Err(e) => self.library_status = e.to_string(),
+                                            }
+                                        }
+                                        if ui.button("Duplicate").clicked() {
+                                            match self.library.duplicate(id, None) {
+                                                Ok(id) => { self.select_blueprint(id); self.persist_library(); }
+                                                Err(e) => self.library_status = e.to_string(),
+                                            }
+                                        }
+                                        if ui.button("Delete").clicked() { self.library_ui.confirm_delete = true; }
+                                    });
+                                    if self.library_ui.confirm_delete {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Delete this blueprint?");
+                                            if ui.button("Delete it").clicked() {
+                                                let _ = self.library.delete(id);
+                                                self.library_ui.selected = None;
+                                                self.library_ui.confirm_delete = false;
+                                                self.persist_library();
+                                            }
+                                            if ui.button("Keep").clicked() { self.library_ui.confirm_delete = false; }
+                                        });
+                                    }
+                                    ui.add_space(12.0);
+                                    if ui.button("Load for placement").clicked() {
+                                        self.clipboard = self.library.load(id);
+                                        self.paste_preview = true;
+                                        self.show_blueprints = false;
+                                        self.notify("Blueprint loaded. Select a destination; V places it. R rotates, M mirrors.");
+                                        self.capture(window);
+                                    }
+                                }
+                            } else { ui.label("Select a blueprint to place or organize it."); }
+                        });
+                        ui.separator();
+                        ui.label("Save current selection");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.library_ui.new_name).hint_text("Blueprint name").desired_width(210.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.library_ui.new_folder).hint_text("Folder (optional)").desired_width(210.0));
+                            if ui.add_enabled(self.local.editing && !self.selected_regions().is_empty(), egui::Button::new("Save selection")).clicked() { self.save_blueprint(); }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&self.library_status).color(COPPER).small());
+                    ui.label(egui::RichText::new("Geometry only · stored on this device").color(MUTED).small());
+                    ui.horizontal(|ui| {
+                        if !self.library_ready && ui.button("Retry loading").clicked() {
+                            self.library_status = "Loading…".into();
+                            self.storage.load(Document::Blueprints);
+                        }
+                        if self.library_ready && self.library_status.starts_with("Local storage failed") && ui.button("Retry save").clicked() { self.persist_library(); }
+                        if ui.button("Back").clicked() { self.show_blueprints = false; }
+                    });
+                });
+            self.show_blueprints &= open;
+        }
+        if !self.captured && self.local.editing && !self.show_settings && !self.show_blueprints {
+            self.selection_panel(ctx);
+        }
+    }
+    fn selection_panel(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Selection")
+            .anchor(egui::Align2::LEFT_TOP, [24.0, 100.0]).collapsible(true).resizable(false).default_width(270.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (mode, name) in [(SelectionMode::Replace, "Replace"), (SelectionMode::Add, "Add"), (SelectionMode::Subtract, "Subtract")] {
+                        ui.selectable_value(&mut self.selection_mode, mode, name);
+                    }
+                });
+                ui.label(egui::RichText::new("Choose a mode, then drag in the world.").small());
+                ui.add_space(8.0);
+                let grid = self.grid as f32 / 8.0;
+                ui.horizontal(|ui| {
+                    ui.label(format!("Grid {grid} m"));
+                    if ui.small_button("−").clicked() { self.change_grid(false); }
+                    if ui.small_button("+").clicked() { self.change_grid(true); }
+                });
+                if let Some(mut selection) = self.selection.clone() {
+                    ui.label("Active volume size (grid cells)");
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        for axis in 0..3 {
+                            let mut count = (selection.max[axis] - selection.min[axis]) / self.grid;
+                            ui.label(["X", "Y", "Z"][axis]);
+                            if ui.add(egui::DragValue::new(&mut count).range(1..=1024).speed(1)).changed() {
+                                selection.max[axis] = selection.min[axis] + count * self.grid;
+                                changed = true;
+                            }
+                        }
+                    });
+                    if changed {
+                        if (0..3).all(|a| selection.max[a] <= [WORLD_MAX*8, WORLD_HEIGHT*8, WORLD_MAX*8][a]) {
+                            self.selection = Some(selection);
+                            self.selection_generation = self.selection_generation.wrapping_add(1);
+                            self.edit_queue.clear();
+                        } else { self.notify("Selection reaches the world boundary."); }
+                    }
+                }
+                let regions = self.selected_regions();
+                ui.label(format!("{} volumes · {:.3} m³", regions.boxes().len(), regions.volume() as f64 / 512.0));
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").clicked() { self.copy_selection(); }
+                    if ui.button("Blueprints").clicked() { self.show_blueprints = true; }
+                    if ui.button("Clear").clicked() { self.clear_selection(); }
+                });
+                ui.label(egui::RichText::new("Alt drag adds · Alt Shift drag subtracts\nRMB / Shift LMB extends in depth").small().color(MUTED));
+            });
+    }
+}

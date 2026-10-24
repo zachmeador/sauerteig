@@ -1,0 +1,14 @@
+[package]
+name = "sauerteig-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared editable world, geometry, movement, and wire protocol for Sauerteig"
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+earcutr = "0.4"
+
+[dev-dependencies]
+serde_json.workspace = true

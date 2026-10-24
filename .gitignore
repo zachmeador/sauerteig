@@ -1,0 +1,6 @@
+/target/
+/.tools/
+/.local/
+/web/dist/
+/.DS_Store
+

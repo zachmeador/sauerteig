@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#11161c" />
+    <meta name="description" content="Sauerteig multiplayer FPS and map editor." />
+    <title>Sauerteig</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main id="game-container" aria-label="Sauerteig multiplayer game"></main>
+
+    <section id="loading-panel" class="startup" aria-labelledby="game-title">
+      <div class="startup-card">
+        <h1 id="game-title">SAUERTEIG</h1>
+        <div class="status-row" role="status" aria-live="polite">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="loading-status">Loading…</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="error-panel" class="startup" aria-labelledby="error-title" hidden>
+      <div class="startup-card error-card" role="alert">
+        <h1 id="error-title">SAUERTEIG</h1>
+        <p class="error-label">STARTUP ERROR</p>
+        <p id="error-message" class="error-message"></p>
+        <button type="button" id="retry-button">Retry</button>
+      </div>
+    </section>
+
+    <noscript><p class="noscript-message">JavaScript and WebGPU required.</p></noscript>
+
+    <script type="module">
+      const loadingPanel = document.getElementById("loading-panel");
+      const loadingStatus = document.getElementById("loading-status");
+      const errorPanel = document.getElementById("error-panel");
+      const errorMessage = document.getElementById("error-message");
+      let failed = false;
+      let ready = false;
+
+      function showError(message) {
+        if (ready) {
+          console.error("Sauerteig:", message);
+          return;
+        }
+        if (failed) return;
+        failed = true;
+        loadingPanel.hidden = true;
+        errorMessage.textContent = message;
+        errorPanel.hidden = false;
+      }
+
+      function describeError(error) {
+        return error instanceof Error ? error.message : String(error ?? "Unknown error");
+      }
+
+      window.addEventListener("sauerteig-ready", () => {
+        if (failed) return;
+        ready = true;
+        loadingPanel.hidden = true;
+        const canvas = document.getElementById("game-canvas");
+        if (canvas) {
+          canvas.setAttribute("aria-label", "Sauerteig arena. Click to capture the mouse; press Escape to release it.");
+          canvas.setAttribute("tabindex", "0");
+          canvas.focus();
+        }
+      });
+
+      window.addEventListener("error", (event) => {
+        if (ready) {
+          console.error("Sauerteig runtime error:", event.error ?? event.message);
+          return;
+        }
+        showError(`Startup failed: ${event.message || "Reload to retry."}`);
+      });
+
+      window.addEventListener("unhandledrejection", (event) => {
+        if (ready) {
+          console.error("Sauerteig runtime promise rejection:", event.reason);
+          return;
+        }
+        showError(`Startup failed: ${describeError(event.reason)}`);
+      });
+
+      document.getElementById("retry-button").addEventListener("click", () => location.reload());
+
+      async function start() {
+        if (!window.isSecureContext) {
+          showError("WebGPU requires HTTPS or http://localhost:3000.");
+          return;
+        }
+        if (!navigator.gpu) {
+          showError("WebGPU unavailable. Enable browser hardware acceleration or use the native client.");
+          return;
+        }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) {
+          showError("No compatible graphics adapter. Check hardware acceleration and GPU drivers.");
+          return;
+        }
+        loadingStatus.textContent = "Loading…";
+        const { default: init } = await import("./pkg/sauerteig.js");
+        await init();
+        if (!failed && !loadingPanel.hidden) {
+          loadingStatus.textContent = "Starting…";
+        }
+      }
+
+      start().catch((error) => {
+        showError(`Loading failed: ${describeError(error)}`);
+      });
+    </script>
+  </body>
+</html>
