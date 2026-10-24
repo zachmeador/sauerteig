@@ -1361,6 +1361,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2676,8 +2678,10 @@ dependencies = [
  "env_logger",
  "ewebsock",
  "glam",
+ "image",
  "js-sys",
  "log",
+ "naga",
  "pollster",
  "rodio",
  "sauerteig-core",
@@ -2697,6 +2701,16 @@ version = "0.1.0"
 dependencies = [
  "earcutr",
  "glam",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sauerteig-import"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "sauerteig-core",
  "serde",
  "serde_json",
 ]

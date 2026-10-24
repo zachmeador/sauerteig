@@ -3,6 +3,8 @@ mod blueprints;
 mod editor;
 mod game;
 mod lighting;
+mod materials;
+mod props;
 mod regions;
 mod render;
 mod scene;

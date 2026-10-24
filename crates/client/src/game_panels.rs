@@ -264,7 +264,12 @@ impl Game {
                 });
             self.show_blueprints &= open;
         }
-        if !self.captured && self.local.editing && !self.show_settings && !self.show_blueprints {
+        if !self.captured
+            && self.local.editing
+            && !self.show_settings
+            && !self.show_blueprints
+            && !self.show_assets
+        {
             self.selection_panel(ctx);
         }
     }
@@ -315,5 +320,124 @@ impl Game {
                 });
                 ui.label(egui::RichText::new("Alt drag adds · Alt Shift drag subtracts\nRMB / Shift LMB extends in depth").small().color(MUTED));
             });
+    }
+}
+
+impl Game {
+    pub(super) fn asset_panel(
+        &mut self,
+        ctx: &egui::Context,
+        renderer: &Renderer,
+        window: &Window,
+    ) {
+        if !self.show_assets {
+            return;
+        }
+        if self.material_thumbnails.is_empty() {
+            self.material_thumbnails = renderer
+                .materials
+                .thumbnails
+                .iter()
+                .enumerate()
+                .map(|(i, image)| {
+                    ctx.load_texture(
+                        format!("material {i}"),
+                        image.clone(),
+                        egui::TextureOptions::LINEAR,
+                    )
+                })
+                .collect();
+        }
+        let mut open = true;
+        let mut resume = false;
+        egui::Window::new("Materials and props")
+            .open(&mut open)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(470.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height((ctx.screen_rect().height() - 160.0).max(200.0))
+                    .show(ui, |ui| {
+                        egui::Grid::new("material library")
+                            .num_columns(4)
+                            .spacing([12.0, 10.0])
+                            .show(ui, |ui| {
+                                for (i, name) in MATERIAL_NAMES.iter().enumerate() {
+                                    ui.vertical(|ui| {
+                                        let image = egui::Image::new((
+                                            self.material_thumbnails[i].id(),
+                                            egui::vec2(72.0, 72.0),
+                                        ));
+                                        if ui
+                                            .add(
+                                                egui::ImageButton::new(image)
+                                                    .selected(self.material as usize == i),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.material = i as u8;
+                                        }
+                                        ui.label(egui::RichText::new(*name).small());
+                                    });
+                                    if i % 4 == 3 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "Selected: {}",
+                                MATERIAL_NAMES[self.material as usize]
+                            ));
+                            if ui
+                                .add_enabled(
+                                    !self.selected_regions().is_empty()
+                                        && self.edit_queue.len() < 32,
+                                    egui::Button::new("Paint selection"),
+                                )
+                                .clicked()
+                            {
+                                self.edit_queue.push_back(EditIntent::Paint(self.material));
+                            }
+                        });
+                        ui.separator();
+                        ui.label("Props");
+                        for (kind, name) in [
+                            (ObjectKind::WallLamp, "Wall lamp"),
+                            (ObjectKind::HangingLamp, "Hanging lamp"),
+                            (ObjectKind::UtilityBox, "Utility box"),
+                            (ObjectKind::Pipe, "Pipe"),
+                            (ObjectKind::Rock, "Rock"),
+                            (ObjectKind::Tree, "Tree (prototype)"),
+                        ] {
+                            ui.selectable_value(&mut self.prop_kind, kind, name);
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "P places the selected prop. Wall lamps align to the aimed wall.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Props are decorative; use cube geometry for solid barriers.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                        ui.separator();
+                        if ui.button("Back to editor").clicked() {
+                            resume = true;
+                        }
+                    });
+            });
+        if !open || resume {
+            self.show_assets = false;
+        }
+        if resume {
+            self.capture(window);
+        }
     }
 }

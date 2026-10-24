@@ -39,10 +39,23 @@ pub fn closest_lights(objects: &[WorldObject], eye: Vec3) -> [Option<LocalLight>
         return [None; LOCAL_LIGHTS];
     }
     for object in objects {
-        if !matches!(object.kind, ObjectKind::Light) || !object.position.is_finite() {
+        if !matches!(
+            object.kind,
+            ObjectKind::Light | ObjectKind::WallLamp | ObjectKind::HangingLamp
+        ) || !object.position.is_finite()
+        {
             continue;
         }
-        let light = LocalLight::from_fixture(object.position);
+        let offset = match object.kind {
+            ObjectKind::WallLamp => Vec3::new(
+                object.rotation.sin() * 0.19,
+                LAMP_OFFSET,
+                object.rotation.cos() * 0.19,
+            ),
+            ObjectKind::HangingLamp => Vec3::Y * (-1.40 + LAMP_OFFSET),
+            _ => Vec3::ZERO,
+        };
+        let light = LocalLight::from_fixture(object.position + offset);
         let distance = light.position.distance_squared(eye);
         if let Some(slot) = nearby.iter().position(|entry| {
             entry.is_none_or(|(d, id, _)| {

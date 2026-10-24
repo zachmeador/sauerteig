@@ -18,14 +18,6 @@ use winit::{
 const PAPER: egui::Color32 = egui::Color32::from_rgb(214, 216, 211);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(164, 174, 169);
 const COPPER: egui::Color32 = egui::Color32::from_rgb(192, 135, 66);
-const MATERIAL_NAMES: [&str; 6] = [
-    "Concrete",
-    "Gunmetal",
-    "Rusted Steel",
-    "Worn Concrete",
-    "Hazard Paint",
-    "Amber Light",
-];
 
 #[derive(Default)]
 struct ModeState {
@@ -177,6 +169,9 @@ pub struct Game {
     show_help: bool,
     show_settings: bool,
     show_blueprints: bool,
+    show_assets: bool,
+    material_thumbnails: Vec<egui::TextureHandle>,
+    prop_kind: ObjectKind,
     preferences: Preferences,
     settings_ready: bool,
     library_ready: bool,
@@ -253,6 +248,9 @@ impl Game {
             show_help: false,
             show_settings: false,
             show_blueprints: false,
+            show_assets: false,
+            material_thumbnails: Vec::new(),
+            prop_kind: ObjectKind::UtilityBox,
             preferences: Preferences::default(),
             settings_ready: false,
             library_ready: false,
@@ -279,6 +277,7 @@ impl Game {
     pub fn close_text_panel(&mut self) {
         self.show_settings = false;
         self.show_blueprints = false;
+        self.show_assets = false;
     }
     pub fn eye(&self) -> Vec3 {
         self.local.eye() + self.camera_offset
@@ -670,11 +669,13 @@ impl Game {
                         self.wheel_remainder = 0.0;
                         return;
                     }
-                    if key == KeyCode::Escape && (self.show_settings || self.show_blueprints) {
+                    if key == KeyCode::Escape
+                        && (self.show_settings || self.show_blueprints || self.show_assets)
+                    {
                         self.close_text_panel();
                         return;
                     }
-                    if self.show_settings || self.show_blueprints {
+                    if self.show_settings || self.show_blueprints || self.show_assets {
                         return;
                     }
                     if ui_consumed && !self.captured {
@@ -691,6 +692,10 @@ impl Game {
                         KeyCode::F2 => {
                             self.release(window);
                             self.show_settings = true;
+                        }
+                        KeyCode::KeyT if self.local.editing => {
+                            self.release(window);
+                            self.show_assets = true;
                         }
                         KeyCode::KeyB if self.local.editing => {
                             self.release(window);
@@ -733,6 +738,8 @@ impl Game {
                         KeyCode::Digit4 => self.material = 3,
                         KeyCode::Digit5 => self.material = 4,
                         KeyCode::Digit6 => self.material = 5,
+                        KeyCode::Digit7 => self.material = 6,
+                        KeyCode::Digit8 => self.material = 7,
                         KeyCode::KeyC if self.local.editing => self.copy_selection(),
                         KeyCode::KeyV if self.local.editing => self.paste_selection(),
                         KeyCode::KeyR if self.local.editing => self.transform_clipboard(true),
@@ -747,7 +754,7 @@ impl Game {
                                 ClientMessage::Undo
                             });
                         }
-                        KeyCode::KeyP if self.local.editing => self.place(ObjectKind::Tree),
+                        KeyCode::KeyP if self.local.editing => self.place(self.prop_kind),
                         KeyCode::KeyL if self.local.editing => self.place(ObjectKind::Light),
                         KeyCode::KeyO if self.local.editing => self.place(ObjectKind::Spawn),
                         KeyCode::Delete | KeyCode::Backspace if self.local.editing => {
@@ -776,7 +783,11 @@ impl Game {
                     return;
                 }
                 if !self.captured {
-                    if !ui_consumed && !self.show_settings && !self.show_blueprints {
+                    if !ui_consumed
+                        && !self.show_settings
+                        && !self.show_blueprints
+                        && !self.show_assets
+                    {
                         self.capture(window);
                     }
                     return;
@@ -981,7 +992,8 @@ impl Game {
             return;
         }
         let intent = if self.keys.contains(&KeyCode::KeyY) {
-            self.material = (self.material as i32 + if up { 1 } else { -1 }).rem_euclid(6) as u8;
+            self.material = (self.material as i32 + if up { 1 } else { -1 })
+                .rem_euclid(MATERIAL_NAMES.len() as i32) as u8;
             EditIntent::Paint(self.material)
         } else if self.keys.contains(&KeyCode::KeyF) || self.corner.is_some() || self.edge.is_some()
         {
@@ -1150,27 +1162,52 @@ impl Game {
     }
     fn place(&mut self, kind: ObjectKind) {
         if let Some(hit) = &self.selected {
-            let position = hit.point
-                + Vec3::Y
-                    * if matches!(kind, ObjectKind::Light) {
-                        1.5
-                    } else {
-                        0.02
-                    };
+            let (position, rotation) = match kind {
+                ObjectKind::WallLamp if hit.normal.y.abs() < 0.7 => (
+                    hit.point + hit.normal * 0.02,
+                    hit.normal.x.atan2(hit.normal.z),
+                ),
+                ObjectKind::HangingLamp => (
+                    hit.point + Vec3::Y * if hit.normal.y > 0.5 { 2.0 } else { -0.02 },
+                    self.local.yaw,
+                ),
+                ObjectKind::Light => (hit.point + Vec3::Y * 1.5, self.local.yaw),
+                _ => (hit.point + Vec3::Y * 0.02, self.local.yaw),
+            };
             self.send(ClientMessage::PlaceObject {
                 kind,
                 position,
-                rotation: self.local.yaw,
+                rotation,
             });
         }
     }
     fn remove_object(&mut self) {
-        let eye = self.eye();
-        let dir = self.direction();
+        let (eye, dir) = self.edit_ray();
         let id = self
             .objects
             .iter()
             .filter_map(|o| {
+                let key = match o.kind {
+                    ObjectKind::WallLamp => Some("wall_lamp"),
+                    ObjectKind::HangingLamp => Some("hanging_lamp"),
+                    ObjectKind::UtilityBox => Some("utility_box"),
+                    ObjectKind::Pipe => Some("pipe"),
+                    ObjectKind::Rock => Some("rock"),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    return crate::props::ray_distance(
+                        key,
+                        o.position.to_array(),
+                        o.rotation,
+                        eye.to_array(),
+                        dir.to_array(),
+                    )
+                    .filter(|&distance| {
+                        distance <= 30.0 && self.world.raycast(eye, dir, distance).is_none()
+                    })
+                    .map(|distance| (o.id, distance));
+                }
                 let delta = o.position - eye;
                 let along = delta.dot(dir);
                 let radius = if matches!(o.kind, ObjectKind::Tree) {
@@ -1470,7 +1507,7 @@ impl Game {
                     "{:.0} fps / {:.1} ms / {} tris",
                     self.fps,
                     1000.0 / self.fps,
-                    renderer.triangles
+                    renderer.visible_triangles()
                 ),
                 mono(10.0),
                 MUTED,
@@ -1486,8 +1523,10 @@ impl Game {
                 egui::pos2(screen.right() - 24.0, 76.0),
                 egui::Align2::RIGHT_TOP,
                 format!(
-                    "edit CPU {:.2} ms / peak {:.2} ms",
-                    self.last_edit_ms, self.peak_edit_ms
+                    "edit CPU {:.2} ms / peak {:.2} ms / textures {:.1} MiB",
+                    self.last_edit_ms,
+                    self.peak_edit_ms,
+                    renderer.materials.texture_bytes as f32 / 1048576.0
                 ),
                 mono(10.0),
                 MUTED,
@@ -1557,7 +1596,7 @@ impl Game {
             painter.text(
                 egui::pos2(24.0, bottom),
                 egui::Align2::LEFT_BOTTOM,
-                "E play   B blueprints   U undo   F1 controls   F2 settings",
+                "E play   T assets   B blueprints   U undo   F1 controls",
                 mono(11.0),
                 MUTED,
             );
@@ -1618,7 +1657,7 @@ impl Game {
                                 "MMB           select a face corner",
                                 "Shift + MMB   select a face edge",
                                 "Y + wheel     change selected material",
-                                "1–6           choose material",
+                                "1–8           choose material",
                                 "U / Z         undo geometry",
                                 "Shift U / Z   redo geometry",
                                 "Alt + drag    add a selection volume",
@@ -1628,7 +1667,8 @@ impl Game {
                                 "F2            settings / scroll direction",
                                 "R             rotate clipboard 90° around Y",
                                 "M / Shift M   mirror clipboard X / Z",
-                                "P / L / O     place tree / light / spawn",
+                                "T             materials and props",
+                                "P / L / O     place chosen prop / light / spawn",
                                 "Delete        remove aimed object",
                                 "Ctrl/Cmd S    save",
                                 "Esc           release mouse",
@@ -1664,7 +1704,7 @@ impl Game {
                     }
                 });
         }
-        if !self.captured && !self.show_settings && !self.show_blueprints {
+        if !self.captured && !self.show_settings && !self.show_blueprints && !self.show_assets {
             egui::Area::new(egui::Id::new("enter"))
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
@@ -1693,6 +1733,9 @@ impl Game {
                                     if ui.button("Settings").clicked() {
                                         self.show_settings = true;
                                     }
+                                    if self.local.editing && ui.button("Assets").clicked() {
+                                        self.show_assets = true;
+                                    }
                                     if self.local.editing && ui.button("Blueprints").clicked() {
                                         self.show_blueprints = true;
                                     }
@@ -1714,6 +1757,7 @@ impl Game {
                         });
                 });
         }
+        self.asset_panel(ctx, renderer, window);
         self.local_panels(ctx, window);
     }
 }

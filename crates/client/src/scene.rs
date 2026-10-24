@@ -19,6 +19,8 @@ impl Geometry {
                 normal,
                 color,
                 emission,
+                uv: [0.0; 2],
+                material: u32::MAX,
             });
         }
         self.indices.extend([i, i + 1, i + 2]);
@@ -165,6 +167,11 @@ impl Geometry {
         for o in objects {
             match o.kind {
                 ObjectKind::Tree => mesh.tree(o),
+                ObjectKind::WallLamp
+                | ObjectKind::HangingLamp
+                | ObjectKind::UtilityBox
+                | ObjectKind::Pipe
+                | ObjectKind::Rock => {}
                 ObjectKind::Light => {
                     let r = Mat3::from_rotation_y(o.rotation);
                     let steel = [0.065, 0.075, 0.085];

@@ -1,0 +1,446 @@
+{
+  "schema": 1,
+  "license_url": "https://polyhaven.com/license",
+  "texture_size": 512,
+  "texture_packing": {
+    "albedo": "sRGB RGB + linear ambient occlusion alpha",
+    "normal_roughness": "OpenGL tangent-space XYZ encoded RGB + linear roughness alpha"
+  },
+  "assets": [
+    {
+      "key": "wall_lamp",
+      "source": "industrial_wall_lamp",
+      "url": "https://polyhaven.com/a/industrial_wall_lamp",
+      "authors": {
+        "Kuutti Siitonen": "All"
+      },
+      "license": "CC0-1.0",
+      "selected_node": "industrial_wall_lamp",
+      "scale": 1.0,
+      "source_triangles": 4446,
+      "bounds_min": [
+        -0.13672421872615814,
+        -0.21495330333709717,
+        1.702955643168025e-08
+      ],
+      "bounds_max": [
+        0.13673660159111023,
+        0.21495330333709717,
+        0.1403784602880478
+      ],
+      "near": {
+        "vertices": 2356,
+        "triangles": 2598,
+        "bytes": 125428,
+        "sha256": "0186e3bdd99b5d51238f533f0fc15d82c8a066bbd46c329c79b6906fb192666d"
+      },
+      "distant": {
+        "vertices": 922,
+        "triangles": 698,
+        "bytes": 45268,
+        "sha256": "dd3ca3fe5630aa95026a3c373ac77d20cf1ba28eb820112849d8311878ebd3c0"
+      },
+      "source_files": [
+        {
+          "file": "industrial_wall_lamp.gltf",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/1k/industrial_wall_lamp/industrial_wall_lamp_1k.gltf",
+          "sha256": "5a2c0d8bdb52fe168727f4200818ac0c2adbded32f0b9dc09cfe224249f9e266",
+          "bytes": 5800
+        },
+        {
+          "file": "textures/industrial_wall_lamp_emissive_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_emissive_1k.jpg",
+          "sha256": "cf80eeeb6fec87499fb8444f554eae62e471ad79f8906d6fd693d7fde53b012f",
+          "bytes": 62349
+        },
+        {
+          "file": "textures/industrial_wall_lamp_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_nor_gl_1k.jpg",
+          "sha256": "427bafa2f14d9f81a5949507d5d6915bfb4b70a8e5e5076a3a18c7de49b3d78b",
+          "bytes": 673018
+        },
+        {
+          "file": "textures/industrial_wall_lamp_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_diff_1k.jpg",
+          "sha256": "e0f824b7e639fceb7ca5b7b7f67a8168bc53db184b818770126167d16d424b2e",
+          "bytes": 669629
+        },
+        {
+          "file": "textures/industrial_wall_lamp_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_arm_1k.jpg",
+          "sha256": "70adef2921bfcf985f951f9f85fca8dbfb63dc84535613c3872684fea65ab025",
+          "bytes": 753080
+        },
+        {
+          "file": "textures/industrial_wall_lamp_glass_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_glass_nor_gl_1k.jpg",
+          "sha256": "73ce4f34d90aee29db9a5e301934c0642bf89136353d7e400f63db1c2f99f345",
+          "bytes": 585913
+        },
+        {
+          "file": "textures/industrial_wall_lamp_glass_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_glass_diff_1k.jpg",
+          "sha256": "215457a5d41ae5d999e94f4ea0f424ff769940e71e1449ce712f35687e33af67",
+          "bytes": 316099
+        },
+        {
+          "file": "textures/industrial_wall_lamp_glass_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/industrial_wall_lamp/industrial_wall_lamp_glass_arm_1k.jpg",
+          "sha256": "a3ba7f76ff395ada04a804b94f4f2f506bc994336189916d2a414173e2360069",
+          "bytes": 570850
+        },
+        {
+          "file": "industrial_wall_lamp.bin",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/4k/industrial_wall_lamp/industrial_wall_lamp.bin",
+          "sha256": "d0a6a08b5e2e83ff8d6eb61bb5daa74654b4ff8d9c634348c87f83dbda4837a2",
+          "bytes": 141492
+        }
+      ]
+    },
+    {
+      "key": "hanging_lamp",
+      "source": "hanging_industrial_lamp",
+      "url": "https://polyhaven.com/a/hanging_industrial_lamp",
+      "authors": {
+        "Kuutti Siitonen": "All"
+      },
+      "license": "CC0-1.0",
+      "selected_node": "hanging_industrial_lamp",
+      "scale": 1.0,
+      "source_triangles": 9530,
+      "bounds_min": [
+        -0.27480319142341614,
+        -1.3400129079818726,
+        -0.27480337023735046
+      ],
+      "bounds_max": [
+        0.2748033106327057,
+        0.015337205491960049,
+        0.2748030722141266
+      ],
+      "near": {
+        "vertices": 4000,
+        "triangles": 3486,
+        "bytes": 201844,
+        "sha256": "f7cd37161726b40df1e3bb604c3d7e16d2bc108836af8614944ea3dd8fac97e2"
+      },
+      "distant": {
+        "vertices": 1485,
+        "triangles": 1062,
+        "bytes": 72156,
+        "sha256": "3776494afb7c53d2f37cbf5b6cd3d83d23eb588e89f15d482f96849616f7502e"
+      },
+      "source_files": [
+        {
+          "file": "hanging_industrial_lamp.gltf",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/1k/hanging_industrial_lamp/hanging_industrial_lamp_1k.gltf",
+          "sha256": "97e31aac7c350bc40294e78f39f66d5aa998ac2703be1d09b5dab9ae7027876f",
+          "bytes": 5436
+        },
+        {
+          "file": "textures/hanging_industrial_lamp_emissive_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/hanging_industrial_lamp/hanging_industrial_lamp_emissive_1k.jpg",
+          "sha256": "ebf7fed3b0c1d6104d91b77195c7eb0e3da6927562ec4a612700b8afd7574099",
+          "bytes": 40173
+        },
+        {
+          "file": "textures/hanging_industrial_lamp_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/hanging_industrial_lamp/hanging_industrial_lamp_nor_gl_1k.jpg",
+          "sha256": "ef524876a1a4c5b6d7fb4c652d21e55474ee85b50b8896537fd60e82b288b5f0",
+          "bytes": 753861
+        },
+        {
+          "file": "textures/hanging_industrial_lamp_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/hanging_industrial_lamp/hanging_industrial_lamp_diff_1k.jpg",
+          "sha256": "22cafeccd4421495c860f8c522bb9e45eaa19fda6ec3a2365dcb5b1db66aad96",
+          "bytes": 708934
+        },
+        {
+          "file": "textures/hanging_industrial_lamp_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/hanging_industrial_lamp/hanging_industrial_lamp_arm_1k.jpg",
+          "sha256": "888d78437900b43874af5195694c7b867568c9a96ef528846ad7d001f9e096ae",
+          "bytes": 835394
+        },
+        {
+          "file": "textures/hanging_industrial_lamp_glass_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/hanging_industrial_lamp/hanging_industrial_lamp_glass_nor_gl_1k.jpg",
+          "sha256": "5393af7d78e85689cba7c7b198fafddcee540d3125ebd133799d56f19945d8bf",
+          "bytes": 555604
+        },
+        {
+          "file": "hanging_industrial_lamp.bin",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/4k/hanging_industrial_lamp/hanging_industrial_lamp.bin",
+          "sha256": "12e8293535e816f1e8bebc94e95da092599909d3c1b9b6cc7384d90307db06ca",
+          "bytes": 344252
+        }
+      ]
+    },
+    {
+      "key": "utility_box",
+      "source": "utility_box_01",
+      "url": "https://polyhaven.com/a/utility_box_01",
+      "authors": {
+        "James Ray Cock": "All"
+      },
+      "license": "CC0-1.0",
+      "selected_node": "utility_box_01_box",
+      "scale": 1.0,
+      "source_triangles": 4404,
+      "bounds_min": [
+        -0.2600001096725464,
+        0.0,
+        -0.21599999070167542
+      ],
+      "bounds_max": [
+        0.2600001096725464,
+        1.1203334331512451,
+        0.21599999070167542
+      ],
+      "near": {
+        "vertices": 1968,
+        "triangles": 2000,
+        "bytes": 102732,
+        "sha256": "837d97e45b323b0540a346e33298506e08bcb3fecfa739009abb5c90d2febe3e"
+      },
+      "distant": {
+        "vertices": 534,
+        "triangles": 465,
+        "bytes": 26952,
+        "sha256": "fcb4781379811bde82e46c3c4932994f4a5bdf3c148efb4263ee836a5732492e"
+      },
+      "source_files": [
+        {
+          "file": "utility_box_01.gltf",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/1k/utility_box_01/utility_box_01_1k.gltf",
+          "sha256": "5b9f8c45f2640c9dd831dc3450529e45b24c987208ddcf73010fe717ce8c454e",
+          "bytes": 2766
+        },
+        {
+          "file": "textures/utility_box_01_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/utility_box_01/utility_box_01_diff_1k.jpg",
+          "sha256": "6a703a4cdf20c3fc3d0400fa815e5a1834836c96c207bdb57ba9e4a5db3a5532",
+          "bytes": 558681
+        },
+        {
+          "file": "textures/utility_box_01_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/utility_box_01/utility_box_01_nor_gl_1k.jpg",
+          "sha256": "1c4e377906c13e864c9c7ffbd31a7d86075f28b948bf54872d6ad3ab38a08124",
+          "bytes": 557001
+        },
+        {
+          "file": "textures/utility_box_01_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/utility_box_01/utility_box_01_arm_1k.jpg",
+          "sha256": "e65428774e94b6a8aeb7a23802e0af8f1568952ea79e21a7a3475b957e34956b",
+          "bytes": 716061
+        },
+        {
+          "file": "utility_box_01.bin",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/8k/utility_box_01/utility_box_01.bin",
+          "sha256": "e4249eb754d7802154eed36bb12070dc24c90fc331f355d60ef7570d61fc0f5c",
+          "bytes": 142552
+        }
+      ]
+    },
+    {
+      "key": "pipe",
+      "source": "modular_industrial_pipes_01",
+      "url": "https://polyhaven.com/a/modular_industrial_pipes_01",
+      "authors": {
+        "Jorge Camacho": "All"
+      },
+      "license": "CC0-1.0",
+      "selected_node": "modular_industrial_pipes_01_pipe02",
+      "scale": 1.0,
+      "source_triangles": 648,
+      "bounds_min": [
+        -0.1035519540309906,
+        0.0,
+        -0.10316049307584763
+      ],
+      "bounds_max": [
+        0.1035519540309906,
+        1.9546396732330322,
+        0.10316049307584763
+      ],
+      "near": {
+        "vertices": 850,
+        "triangles": 648,
+        "bytes": 41788,
+        "sha256": "f6dea1c72bfc6ec8c63c36824801e9f7ce679a3bfc3904a7823e15177cd7dbd9"
+      },
+      "distant": {
+        "vertices": 236,
+        "triangles": 220,
+        "bytes": 12092,
+        "sha256": "2417e74cb254bce40da684d6a96c7f4bdb517033d31d6e2eb53478b2da82f646"
+      },
+      "source_files": [
+        {
+          "file": "modular_industrial_pipes_01.gltf",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_1k.gltf",
+          "sha256": "455d3a0fe95b7900a08cbebb23cfb2c341672fcb67ae7355d776e53cfa3d0688",
+          "bytes": 15014
+        },
+        {
+          "file": "textures/modular_industrial_pipes_01_group02_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_group02_arm_1k.jpg",
+          "sha256": "4c65dcb651a3d345517fa93ad7c6e48f2388f4e8bb347446f70317c16049867b",
+          "bytes": 898932
+        },
+        {
+          "file": "textures/modular_industrial_pipes_01_group01_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_group01_diff_1k.jpg",
+          "sha256": "c0233f66b18e3374dfbbb8c8078a41f6571a0809d3eb14dd9d3c332265cfde7b",
+          "bytes": 553576
+        },
+        {
+          "file": "textures/modular_industrial_pipes_01_group02_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_group02_nor_gl_1k.jpg",
+          "sha256": "84a43ca11a4f1ac84f7fc8336a4e9b7b333d30c13e540f3ff42e662dc6f91b53",
+          "bytes": 725187
+        },
+        {
+          "file": "modular_industrial_pipes_01.bin",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/8k/modular_industrial_pipes_01/modular_industrial_pipes_01.bin",
+          "sha256": "2e11e1a7dabd56b1e158364f48b0b388bf316fcab61a01274740db75dbafa448",
+          "bytes": 515160
+        },
+        {
+          "file": "textures/modular_industrial_pipes_01_group01_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_group01_nor_gl_1k.jpg",
+          "sha256": "ed4728fde567efe420e3a6e1bdc4238b26c2782218737c7e2de88eeca1e91fb2",
+          "bytes": 674568
+        },
+        {
+          "file": "textures/modular_industrial_pipes_01_group01_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_group01_arm_1k.jpg",
+          "sha256": "7fff7d4604491eeb7531ad5f7520517015c72ec7316d1e865d62f23f976dfed6",
+          "bytes": 860825
+        },
+        {
+          "file": "textures/modular_industrial_pipes_01_group02_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/modular_industrial_pipes_01/modular_industrial_pipes_01_group02_diff_1k.jpg",
+          "sha256": "ef8a75c402a8871903dcaa147b023d57c640d0de4c7a8acdfdee822861656a92",
+          "bytes": 580676
+        }
+      ]
+    },
+    {
+      "key": "rock",
+      "source": "rock_07",
+      "url": "https://polyhaven.com/a/rock_07",
+      "authors": {
+        "Jenelle van Heerden": "All"
+      },
+      "license": "CC0-1.0",
+      "selected_node": "rock_07",
+      "scale": 8.0,
+      "source_triangles": 14844,
+      "bounds_min": [
+        -0.6755276322364807,
+        0.0,
+        -1.2811079025268555
+      ],
+      "bounds_max": [
+        0.6755276322364807,
+        1.1497611999511719,
+        1.2811079025268555
+      ],
+      "near": {
+        "vertices": 1112,
+        "triangles": 1800,
+        "bytes": 66092,
+        "sha256": "c3abe9a9528a46975661a8ac56ddb1c8626eca4083b6fed7fac40a2c95a06276"
+      },
+      "distant": {
+        "vertices": 289,
+        "triangles": 400,
+        "bytes": 16372,
+        "sha256": "0b4d63315db0635f70dbcc786411483ccb2e163b778356b5f9aad8d378f319af"
+      },
+      "source_files": [
+        {
+          "file": "rock_07.gltf",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/1k/rock_07/rock_07_1k.gltf",
+          "sha256": "efcc2dcaa133ff8ad5c865dc2135772e8f5dbc83fa38db2ee2cf25382436b6e6",
+          "bytes": 2979
+        },
+        {
+          "file": "rock_07.bin",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/gltf/8k/rock_07/rock_07.bin",
+          "sha256": "e4a532a6d6cf4a08c288f501b790f32cba0528136a29959ce774c3cd39369e7e",
+          "bytes": 468936
+        },
+        {
+          "file": "textures/rock_07_arm_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/rock_07/rock_07_arm_1k.jpg",
+          "sha256": "1ed76e9a8542c76bdc6b7b018720ae1f52cd75d9f5ae719f613de3f5032cf4da",
+          "bytes": 309735
+        },
+        {
+          "file": "textures/rock_07_diff_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/rock_07/rock_07_diff_1k.jpg",
+          "sha256": "8ff1965aa1664cc4abcc0131c44ee2b97ab14d6e131d7a51429ff261eeb101c8",
+          "bytes": 635452
+        },
+        {
+          "file": "textures/rock_07_nor_gl_1k.jpg",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Models/jpg/1k/rock_07/rock_07_nor_gl_1k.jpg",
+          "sha256": "57cb2210951aeb376164fce5f7c65f03e5599def04873b56cad0f173c275d78d",
+          "bytes": 766986
+        }
+      ]
+    }
+  ],
+  "textures": [
+    {
+      "slot": 8,
+      "key": "08_wall_lamp",
+      "source_material": "industrial_wall_lamp",
+      "metallic": 0.0,
+      "emission": 0.0
+    },
+    {
+      "slot": 9,
+      "key": "09_wall_lamp_glass",
+      "source_material": "industrial_wall_lamp_glass",
+      "metallic": 0.0,
+      "emission": 0.8
+    },
+    {
+      "slot": 10,
+      "key": "10_hanging_lamp",
+      "source_material": "hanging_industrial_lamp",
+      "metallic": 0.2776,
+      "emission": 0.0
+    },
+    {
+      "slot": 11,
+      "key": "11_hanging_lamp_glass",
+      "source_material": "hanging_industrial_lamp_glass",
+      "metallic": 0.0,
+      "emission": 0.8
+    },
+    {
+      "slot": 12,
+      "key": "12_utility_box",
+      "source_material": "utility_box_01",
+      "metallic": 0.1328,
+      "emission": 0.0
+    },
+    {
+      "slot": 13,
+      "key": "13_pipe",
+      "source_material": "modular_industrial_pipes_01_group01",
+      "metallic": 0.5632,
+      "emission": 0.0
+    },
+    {
+      "slot": 14,
+      "key": "14_rock",
+      "source_material": "rock_07",
+      "metallic": 0.0,
+      "emission": 0.0
+    }
+  ]
+}

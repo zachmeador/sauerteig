@@ -25,8 +25,8 @@ four corresponding top corners. SHAPE_FACES defines outward quad winding for
 General shapes must have a valid oriented closed boundary with positive volume;
 folds and non-manifold pinches are rejected. Old height-field pinches retain
 their original representation and behavior.
-Cell::solid(material:u8)->Cell. MATERIAL_COLORS: [[f32;3];6] in this order:
-concrete, gunmetal, rusted steel, worn concrete, hazard paint, amber light (material5).
+Cell::solid(material:u8)->Cell. MATERIAL_COLORS: [[f32;3];8] in this order:
+concrete, gunmetal, rusted steel, worn concrete, hazard paint, amber light (material5), rock, earth. MATERIAL_NAMES mirrors these stable slots.
 CellEdit { pub pos:CellPos, pub cell:Option<Cell> }.
 World holds sparse 8-cube chunks; empty cells omitted from serialized snapshots.
 World::empty()->Self; World::arena()->Self;
@@ -44,7 +44,7 @@ World::raycast(origin:Vec3,direction:Vec3,max_distance:f32)->Option<RayHit>;
 RayHit { pub pos:CellPos, pub bounds:FineBox, pub face:u8, pub normal:Vec3,
          pub point:Vec3, pub distance:f32 }. face is the logical face even when its normal slopes.
 Mesh { pub vertices:Vec<Vertex>, pub indices:Vec<u32> };
-Vertex { pub position:[f32;3], pub normal:[f32;3], pub color:[f32;3] }.
+Vertex { pub position:[f32;3], pub normal:[f32;3], pub color:[f32;3], pub material:u8 }.
 Empty/internal full-solid faces are culled. General shapes retain some partially
 occluded triangles; opaque depth testing hides their covered portions. Rays
 reject internal union boundaries. Rendering, rays, and collision use the same
@@ -56,8 +56,10 @@ triangles.
 Fine geometry retains one-metre roots and allocates sparse fragments only when
 needed. Coordinates in FineBox and CellFragment origin/size are integer eighths.
 FineBox { min:[i32;3], max:[i32;3] } is half-open.
-CellFragment { bounds:FineBox, origin:[i32;3], size:u8, cell:Cell } clips an authored
-source cell (size1,2,4,8 eighths) to bounds. Source geometry remains unchanged,
+CellFragment { bounds:FineBox, origin:[i32;3], size:u32, cell:Cell } clips an authored
+source cell (power-of-two size1..65536 eighths) to bounds. The 8192-metre
+source limit supports imported octree leaves; editor creation grids remain unchanged.
+Checked source bounds and world-space collision tolerances preserve small clips. Source geometry remains unchanged,
 including triangle diagonals and old height-field pinches. Clip caps are
 triangulated exactly; cached boundaries serve meshes, rays, and support queries.
 RootEdit { pos:CellPos, fragments:Vec<CellFragment> } atomically replaces one root.
@@ -94,7 +96,7 @@ pub fn player_intersects_cell(player:&Player,pos:CellPos,cell:Cell)->bool.
 pub fn ray_player(origin:Vec3,direction:Vec3,player:&Player,max_distance:f32)->Option<f32>.
 
 WorldObject { pub id:u32, pub position:Vec3, pub kind:ObjectKind,
-pub rotation:f32 }. ObjectKind enum (serde snake_case): Tree, Light, Spawn.
+pub rotation:f32 }. ObjectKind enum (serde snake_case): Tree, Light, Spawn, WallLamp, HangingLamp, UtilityBox, Pipe, Rock. Props have no gameplay collision yet; lamp variants participate in dynamic lighting.
 pub fn arena_objects()->Vec<WorldObject>; industrial light fixtures and spawns.
 Objects are visual/decorative initially except Spawn used on respawn; trees
 do not claim detailed collider support. Shared placement/removal in client.

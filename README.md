@@ -140,7 +140,8 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Shape the selected corner | Wheel |
 | Shape all face corners without a corner/edge selection | F+wheel |
 | Cycle and apply material | Y+wheel |
-| Choose material | 1–6 |
+| Choose material | 1–8 |
+| Browse materials and props | T, or Esc → Assets |
 | Undo your latest geometry edit | U or Z |
 | Redo your latest undone geometry edit | Shift+U or Shift+Z |
 | Copy / paste selected volumes | C / V |
@@ -148,7 +149,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Settings, including scroll inversion | F2, or Esc → Settings |
 | Rotate the clipboard 90° around Y | R |
 | Mirror the clipboard along X / Z | M / Shift+M |
-| Place a tree / light / spawn | P / L / O |
+| Place selected prop / prototype light / spawn | P / L / O |
 | Remove an aimed object | Delete / Backspace |
 | Show controls / performance stats | F1 / F3 |
 | Save the shared world on the server | Ctrl+S or Cmd+S |
@@ -161,9 +162,17 @@ The grid ranges from 1/8 metre to 8 metres. The Escape selection panel also offe
 Replace/Add/Subtract modes and numeric X/Y/Z sizes measured in the current grid.
 Fine carving preserves the original shape of existing sloped and warped surfaces.
 
-Materials 1–6 are **Concrete**, **Gunmetal**, **Rusted Steel**, **Worn Concrete**,
-**Hazard Paint**, and **Amber Light**. Use Y+wheel to cycle and apply them to a
-selection or the aimed face.
+Materials 1–8 are **Concrete**, **Gunmetal**, **Rusted Steel**, **Worn Concrete**,
+**Hazard Paint**, **Amber Light**, **Rock**, and **Earth**. Use Y+wheel to cycle and
+apply them, or T to browse thumbnails and paint a persistent selection. Texture
+scale uses world coordinates, so subdividing a surface does not shrink its pattern.
+
+T also chooses a wall lamp, hanging lamp, utility box, pipe, rock, or the earlier
+prototype tree. P places the chosen prop. Wall lamps align to walls; hanging
+lamps mount to ceilings, or stand two metres above an aimed floor. Both lamps
+join the dynamic lighting budget. Props are decorative: use cube geometry for
+collision underneath large barriers. Props do not yet belong to blueprints or
+geometry undo history.
 
 Selections can contain several volumes: select the main building, then add its
 annex with Alt+drag. Overlaps count once. Subtract volumes with Alt+Shift+drag.
@@ -197,6 +206,8 @@ geometry through an active fighter is also rejected.
   and the shared message protocol. Both server and clients use it.
 - `crates/server` runs the shared simulation and validates movement inputs,
   combat, edits, and saves. It also serves the browser build.
+- `crates/importer` inspects legacy Cube 2 OGZ maps and converts explicitly selected
+  regions; see [the importer guide](crates/importer/README.md) for compatibility limits.
 - `crates/client` uses Rust, wgpu, winit, and egui for the native and WebAssembly
   clients. wgpu provides desktop GPU backends and browser WebGPU support.
 - `web` contains the browser loading/error screen. `scripts/build-web.sh`
@@ -214,6 +225,29 @@ shadow map and skips chunks outside its light volume. Editor guides, tracers,
 and the first-person weapon do not cast shadows. A small ambient fill keeps
 unlit areas readable; this is not bounced lighting or global illumination.
 
+## Materials and props
+
+The client embeds eight 512px material sets and five CC0 props. Color/AO and
+normal/roughness textures use shared arrays with linear-light color mipmaps,
+renormalized normal mipmaps, and anisotropic filtering. World and prop shaders
+use explicit material IDs. Existing six material slots retain their identities.
+Repeated props use GPU instancing, near/distant meshes, and local-light range
+culling. The five near meshes range from 648 to 3,486 triangles.
+
+All fifteen material layers use **40.0 MiB of texture storage including mipmaps**,
+excluding geometry, shadows, framebuffers and driver overhead. Cooked PNGs and
+prop meshes total about **14.1 MiB on disk**. These are allocation/file counts,
+not measured GPU performance or an ordinary-laptop FPS result.
+
+Sources, authors, licenses, modifications and hashes are kept in
+[the material manifest](assets/materials/manifest.json) and
+[the prop manifest](assets/props/manifest.json). Ordinary builds embed the cooked
+files without network requests. Optional conversion tools are documented in
+[the prop guide](assets/props/README.md); `scripts/cook-materials.py --offline`
+rebuilds terrain textures from its local source cache. Code remains MIT;
+these assets retain CC0. The larger [research shortlist](research/assets.md)
+contains candidates beyond this shipped set.
+
 ## Prototype boundaries
 
 This is an initial implementation of the loop, with deliberate limits:
@@ -229,8 +263,8 @@ This is an initial implementation of the loop, with deliberate limits:
 - One shared room supports up to 16 players. WebSocket networking establishes
   multiplayer behavior; it does not establish acceptable FPS responsiveness
   under WAN latency or packet loss.
-- Trees are procedural placeholders and decorative objects. There is no
-  imported asset library or detailed prop collision yet.
+- Trees remain procedural placeholders. The five imported props are decorative,
+  with selection bounds but no gameplay collision proxies yet.
 - Names are not accounts. Public hosting, moderation, and access control need
   further work before treating this as a public game service.
 - Rendering and edit performance have not yet been validated against a measured
@@ -238,11 +272,8 @@ This is an initial implementation of the loop, with deliberate limits:
 
 The intended art direction is moderately detailed, coherent, and efficient,
 with textured architecture and convincing foliage rather than a toy-like
-low-poly style. [Poly Haven](https://polyhaven.com/license) is a candidate CC0
-source. The [starter asset research](research/assets.md) shortlists 38 CC0
-materials and models, including two conditional tree conversions. No third-party
-assets have been imported. Each eventual import needs a source manifest and
-runtime optimization.
+low-poly style. The [starter asset research](research/assets.md) contains a
+wider shortlist, including two tree conversions that still need preparation.
 
 ## Development checks
 
@@ -254,8 +285,8 @@ cargo build --locked -p sauerteig-server -p sauerteig-client
 ./scripts/build-web.sh
 ```
 
-Local verification on October 24, 2026: **115 tests pass** across the client,
-core, and server. Native macOS and WebAssembly release builds succeed.
+Local verification on October 24, 2026: **135 tests pass** across the client,
+core, server, and importer. Native macOS and WebAssembly release builds succeed.
 
 Browser checks cover additive selection, volume sizing, saving and renaming a
 blueprint, folders, reload persistence, loading and placing a blueprint, undo,
@@ -276,12 +307,24 @@ exact fine geometry after a server restart. Server tests also exercise the
 16,384-root edit limit and bounded history. The live map was backed up and its
 geometry and objects preserved when upgrading the server.
 
+Current material/prop checks verified the picker and rendering in both the
+browser and native app, plus painting and placing a prop in a separate browser
+test room. The complete converted `test_weapon.ogz` was loaded in the browser.
+A second three-client test injects 80 ms delay in each direction while fighters
+fire and a builder changes new materials/props; clients converge, damage and
+respawn continue, and a fresh-server rejoin preserves the saved result.
+
+The legacy importer and its exact compatibility/appearance limits are documented
+in [crates/importer/README.md](crates/importer/README.md). The supplied archives
+stay local and are excluded from Git.
+
 These checks do not establish a measured graphics budget across integrated GPUs.
 Normal browser pointer lock, WAN behavior, and broader hardware playtesting
 remain open.
 
-GitHub Actions is configured to run these checks on Linux and upload the generated browser
-files; that hosted workflow has not run yet. Interactive validation should include two fighters and one builder in
+GitHub Actions runs these checks on Linux and uploads the generated browser
+files. The initial commit passed its hosted workflow; current local changes
+need their own hosted run after publication. Interactive validation should include two fighters and one builder in
 a mixed native/browser session: overlap edits, undo, reshape a route during a
 fight, save, and rejoin. Measure frame times and editing stalls as well as
 network behavior.

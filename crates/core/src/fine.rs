@@ -6,6 +6,9 @@ use std::collections::BTreeSet;
 
 pub const FINE_UNITS: i32 = 8;
 pub const MAX_ROOT_FRAGMENTS: usize = 512;
+/// Legacy octree leaves may author a large slope once and clip it into many
+/// one-metre roots. Bound the source to 8 km so coordinate math stays precise.
+pub const MAX_FRAGMENT_SOURCE_SIZE: u32 = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FineBox {
@@ -71,7 +74,7 @@ impl FineBox {
 pub struct CellFragment {
     pub bounds: FineBox,
     pub origin: [i32; 3],
-    pub size: u8,
+    pub size: u32,
     pub cell: Cell,
 }
 impl CellFragment {
@@ -86,7 +89,7 @@ impl CellFragment {
     pub fn source_bounds(&self) -> Option<FineBox> {
         let mut max = [0; 3];
         for (a, v) in max.iter_mut().enumerate() {
-            *v = self.origin[a].checked_add(self.size as i32)?;
+            *v = self.origin[a].checked_add(i32::try_from(self.size).ok()?)?;
         }
         Some(FineBox {
             min: self.origin,
@@ -94,7 +97,8 @@ impl CellFragment {
         })
     }
     pub fn is_valid(&self) -> bool {
-        [1, 2, 4, 8].contains(&self.size)
+        self.size.is_power_of_two()
+            && self.size <= MAX_FRAGMENT_SOURCE_SIZE
             && self
                 .source_bounds()
                 .is_some_and(|b| b.contains(self.bounds))
@@ -734,7 +738,7 @@ mod tests {
                     max: [1 + size, 1 + size, 1 + size],
                 },
                 origin: [1, 1, 1],
-                size: size as u8,
+                size: size as u32,
                 cell: Cell::solid(1),
             };
             world
@@ -1196,5 +1200,66 @@ mod tests {
         );
         assert!(!player.grounded);
         assert!(player.position.y < 1.125);
+    }
+    #[test]
+    fn maximum_legacy_source_retains_tiny_clips_and_world_space_collision() {
+        let height = Cell {
+            heights: [8, 7, 7, 8],
+            ..Cell::solid(0)
+        };
+        for cell in [
+            height,
+            Cell {
+                shape: Some(height.as_shape()),
+                ..Cell::solid(0)
+            },
+        ] {
+            let fragment = CellFragment {
+                bounds: FineBox {
+                    min: [0, 8, 0],
+                    max: [1, 9, 1],
+                },
+                origin: [-32768; 3],
+                size: MAX_FRAGMENT_SOURCE_SIZE,
+                cell,
+            };
+            assert!(fragment.is_valid());
+            let mut world = World::empty();
+            world
+                .apply_root_edits(&[RootEdit {
+                    pos: [0, 1, 0],
+                    fragments: vec![fragment.clone()],
+                }])
+                .unwrap();
+            assert_eq!(world.root_fragments([0, 1, 0]), vec![fragment]);
+            assert!(world.intersects_box(Vec3::new(0.02, 1.02, 0.02), Vec3::new(0.04, 1.04, 0.04)));
+            let hit = world
+                .raycast(Vec3::new(0.0625, 3.0, 0.0625), -Vec3::Y, 4.0)
+                .unwrap();
+            assert!((hit.point.y - 1.125).abs() < 1.0e-5);
+            let mut player = crate::Player::new(1, "legacy".into());
+            player.position = Vec3::new(0.0625, 1.5, 0.0625);
+            for _ in 0..60 {
+                crate::simulate_player(
+                    &world,
+                    &mut player,
+                    &crate::InputFrame::default(),
+                    crate::FIXED_DT,
+                );
+            }
+            assert!(player.grounded);
+            assert!((player.position.y - 1.125).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn oversized_or_overflowing_legacy_sources_are_rejected() {
+        let mut source = CellFragment::from_cell([0, 0, 0], Cell::solid(0));
+        source.size = MAX_FRAGMENT_SOURCE_SIZE * 2;
+        assert!(!source.is_valid());
+        source.size = 16;
+        source.origin = [i32::MAX; 3];
+        assert!(source.source_bounds().is_none());
+        assert!(!source.is_valid());
     }
 }

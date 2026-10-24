@@ -30,4 +30,7 @@ wasm-bindgen \
 cp web/index.html web/style.css web/dist/
 cp LICENSE web/dist/LICENSE.txt
 cp THIRD_PARTY_NOTICES.md web/dist/THIRD_PARTY_NOTICES.txt
+mkdir -p web/dist/asset-provenance
+cp assets/materials/manifest.json web/dist/asset-provenance/materials.json
+cp assets/props/manifest.json web/dist/asset-provenance/props.json
 echo "Browser build ready in web/dist. Start it with: cargo run -p sauerteig-server"

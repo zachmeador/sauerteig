@@ -1,6 +1,6 @@
 # Sauerteig starter assets
 
-Research checked 2026-10-24. No assets downloaded or imported; published specifications below are not local measurements.
+Research checked 2026-10-24. The first eight material slots (six photographic surfaces plus hazard/amber utility surfaces) and five props are now embedded in the client. See `assets/materials/manifest.json` and `assets/props/manifest.json` for the shipped subset, measured counts and provenance. The wider shortlist below remains research, not a claim that every candidate has been imported.
 
 Use a small, curated **Poly Haven** set: concrete, worn steel, rust, industrial lamps and utility equipment, with restrained textured vegetation outdoors. It fits the requested harsher industrial look and keeps licensing simple. Build the rooms, stairs, buttresses and large outdoor forms with the editor; use models for fixtures and recognizable details.
 

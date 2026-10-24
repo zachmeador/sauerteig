@@ -3,7 +3,7 @@ use crate::lighting::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use sauerteig_core::{ChunkKey, Mesh, World, WorldObject, MATERIAL_COLORS};
+use sauerteig_core::{ChunkKey, Mesh, ObjectKind, World, WorldObject};
 use std::{collections::BTreeMap, sync::Arc};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -15,11 +15,12 @@ pub struct GpuVertex {
     pub normal: [f32; 3],
     pub color: [f32; 3],
     pub emission: f32,
+    pub uv: [f32; 2],
+    pub material: u32,
 }
 impl GpuVertex {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRS: [wgpu::VertexAttribute; 4] =
-            wgpu::vertex_attr_array![0=>Float32x3, 1=>Float32x3, 2=>Float32x3, 3=>Float32];
+        const ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![0=>Float32x3, 1=>Float32x3, 2=>Float32x3, 3=>Float32, 4=>Float32x2, 5=>Uint32];
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Self>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -145,6 +146,9 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     shadow: wgpu::TextureView,
     camera_buffer: wgpu::Buffer,
+    pub materials: crate::materials::Materials,
+    identity_instance: wgpu::Buffer,
+    props: Vec<PropBatch>,
     camera_group: wgpu::BindGroup,
     shadow_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
@@ -341,10 +345,17 @@ impl Renderer {
                 },
             ],
         });
+        let materials = crate::materials::Materials::new(&device, &queue)?;
+        let props = load_props(&device)?;
+        let identity_instance = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("world identity transform"),
+            contents: bytemuck::cast_slice(&[[0.0f32; 4]]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         let shader = device.create_shader_module(wgpu::include_wgsl!("world.wgsl"));
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world pipeline layout"),
-            bind_group_layouts: &[&camera_layout, &shadow_layout],
+            bind_group_layouts: &[&camera_layout, &shadow_layout, &materials.layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -353,7 +364,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[GpuVertex::layout()],
+                buffers: &[GpuVertex::layout(), instance_layout()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -387,7 +398,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_shadow"),
-                buffers: &[GpuVertex::layout()],
+                buffers: &[GpuVertex::layout(), instance_layout()],
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -415,7 +426,7 @@ impl Renderer {
                 vertex: wgpu::VertexState {
                     module: &local_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[GpuVertex::layout()],
+                    buffers: &[GpuVertex::layout(), instance_layout()],
                     compilation_options: Default::default(),
                 },
                 fragment: None,
@@ -474,6 +485,9 @@ impl Renderer {
             depth,
             shadow,
             camera_buffer,
+            materials,
+            identity_instance,
+            props,
             camera_group,
             shadow_group,
             pipeline,
@@ -510,12 +524,10 @@ impl Renderer {
                 .map(|v| GpuVertex {
                     position: v.position,
                     normal: v.normal,
-                    color: v.color,
-                    emission: if v.color == MATERIAL_COLORS[5] {
-                        0.75
-                    } else {
-                        0.0
-                    },
+                    color: [1.0; 3],
+                    emission: 0.0,
+                    uv: crate::materials::world_uv(v.position, v.normal, v.material),
+                    material: v.material as u32,
                 })
                 .collect();
             if let Some(mesh) = GpuMesh::new(&self.device, &gpu, &indices) {
@@ -565,6 +577,7 @@ impl Renderer {
             local_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); LOCAL_LIGHTS],
         };
         let nearby = closest_lights(objects, eye);
+        self.prepare_props(objects, eye, &nearby);
         for (i, light) in nearby.iter().enumerate() {
             if let Some(light) = light {
                 let p = light.position;
@@ -622,6 +635,7 @@ impl Renderer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.camera_group, &[]);
+            pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             for mesh in self.chunks.values() {
                 mesh.draw(&mut pass);
             }
@@ -629,6 +643,7 @@ impl Renderer {
                 mesh.draw(&mut pass);
             }
             self.dynamic.draw_prefix(&mut pass, shadow_index_count);
+            self.draw_props(&mut pass, None);
         }
         // Eight broad fixture views, not six cubemap faces per light. Geometry
         // and moving actors update these maps on every frame, including edits.
@@ -653,6 +668,7 @@ impl Renderer {
             });
             pass.set_pipeline(&self.local_shadow_pipeline);
             pass.set_bind_group(0, &shadow.group, &[]);
+            pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             for (key, mesh) in &self.chunks {
                 if chunk_in_light(*key, light) {
                     mesh.draw(&mut pass);
@@ -662,6 +678,7 @@ impl Renderer {
                 mesh.draw(&mut pass);
             }
             self.dynamic.draw_prefix(&mut pass, shadow_index_count);
+            self.draw_props(&mut pass, Some(i));
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -696,6 +713,8 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_group, &[]);
             pass.set_bind_group(1, &self.shadow_group, &[]);
+            pass.set_bind_group(2, &self.materials.group, &[]);
+            pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             for mesh in self.chunks.values() {
                 mesh.draw(&mut pass);
             }
@@ -703,6 +722,7 @@ impl Renderer {
                 mesh.draw(&mut pass);
             }
             self.dynamic.draw(&mut pass);
+            self.draw_props(&mut pass, None);
         }
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -760,4 +780,181 @@ fn depth_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) ->
             view_formats: &[],
         })
         .create_view(&Default::default())
+}
+
+fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![6=>Float32x4];
+    wgpu::VertexBufferLayout {
+        array_stride: 16,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &ATTRS,
+    }
+}
+struct PropLod {
+    mesh: GpuMesh,
+    instances: wgpu::Buffer,
+    transforms: Vec<[f32; 4]>,
+    world_count: u32,
+    light_ranges: [(u32, u32); LOCAL_LIGHTS],
+}
+struct PropBatch {
+    kind: ObjectKind,
+    near: PropLod,
+    distant: PropLod,
+    lod_distance: f32,
+    bounds_center: Vec3,
+    bounds_radius: f32,
+}
+fn load_props(device: &wgpu::Device) -> Result<Vec<PropBatch>, String> {
+    crate::props::load()?
+        .into_iter()
+        .map(|asset| {
+            let kind = match asset.key {
+                "wall_lamp" => ObjectKind::WallLamp,
+                "hanging_lamp" => ObjectKind::HangingLamp,
+                "utility_box" => ObjectKind::UtilityBox,
+                "pipe" => ObjectKind::Pipe,
+                "rock" => ObjectKind::Rock,
+                key => return Err(format!("Unknown embedded prop: {key}")),
+            };
+            let lod = |mesh: crate::props::PropMesh| -> Result<PropLod, String> {
+                let vertices: Vec<_> = mesh
+                    .vertices
+                    .into_iter()
+                    .map(|v| GpuVertex {
+                        position: v.position,
+                        normal: v.normal,
+                        color: [1.0; 3],
+                        emission: v.emission,
+                        uv: v.uv,
+                        material: v.material,
+                    })
+                    .collect();
+                Ok(PropLod {
+                    mesh: GpuMesh::new(device, &vertices, &mesh.indices)
+                        .ok_or("Empty prop mesh")?,
+                    instances: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("prop instances"),
+                        size: 1024 * 16 * (LOCAL_LIGHTS as u64 + 1),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    transforms: Vec::with_capacity(1024 * (LOCAL_LIGHTS + 1)),
+                    world_count: 0,
+                    light_ranges: [(0, 0); LOCAL_LIGHTS],
+                })
+            };
+            log::debug!("Loaded prop {}", asset.name);
+            Ok(PropBatch {
+                kind,
+                near: lod(asset.near)?,
+                distant: lod(asset.distant)?,
+                lod_distance: asset.lod_distance,
+                bounds_center: (Vec3::from_array(asset.bounds_min)
+                    + Vec3::from_array(asset.bounds_max))
+                    * 0.5,
+                bounds_radius: Vec3::from_array(asset.bounds_min)
+                    .distance(Vec3::from_array(asset.bounds_max))
+                    * 0.5,
+            })
+        })
+        .collect()
+}
+impl Renderer {
+    pub fn visible_triangles(&self) -> usize {
+        self.triangles
+            + self
+                .props
+                .iter()
+                .map(|b| {
+                    (b.near.mesh.count as usize * b.near.world_count as usize
+                        + b.distant.mesh.count as usize * b.distant.world_count as usize)
+                        / 3
+                })
+                .sum::<usize>()
+    }
+    fn prepare_props(
+        &mut self,
+        objects: &[WorldObject],
+        eye: Vec3,
+        lights: &[Option<crate::lighting::LocalLight>; LOCAL_LIGHTS],
+    ) {
+        for batch in &mut self.props {
+            batch.near.transforms.clear();
+            batch.distant.transforms.clear();
+            for object in objects.iter().filter(|o| o.kind == batch.kind).take(1024) {
+                let distance = eye.distance_squared(object.position);
+                if distance > 180.0 * 180.0 {
+                    continue;
+                }
+                let lod = if distance < batch.lod_distance.powi(2) {
+                    &mut batch.near
+                } else {
+                    &mut batch.distant
+                };
+                lod.transforms.push([
+                    object.position.x,
+                    object.position.y,
+                    object.position.z,
+                    object.rotation,
+                ]);
+            }
+            for lod in [&mut batch.near, &mut batch.distant] {
+                lod.world_count = lod.transforms.len() as u32;
+                for (i, light) in lights.iter().enumerate() {
+                    let start = lod.transforms.len() as u32;
+                    if let Some(light) = light {
+                        for index in 0..lod.world_count as usize {
+                            let t = lod.transforms[index];
+                            let center = Vec3::new(t[0], t[1], t[2])
+                                + glam::Mat3::from_rotation_y(t[3]) * batch.bounds_center;
+                            if center.distance_squared(light.position)
+                                <= (LIGHT_RANGE + batch.bounds_radius).powi(2)
+                            {
+                                lod.transforms.push(t);
+                            }
+                        }
+                    }
+                    lod.light_ranges[i] = (start, lod.transforms.len() as u32);
+                }
+                if !lod.transforms.is_empty() {
+                    self.queue.write_buffer(
+                        &lod.instances,
+                        0,
+                        bytemuck::cast_slice(&lod.transforms),
+                    );
+                }
+            }
+        }
+    }
+    fn draw_props<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, light: Option<usize>) {
+        for batch in &self.props {
+            for lod in [&batch.near, &batch.distant] {
+                let (start, end) = light.map_or((0, lod.world_count), |i| lod.light_ranges[i]);
+                if start == end {
+                    continue;
+                }
+                pass.set_vertex_buffer(0, lod.mesh.vertex.slice(..));
+                pass.set_vertex_buffer(1, lod.instances.slice(..));
+                pass.set_index_buffer(lod.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..lod.mesh.count, 0, start..end);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod material_shader_tests {
+    #[test]
+    fn textured_instanced_world_and_shadow_shaders_validate() {
+        for shader in [include_str!("world.wgsl"), include_str!("shadow.wgsl")] {
+            let module = naga::front::wgsl::parse_str(shader).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
+    }
 }

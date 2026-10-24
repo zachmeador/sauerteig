@@ -24,3 +24,18 @@ OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
 TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 ```
+
+## Starter materials and props
+
+The photographic surfaces and five prop models are from Poly Haven, under
+[CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/), as described by
+[Poly Haven's asset license](https://polyhaven.com/license). Original authors,
+asset URLs, download checksums, modifications and cooked measurements are recorded
+in `assets/materials/manifest.json` and `assets/props/manifest.json`. Copies of
+these manifests ship in `asset-provenance/` in the browser build and in the
+native app's Resources. The authored hazard/amber utility surfaces are also
+released under CC0. Sauerteig's MIT code license does not replace those records.
+
+The optional offline conversion tools use Pillow, NumPy and meshoptimizer;
+these tools are not shipped as game dependencies. No source Blender scripts,
+legacy map configuration scripts, or third-party game engines run in the client.

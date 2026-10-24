@@ -536,7 +536,7 @@ fn filled(bounds: FineBox, size: u8, cell: Cell) -> Result<Vec<CellFragment>, Ed
                         max: std::array::from_fn(|a| (origin[a] + size as i32).min(bounds.max[a])),
                     },
                     origin,
-                    size,
+                    size: u32::from(size),
                     cell,
                 });
             }
@@ -1489,6 +1489,46 @@ mod tests {
                     .unwrap_err(),
                 EditError::NoPlaneIntersection
             );
+        }
+    }
+    #[test]
+    fn imported_large_source_survives_clipboard_serialization_transforms_and_paste() {
+        let ramp = Cell {
+            heights: [0, 8, 8, 0],
+            ..Cell::solid(0)
+        };
+        let mut world = World::empty();
+        let roots: Vec<_> = [[0, 0, 0], [1, 0, 0], [1, 1, 0]]
+            .into_iter()
+            .map(|pos| RootEdit {
+                pos,
+                fragments: vec![CellFragment {
+                    bounds: FineBox::root(pos),
+                    origin: [0; 3],
+                    size: 64,
+                    cell: ramp,
+                }],
+            })
+            .collect();
+        world.apply_root_edits(&roots).unwrap();
+        let selected = selection([0, 0, 0], [16, 16, 8], 0, -1, 8);
+        let clip = Clipboard::copy(&world, &selected).unwrap();
+        let mut clip: Clipboard =
+            serde_json::from_slice(&serde_json::to_vec(&clip).unwrap()).unwrap();
+        for _ in 0..4 {
+            clip.rotate_y().unwrap();
+        }
+        clip.mirror(0).unwrap();
+        clip.mirror(0).unwrap();
+        assert!(clip.fragments.iter().all(|f| f.size == 64));
+        let target = selection([32, 0, 0], [48, 16, 8], 0, -1, 8);
+        let plan = clip.plan_paste(&world, &target).unwrap();
+        apply(&mut world, &plan);
+        for x in [0.25, 0.75, 1.25, 1.75] {
+            let hit = world
+                .raycast(Vec3::new(x + 4.0, 4.0, 0.5), -Vec3::Y, 8.0)
+                .unwrap();
+            assert!((hit.point.y - x).abs() < 1e-5);
         }
     }
 }

@@ -149,8 +149,7 @@ impl World {
                             append_triangle(
                                 &mut mesh,
                                 triangle.points,
-                                MATERIAL_COLORS
-                                    [root.fragments[triangle.fragment].cell.material as usize],
+                                root.fragments[triangle.fragment].cell.material,
                             );
                         }
                         continue;
@@ -170,6 +169,7 @@ impl World {
                             position: position.to_array(),
                             normal,
                             color,
+                            material: cell.material,
                         }));
                         mesh.indices.extend([start, start + 1, start + 2]);
                     });
@@ -331,11 +331,22 @@ pub(crate) fn max_height(
     max_x: f32,
     max_z: f32,
 ) -> Option<f32> {
+    max_height_with_epsilon(cell, min_x, min_z, max_x, max_z, EPS)
+}
+
+fn max_height_with_epsilon(
+    cell: Cell,
+    min_x: f32,
+    min_z: f32,
+    max_x: f32,
+    max_z: f32,
+    epsilon: f32,
+) -> Option<f32> {
     let x0 = min_x.max(0.0);
     let x1 = max_x.min(1.0);
     let z0 = min_z.max(0.0);
     let z1 = max_z.min(1.0);
-    if x1 - x0 <= EPS || z1 - z0 <= EPS {
+    if x1 - x0 <= epsilon || z1 - z0 <= epsilon {
         return None;
     }
     let mut height = cell
@@ -751,14 +762,16 @@ pub(crate) fn cell_intersects_box_scaled(
     min: Vec3,
     max: Vec3,
 ) -> bool {
-    let min = (min - origin) / size + Vec3::splat(EPS);
-    let max = (max - origin) / size - Vec3::splat(EPS);
+    // Keep tolerance in world metres when an authored source spans many roots.
+    let epsilon = EPS / size;
+    let min = (min - origin) / size + Vec3::splat(epsilon);
+    let max = (max - origin) / size - Vec3::splat(epsilon);
     if min.cmpge(max).any() || max.cmple(Vec3::ZERO).any() || min.cmpge(Vec3::ONE).any() {
         return false;
     }
     let Some(shape) = cell.shape else {
-        return max_height(cell, min.x, min.z, max.x, max.z)
-            .is_some_and(|h| h > EPS && min.y < h && max.y > 0.0);
+        return max_height_with_epsilon(cell, min.x, min.z, max.x, max.z, epsilon)
+            .is_some_and(|h| h > epsilon && min.y < h && max.y > 0.0);
     };
     for (triangle, _) in shape_triangles(shape, Vec3::ZERO, 1.0)
         .into_iter()
@@ -1105,7 +1118,7 @@ mod shape_tests {
     }
 }
 
-fn append_triangle(mesh: &mut Mesh, triangle: [Vec3; 3], color: [f32; 3]) {
+fn append_triangle(mesh: &mut Mesh, triangle: [Vec3; 3], material: u8) {
     let cross = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
     if cross.length_squared() <= 1.0e-16 {
         return;
@@ -1115,7 +1128,8 @@ fn append_triangle(mesh: &mut Mesh, triangle: [Vec3; 3], color: [f32; 3]) {
     mesh.vertices.extend(triangle.map(|position| Vertex {
         position: position.to_array(),
         normal,
-        color,
+        color: MATERIAL_COLORS[material as usize],
+        material,
     }));
     mesh.indices.extend([start, start + 1, start + 2]);
 }

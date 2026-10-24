@@ -8,13 +8,26 @@ const CHUNK_VOLUME: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
 
 /// Linear colors: concrete, gunmetal, rusted steel, worn concrete, hazard paint,
 /// and amber light. These slots stay stable in saved maps and the editor.
-pub const MATERIAL_COLORS: [[f32; 3]; 6] = [
+pub const MATERIAL_COLORS: [[f32; 3]; 8] = [
     [0.23, 0.245, 0.25],
     [0.070, 0.085, 0.095],
     [0.29, 0.115, 0.045],
     [0.37, 0.355, 0.30],
     [0.39, 0.27, 0.07],
     [0.90, 0.43, 0.12],
+    [0.24, 0.235, 0.22],
+    [0.14, 0.12, 0.08],
+];
+
+pub const MATERIAL_NAMES: [&str; 8] = [
+    "Concrete",
+    "Gunmetal",
+    "Rusted Steel",
+    "Worn Concrete",
+    "Hazard Paint",
+    "Amber Light",
+    "Rock",
+    "Earth",
 ];
 
 /// Logical faces -X, +X, -Y, +Y, -Z, +Z, wound outward. A clear diagonal
@@ -141,6 +154,8 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    /// Stable material slot, independent of fallback/debug color.
+    pub material: u8,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -60,6 +60,11 @@ pub enum ObjectKind {
     Tree,
     Light,
     Spawn,
+    WallLamp,
+    HangingLamp,
+    UtilityBox,
+    Pipe,
+    Rock,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

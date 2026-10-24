@@ -83,7 +83,10 @@ fn invalid_set_does_not_erase_existing_cell() {
             shape: None,
         }),
     );
-    world.set([0, 0, 0], Some(Cell::solid(6)));
+    world.set(
+        [0, 0, 0],
+        Some(Cell::solid(sauerteig_core::MATERIAL_COLORS.len() as u8)),
+    );
     assert_eq!(world.get([0, 0, 0]), Some(Cell::solid(0)));
 }
 
