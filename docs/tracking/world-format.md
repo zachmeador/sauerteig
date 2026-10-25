@@ -26,8 +26,13 @@ does not require another format overhaul.
   yaw. Lights come first (color, intensity, radius, cone, direction); the same
   mechanism later serves sounds, particles, jump pads, teleporters, and pickups.
 - **Materials come from a library** rather than eight compiled-in entries, with
-  per-face texture offset, rotation, and scale. Worlds reference materials by
-  stable identifiers.
+  per-face texture offset, rotation (Sauerbraten's eight orientations), and scale.
+  Worlds reference materials by stable identifiers. Unlike Sauerbraten, alignment
+  survives paste, rotate, and mirror: those transforms compose the rotation and
+  shift the offset. One choice is still open: Sauerbraten projects along a face's
+  nominal axis, which matches imported maps but stretches on slopes, while
+  Sauerteig projects along the actual normal. See the
+  [Sauerbraten editor reference](../../research/sauerbraten-editor.md).
 - **Saves move to the compact encoding** chosen in
   [shared-sandbox](shared-sandbox.md) stage 2, compressed; JSON stays available
   for export and debugging.

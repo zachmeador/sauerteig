@@ -25,7 +25,7 @@ touch the same code.
 | [World format](world-format.md) | Active | Stage 1: movement styles in the simulation core. Then world settings, object properties, and a material library with texture alignment. |
 | [Renderer](renderer.md) | Active | Stage 1: HDR pipeline, bloom, anti-aliasing, smooth motion, GPU timing, and cached shadows. |
 | [Large worlds and performance](large-worlds.md) | Partial | Viewing distance, streaming, and traversal, once the first three tracks lay their foundations. |
-| [Editor feel](editor-feel.md) | Planned | Sauerbraten gesture parity and small editor fixes. |
+| [Editor feel](editor-feel.md) | Active | Stage 1: extrusion copies the faces behind, and Delete empties the selection. |
 | [Legacy map restoration](legacy-import.md) | Partial | Original textures, models, and lights once the world format and renderer support them. |
 | [Lighting](lighting.md) | Partial | Editable light properties from the world format and many real lights from renderer stage 2. |
 | [Game layer](game-layer.md) | Planned | Combat networking, weapons, items, and modes, after the sandbox core. |
