@@ -257,7 +257,8 @@ pub struct Game {
     pub local: Player,
     players: Vec<Player>,
     projectiles: Vec<Projectile>,
-    remote_positions: BTreeMap<u64, Vec3>,
+    local_motion: crate::motion::Motion,
+    remote_positions: BTreeMap<u64, crate::motion::Motion>,
     effects: Vec<(ShotEffect, f32)>,
     socket: Option<(ewebsock::WsSender, ewebsock::WsReceiver)>,
     pub connected: bool,
@@ -340,6 +341,7 @@ impl Game {
         Self {
             world: World::arena(),
             objects: arena_objects(),
+            local_motion: crate::motion::Motion::new(local.position, local.yaw),
             local,
             players: vec![],
             projectiles: vec![],
@@ -423,8 +425,13 @@ impl Game {
         self.show_blueprints = false;
         self.show_assets = false;
     }
+    pub fn render_settings(&self) -> crate::render::settings::RenderSettings {
+        self.preferences.render
+    }
     pub fn eye(&self) -> Vec3 {
-        self.local.eye() + self.camera_offset
+        self.local_motion.position(self.accumulator / FIXED_DT)
+            + (self.local.eye() - self.local.position)
+            + self.camera_offset
     }
     pub fn direction(&self) -> Vec3 {
         forward(self.local.yaw, self.local.pitch)
@@ -574,6 +581,7 @@ impl Game {
                 _ => {}
             }
         }
+        self.local_motion.correct(self.local.position);
         self.accumulator = (self.accumulator + dt).min(FIXED_DT * 6.0);
         while take_input_tick(&mut self.accumulator, self.pending.len()) {
             if self.connected {
@@ -600,28 +608,27 @@ impl Game {
                     weapon: self.weapon,
                 };
                 simulate_player(&self.world, &mut self.local, &input, FIXED_DT);
+                self.local_motion.tick(self.local.position, self.local.yaw);
                 self.pending.push_back(input);
                 self.send(ClientMessage::Input { input });
             }
+            for player in &self.players {
+                self.remote_positions
+                    .entry(player.id)
+                    .or_insert_with(|| crate::motion::Motion::new(player.position, player.yaw))
+                    .remote_tick(player.position, player.yaw, FIXED_DT);
+            }
         }
+        self.remote_positions
+            .retain(|id, _| self.players.iter().any(|p| p.id == *id));
         self.camera_offset *= (-dt * 18.0).exp();
         self.update_selection();
         self.process_edit_queue();
         self.effects.retain(|(_, until)| *until > self.time);
         self.hit_flash = (self.hit_flash - dt).max(0.0);
         self.damage_flash = (self.damage_flash - dt).max(0.0);
-        for player in &self.players {
-            let position = self
-                .remote_positions
-                .entry(player.id)
-                .or_insert(player.position);
-            if position.distance(player.position) > 5.0 {
-                *position = player.position;
-            } else {
-                *position = position.lerp(player.position, 1.0 - (-dt * 18.0).exp());
-            }
-        }
     }
+
     fn receive(&mut self, message: ServerMessage, renderer: &mut Renderer) {
         match message {
             ServerMessage::Welcome {
@@ -1576,7 +1583,8 @@ impl Game {
             if player.id != self.local.id {
                 let mut p = player.clone();
                 if let Some(position) = self.remote_positions.get(&p.id) {
-                    p.position = *position;
+                    p.position = position.position(self.accumulator / FIXED_DT);
+                    p.yaw = position.yaw(self.accumulator / FIXED_DT);
                 }
                 mesh.player(&p, self.time);
             }
@@ -1616,7 +1624,8 @@ impl Game {
             if player.id != self.local.id && player.editing {
                 let mut p = player.clone();
                 if let Some(position) = self.remote_positions.get(&p.id) {
-                    p.position = *position;
+                    p.position = position.position(self.accumulator / FIXED_DT);
+                    p.yaw = position.yaw(self.accumulator / FIXED_DT);
                 }
                 mesh.player_guide(&p);
             }
@@ -1903,6 +1912,36 @@ impl Game {
                     self.last_edit_ms,
                     self.peak_edit_ms,
                     renderer.materials.texture_bytes as f32 / 1048576.0
+                ),
+                mono(10.0),
+                MUTED,
+            );
+            let gpu = match renderer.gpu_times() {
+                None => "GPU timing unavailable on this adapter".to_owned(),
+                Some(times) if times.is_empty() => "GPU timing pending".to_owned(),
+                Some(times) => times
+                    .iter()
+                    .map(|(name, ms)| format!("{name}: {ms:.2} ms"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            painter.text(
+                egui::pos2(screen.right() - 24.0, 92.0),
+                egui::Align2::RIGHT_TOP,
+                gpu,
+                mono(10.0),
+                MUTED,
+            );
+            painter.text(
+                egui::pos2(
+                    screen.right() - 24.0,
+                    108.0 + renderer.gpu_times().map_or(1, |t| t.len().max(1)) as f32 * 12.0,
+                ),
+                egui::Align2::RIGHT_TOP,
+                format!(
+                    "{} / static shadows updated: {}",
+                    renderer.render_description(),
+                    renderer.shadow_updates
                 ),
                 mono(10.0),
                 MUTED,

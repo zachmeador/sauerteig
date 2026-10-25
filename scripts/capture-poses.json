@@ -1,0 +1,11 @@
+[
+  {"name":"arena-yard","world":"arena","eye":[16,9,19],"look_at":[0,3,0],"time":2},
+  {"name":"arena-shadow","world":"arena","eye":[-18,2.6,10],"look_at":[-18,4,-10],"time":2},
+  {"name":"materials-water","world":"materials","eye":[-9,6,10],"look_at":[-3,2,3],"time":2},
+  {"name":"materials-underwater","world":"materials","eye":[-4,2,5],"look_at":[-2,2,0],"time":2},
+  {"name":"materials-glass","world":"materials","eye":[7,3,7],"look_at":[0,3,-2],"time":2},
+  {"name":"materials-lamp-shadow","world":"materials","eye":[0,3,5],"look_at":[0,4,-2],"time":2,"guides":true},
+  {"name":"imported-spawn","world":".local/the_cube1m.json","eye":[102.5,14.6,32],"look_at":[0,26,32],"time":2},
+  {"name":"imported-overlook","world":".local/the_cube1m.json","eye":[-40,72,70],"look_at":[-15,25,32],"time":2},
+  {"name":"imported-water","world":".local/the_cube1m.json","eye":[-42,21,8],"look_at":[-25,21,20],"time":2}
+]

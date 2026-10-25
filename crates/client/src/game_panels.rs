@@ -1,4 +1,5 @@
 use super::*;
+use crate::render::settings::Antialiasing;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
@@ -64,6 +65,7 @@ impl Game {
                     {
                         Ok(preferences) => {
                             self.preferences = preferences.unwrap_or_default();
+                            self.preferences.render = self.preferences.render.normalized();
                             self.settings_ready = true;
                             self.settings_status = "Saved locally".into();
                         }
@@ -213,6 +215,35 @@ impl Game {
                             "Wheel down adds geometry; wheel up removes it."
                         });
                         ui.label("Also reverses grid, shaping, and material wheel controls.");
+                        ui.separator();
+                        let before = self.preferences.render;
+                        let render = &mut self.preferences.render;
+                        egui::ComboBox::from_label("Anti-aliasing")
+                            .selected_text(match render.msaa {
+                                Antialiasing::Auto => "Auto",
+                                Antialiasing::On => "4× MSAA",
+                                Antialiasing::Off => "Off",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut render.msaa,
+                                    Antialiasing::Auto,
+                                    "Auto (off above 1440p)",
+                                );
+                                ui.selectable_value(&mut render.msaa, Antialiasing::On, "4× MSAA");
+                                ui.selectable_value(&mut render.msaa, Antialiasing::Off, "Off");
+                            });
+                        ui.checkbox(&mut render.vsync, "Vsync");
+                        ui.add(
+                            egui::Slider::new(&mut render.scale, 0.5..=1.0).text("Render scale"),
+                        );
+                        ui.add(egui::Slider::new(&mut render.bloom, 0.0..=0.2).text("Bloom"));
+                        ui.add(
+                            egui::Slider::new(&mut render.exposure, 0.25..=4.0).text("Exposure"),
+                        );
+                        if *render != before {
+                            self.persist_settings();
+                        }
                     });
                     ui.separator();
                     ui.label(

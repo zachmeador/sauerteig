@@ -1,18 +1,3 @@
-struct Camera {
-    view_proj: mat4x4<f32>,
-    light_view_proj: mat4x4<f32>,
-    eye_time: vec4<f32>,
-    sun: vec4<f32>,
-    fog: vec4<f32>,
-    points: array<vec4<f32>, 8>,
-    point_colors: array<vec4<f32>, 8>,
-    local_view_proj: array<mat4x4<f32>, 8>,
-};
-@group(0) @binding(0) var<uniform> camera: Camera;
-@group(1) @binding(0) var shadow_map: texture_depth_2d;
-@group(1) @binding(1) var shadow_sampler: sampler_comparison;
-@group(1) @binding(2) var fixture_shadows: texture_depth_2d_array;
-
 @group(2) @binding(0) var albedo_map: texture_2d_array<f32>;
 @group(2) @binding(1) var normal_map: texture_2d_array<f32>;
 @group(2) @binding(2) var material_sampler: sampler;
@@ -38,10 +23,6 @@ struct VertexOutput {
     @location(5) uv: vec2<f32>,
     @location(6) @interpolate(flat) material: u32,
 };
-fn rotate_y(p: vec3<f32>, yaw: f32) -> vec3<f32> {
-    let c = cos(yaw); let s = sin(yaw);
-    return vec3<f32>(c*p.x + s*p.z, p.y, -s*p.x + c*p.z);
-}
 @vertex fn vs_main(v: VertexInput) -> VertexOutput {
     let position = rotate_y(v.position,v.instance.w) + v.instance.xyz;
     let normal = rotate_y(v.normal,v.instance.w);
@@ -60,45 +41,6 @@ fn rotate_y(p: vec3<f32>, yaw: f32) -> vec3<f32> {
 }
 @vertex fn vs_shadow(v: VertexInput) -> @builtin(position) vec4<f32> {
     return camera.light_view_proj * vec4<f32>(rotate_y(v.position,v.instance.w) + v.instance.xyz, 1.0);
-}
-// Depth changes across a sloping receiver. Comparing every PCF tap against
-// the center depth stripes the surface; project its tangent plane instead.
-fn depth_gradient(matrix: mat4x4<f32>, clip: vec4<f32>, normal: vec3<f32>) -> vec2<f32> {
-    let axis = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
-    let tangent = normalize(cross(normal, axis));
-    let bitangent = cross(normal, tangent);
-    let a = matrix * vec4<f32>(tangent, 0.0);
-    let b = matrix * vec4<f32>(bitangent, 0.0);
-    let ndc = clip.xyz / clip.w;
-    let da = (a.xyz - ndc * a.w) / clip.w;
-    let db = (b.xyz - ndc * b.w) / clip.w;
-    let ua = da.xy * vec2<f32>(0.5, -0.5);
-    let ub = db.xy * vec2<f32>(0.5, -0.5);
-    let det = ua.x * ub.y - ua.y * ub.x;
-    if (abs(det) < 0.00000001) { return vec2<f32>(0.0); }
-    return vec2<f32>(da.z * ub.y - db.z * ua.y, ua.x * db.z - ub.x * da.z) / det;
-}
-fn fixture_visibility(index: i32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
-    let clip = camera.local_view_proj[index] * vec4<f32>(position + normal * 0.015, 1.0);
-    if (clip.w <= 0.0) { return 0.0; }
-    let ndc = clip.xyz / clip.w;
-    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    if (any(uv <= vec2<f32>(0.0)) || any(uv >= vec2<f32>(1.0)) || ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 0.0;
-    }
-    let texel = 1.0 / vec2<f32>(textureDimensions(fixture_shadows));
-    let gradient = depth_gradient(camera.local_view_proj[index], clip, normal);
-    // Linear filtering compares four neighboring texels at each tap.
-    let bias = 0.00004 + dot(abs(gradient), texel) * 0.5;
-    var sum = 0.0;
-    for (var x = -1; x <= 1; x += 1) {
-        for (var y = -1; y <= 1; y += 1) {
-            let offset = vec2<f32>(f32(x), f32(y)) * texel;
-            sum += textureSampleCompareLevel(fixture_shadows, shadow_sampler,
-                uv + offset, index, ndc.z + dot(gradient, offset) - bias);
-        }
-    }
-    return sum / 9.0;
 }
 @fragment fn fs_main(v: VertexOutput) -> @location(0) vec4<f32> {
     let geometric_normal = normalize(v.normal);
@@ -155,33 +97,14 @@ fn fixture_visibility(index: i32, position: vec3<f32>, normal: vec3<f32>) -> f32
     var lit = color * (ambient * ao + vec3<f32>(0.85, 0.88, 0.90) * max(dot(n, sun), 0.0) * visibility);
     for (var i = 0; i < 8; i += 1) {
         if (camera.points[i].w <= 0.0) { continue; }
-        let delta = camera.points[i].xyz - v.position;
-        let d2 = max(dot(delta, delta), 0.1);
-        let to_light = delta * inverseSqrt(d2);
-        // Broad downward fixture cone: 120 degrees, with a soft inner edge.
-        // No unshadowed spill outside its projection or through nearby walls.
-        let cone = smoothstep(0.5, 0.65, to_light.y);
-        let ndotl = max(dot(n, to_light), 0.0);
-        let range = camera.point_colors[i].w;
-        let falloff = max(1.0 - d2 / (range * range), 0.0);
-        if (cone <= 0.0 || ndotl <= 0.0 || falloff <= 0.0) { continue; }
-        let attenuation = camera.points[i].w * falloff * falloff / (1.0 + d2);
-        lit += color * camera.point_colors[i].rgb * attenuation * ndotl * cone * fixture_visibility(i, v.position, geometric_normal);
+        let light = local_attenuation(i, v.position);
+        let ndotl = max(dot(n, light.xyz), 0.0);
+        if (light.w <= 0.0 || ndotl <= 0.0) { continue; }
+        lit += color * camera.point_colors[i].rgb * light.w * ndotl * fixture_visibility(i, v.position, geometric_normal);
     }
     let view = normalize(camera.eye_time.xyz - v.position);
     let half_vec = normalize(sun + view);
     lit += specular * pow(max(dot(n, half_vec), 0.0), roughness_power) * visibility * max(dot(n, sun), 0.0);
     lit = mix(lit, color * 1.8, clamp(emission, 0.0, 1.0));
-    let distance = length(camera.eye_time.xyz - v.position);
-    let fog_amount = 1.0 - exp(-distance * distance * camera.fog.w);
-    lit = mix(lit, camera.fog.rgb, clamp(fog_amount, 0.0, 0.85));
-    // Lighting stays linear through tone mapping. An unorm surface needs the
-    // display transfer here; an sRGB fallback surface performs it on write.
-    var output = lit / (lit + vec3<f32>(0.82));
-    if (camera.sun.w > 0.5) {
-        let linear = max(output, vec3<f32>(0.0));
-        output = select(1.055 * pow(linear, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
-            linear * 12.92, linear <= vec3<f32>(0.0031308));
-    }
-    return vec4<f32>(output, 1.0);
+    return vec4<f32>(apply_fog(lit, v.position), 1.0);
 }

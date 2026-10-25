@@ -11,71 +11,61 @@ assumed.
 
 ## Current behavior
 
-The 3D scene renders straight to the swapchain, with tonemapping and display
-encoding inside each shader. There is no HDR target, post-processing, or
-anti-aliasing. Lighting is one sun plus the eight nearest light nodes, all the
-same warm downward 12 m cone ([lighting](lighting.md)), and all nine shadow maps
-re-render every frame. The opaque world draws without back-face culling. Sun
-direction, fog, field of view, and the 180 m far plane are constants. The camera
-follows the 60 Hz simulation without interpolation, so motion steps visibly on
-faster displays such as this Mac's 144 Hz monitor. F3 reports CPU timings only.
+- **Stage 1 is in place.** The scene renders in linear HDR with bloom, filmic
+  tonemapping, Auto 4× MSAA, render scaling, cached static shadows, motion
+  interpolation between fixed steps, and per-pass GPU timings in F3.
+- **Lighting is still limited.** It is one sun plus the eight nearest light
+  nodes, all with the same fixed warm downward 12 m cone ([lighting](lighting.md)).
+- **Still constants:** sun direction, fog, field of view, and the 180 m far
+  plane.
 
 ## Stage 1: render foundation
 
-State: active on branch `render-foundation`.
+State: merged on 2026-10-25. The maintainer has not yet checked smoothness and
+look on the 144 Hz 4K monitor, natively or in the browser.
 
-Decisions:
+- **Tools.**
+  - The `capture` binary renders fixed camera poses headlessly to PNG with the
+    real renderer, using `scripts/capture-poses.json`.
+  - `scripts/profile-browser.mjs` measures the browser client in Playwright's
+    Chromium.
+- **HDR pipeline.**
+  - The scene renders to an `Rgba16Float` target.
+  - Post-processing applies ACES-fitted tonemapping and five-level bloom
+    (strength 0.06).
+  - Render scale (0.5–1), exposure, bloom, and vsync are saved settings. egui
+    draws at output resolution.
+- **Anti-aliasing defaults to Auto.**
+  - 4× MSAA while the scene has at most 2560×1440 pixels, none above. This was
+    added at merge after the 4K measurements below.
+  - On and Off override it.
+- **Shared shader code.** One WGSL module is assembled into each shader, and all
+  five validate with Naga.
+- **Cached shadows.**
+  - The sun window (192 m, moving in 6 m steps) and local lights keep
+    static-geometry shadow caches.
+  - Any geometry or object rebuild invalidates them.
+  - Moving actors are drawn over a copy each frame.
+- **Back-face culling** on opaque terrain.
+  - Terrain falls back to two-sided drawing when the camera is inside geometry.
+  - Objects, props, actors, guides, and volumes are always two-sided.
+- **Smooth motion.**
+  - The local player and other players are interpolated between 60 Hz steps;
+    mouse look stays per-frame.
+  - The surface asks for the lowest frame latency.
+  - With vsync off, presentation prefers Mailbox, then Immediate.
+- **GPU timing.** F3 shows per-pass GPU timings from timestamp queries where the
+  adapter supports them.
 
-- **Capture tool first.** Add a native headless capture mode that loads a world
-  file, renders a list of fixed camera poses to PNG at a chosen resolution, and
-  exits. Capture the current renderer before changing it and reuse the same
-  poses afterwards. Cover the default arena, an imported map, underwater views,
-  glass, emissive lamps, and shadowed areas.
-- **HDR scene target.** Render the 3D scene to an offscreen `Rgba16Float` target
-  with its own depth buffer. World, volume, and sky shaders output linear
-  radiance only. One post pass applies exposure, a filmic tonemapper, and display
-  encoding; egui draws afterwards on the swapchain.
-- **Bloom** from the HDR target with a downsample and upsample chain, subtle by
-  default, with a setting.
-- **Anti-aliasing:** 4× MSAA on the scene where supported, resolved before post,
-  with a setting to turn it off.
-- **Render scale** setting for the 3D scene, for 4K displays and integrated GPUs,
-  upscaled in the post pass.
-- **Shared shader code:** one WGSL source for camera and light structures and the
-  lighting functions, assembled into each shader at load time instead of copied.
-- **Smooth motion:** draw the local player and other players interpolated between
-  simulation steps using the accumulator remainder; mouse look stays per-frame.
-  Add a vsync setting (Fifo, or Mailbox or Immediate where available) and use the
-  lowest frame latency the surface allows.
-- **Cheaper shadows:** cache static-geometry shadow maps per light and for the sun
-  window, and re-render a cache only when geometry, the light, or the sun window
-  changes. Draw moving actors over the cached static map each frame.
-- **Back-face culling** for closed opaque geometry, with a fallback for any meshes
-  that need both sides. Verify imported maps.
-- **GPU timing:** per-pass GPU times in F3 from timestamp queries where the
-  adapter supports them, and a clear "unavailable" otherwise.
+Gaps:
 
-Not in this stage: the light model itself (stage 2), sky (stage 3), particles and
-decals (stage 4), and world-format changes. Lights keep today's fixed properties.
-
-Parallel work: shared-sandbox stage 1 runs at the same time on another branch.
-Do not modify `crates/server`, `crates/core`, or protocol types. In
-`crates/client`, avoid connection and hosting code, and keep interpolation
-changes in `game.rs` small and local.
-
-Acceptance:
-
-- fmt, Clippy, all workspace tests, and native and browser builds pass, including
-  shader validation for every assembled shader.
-- Before and after captures at identical poses show no lost shadows, transparency
-  errors, or missing geometry; differences are the intended tonemapping, bloom,
-  and anti-aliasing. Keep the images under `.local/` and list them in Evidence.
-- Measured on this Mac (Apple M3 Pro, 3840×2160 at 144 Hz), natively and in the
-  browser: frame time and per-pass GPU time for the arena and the largest library
-  world, before and after.
-- Observed: strafing and editor flight are smooth at 144 Hz. Selection outlines,
-  guides, the first-person weapon, water and glass, underwater tint, and egui
-  panels render correctly in both clients.
+- **Large imported worlds stay slow.** They take 16–38 ms per frame at 4K even
+  without MSAA. They are limited by geometry rather than pixels, which is a job
+  for the [large-worlds](large-worlds.md) track.
+- **Shadow invalidation is coarse.** Any geometry rebuild invalidates every cache.
+  Stage 2's atlas should key caches by tile and version.
+- **Untested hardware paths:** adapters without timestamps or MSAA, and non-Fifo
+  native presentation.
 
 ## Later stages
 
@@ -102,4 +92,38 @@ Acceptance:
 
 ## Evidence
 
-None yet for this outcome.
+Stage 1, 2026-10-25, on this Mac's Apple M3 Pro at 3840×2160:
+
+- **Checks.** fmt, Clippy, 279 workspace tests, and the native release and
+  browser builds passed. The design lead re-ran fmt, Clippy, the tests, and a
+  wasm check after adding Auto anti-aliasing.
+  - A GPU regression test, run explicitly, matched cached and freshly rendered
+    shadows after actor, terrain, light, and sun-window changes.
+- **Captures.** Nine before/after pairs from identical poses, covering the arena,
+  the materials scene, and the largest library map. They are kept outside the
+  repository in `.local/captures/render-foundation/` in the main checkout.
+  - Geometry, shadows, water and glass boundaries, underwater tint, and guides
+    are preserved.
+  - The new look has stronger contrast and more saturated water and glass.
+- **Native frame times** (serial submission to GPU completion, median ms, before
+  → after, with MSAA on):
+
+  | Pose | Before | After |
+  | --- | ---: | ---: |
+  | arena-yard | 5.13 | 10.99 |
+  | materials-underwater | 6.07 | 18.56 |
+  | imported-spawn | 28.40 | 26.49 |
+  | imported-overlook | 30.31 | 37.77 |
+
+  Alternatives measured for arena-yard and imported-spawn:
+  - scale 0.75 with MSAA: 6.48 and 20.63 ms;
+  - scale 1 without MSAA, Auto's 4K choice: 5.06 and 16.02 ms.
+
+  The 144 Hz budget is 6.94 ms.
+- **Browser** (Chromium, 4K canvas), median frame interval: arena 8.30 → 8.30 ms;
+  the_cube1m 24.10 → 12.80 ms.
+- **Not observed:**
+  - perceived smoothness at 144 Hz, mouse latency, and vsync on the actual
+    monitor;
+  - interaction in a native window;
+  - shadow updates during continuous editing.

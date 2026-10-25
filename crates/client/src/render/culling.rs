@@ -56,9 +56,29 @@ impl Frustum {
     }
 }
 
+/// Editor flight can put the eye in a wall or on a roof boundary. Preserve the
+/// two-sided view there instead of exposing holes through back-face culling.
+/// 12 cm conservatively encloses the 6 cm near plane at the current FOV/aspect.
+pub(super) fn camera_intersects_terrain(world: &sauerteig_core::World, eye: Vec3) -> bool {
+    world.intersects_box(eye - Vec3::splat(0.12), eye + Vec3::splat(0.12))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn camera_on_roof_boundary_keeps_two_sided_view_and_outside_culls() {
+        let world = sauerteig_core::World::arena();
+        assert!(camera_intersects_terrain(
+            &world,
+            Vec3::new(16.0, 9.0, 19.0)
+        ));
+        assert!(!camera_intersects_terrain(
+            &world,
+            Vec3::new(16.0, 12.0, 19.0)
+        ));
+        assert!(!camera_intersects_terrain(&world, Vec3::new(0.0, 3.0, 0.0)));
+    }
 
     #[test]
     fn perspective_culling_keeps_crossing_boxes_and_rejects_hidden_ones() {

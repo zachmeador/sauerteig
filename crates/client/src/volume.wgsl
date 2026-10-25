@@ -1,16 +1,3 @@
-// Matches the shared camera uniform through point_colors. Volume materials use
-// their own transparent shader rather than the opaque terrain texture table.
-struct Camera {
-    view_proj: mat4x4<f32>,
-    light_view_proj: mat4x4<f32>,
-    eye_time: vec4<f32>,
-    sun: vec4<f32>,
-    fog: vec4<f32>,
-    points: array<vec4<f32>, 8>,
-    point_colors: array<vec4<f32>, 8>,
-};
-@group(0) @binding(0) var<uniform> camera: Camera;
-
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -36,15 +23,6 @@ struct VertexOutput {
     o.size = v.size;
     o.material = v.material;
     return o;
-}
-
-fn display_color(linear: vec3<f32>) -> vec3<f32> {
-    let mapped = max(linear, vec3<f32>(0.0)) / (max(linear, vec3<f32>(0.0)) + vec3<f32>(0.82));
-    if (camera.sun.w > 0.5) {
-        return select(1.055 * pow(mapped, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
-            mapped * 12.92, mapped <= vec3<f32>(0.0031308));
-    }
-    return mapped;
 }
 
 @fragment fn fs_main(v: VertexOutput, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
@@ -91,20 +69,11 @@ fn display_color(linear: vec3<f32>) -> vec3<f32> {
     color += vec3<f32>(0.72, 0.76, 0.76) * specular * 0.65;
     for (var i = 0; i < 8; i += 1) {
         if (camera.points[i].w <= 0.0) { continue; }
-        let delta = camera.points[i].xyz - v.position;
-        let d2 = max(dot(delta, delta), 0.1);
-        let light = delta * inverseSqrt(d2);
-        let range = camera.point_colors[i].w;
-        let falloff = max(1.0 - d2 / (range * range), 0.0);
-        let cone = smoothstep(0.5, 0.65, light.y);
-        let highlight = pow(max(dot(n, normalize(light + view)), 0.0), 80.0);
-        color += camera.point_colors[i].rgb * highlight * cone * falloff * falloff
-            * camera.points[i].w / (1.0 + d2) * 0.24;
+        let light = local_attenuation(i, v.position);
+        let highlight = pow(max(dot(n, normalize(light.xyz + view)), 0.0), 80.0);
+        color += camera.point_colors[i].rgb * highlight * light.w * 0.24;
     }
-    let distance = length(camera.eye_time.xyz - v.position);
-    let fog = clamp(1.0 - exp(-distance * distance * camera.fog.w), 0.0, 0.85);
-    color = mix(color, camera.fog.rgb, fog);
-    return vec4<f32>(display_color(color), clamp(alpha, 0.0, 0.76));
+    return vec4<f32>(apply_fog(color, v.position), clamp(alpha, 0.0, 0.76));
 }
 
 struct UnderwaterOutput {
@@ -121,5 +90,5 @@ struct UnderwaterOutput {
 }
 @fragment fn fs_underwater(v: UnderwaterOutput) -> @location(0) vec4<f32> {
     let vignette = clamp(length(v.uv - vec2<f32>(0.5)), 0.0, 0.7);
-    return vec4<f32>(display_color(vec3<f32>(0.015, 0.115, 0.145)), 0.055 + vignette * 0.075);
+    return vec4<f32>(vec3<f32>(0.015, 0.115, 0.145), 0.055 + vignette * 0.075);
 }

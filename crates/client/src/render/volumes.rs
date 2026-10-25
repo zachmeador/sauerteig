@@ -30,8 +30,8 @@ impl VolumeVertex {
 }
 
 pub(super) struct VolumeRenderer {
-    pipeline: wgpu::RenderPipeline,
-    underwater_pipeline: wgpu::RenderPipeline,
+    pipeline: Vec<wgpu::RenderPipeline>,
+    underwater_pipeline: Vec<wgpu::RenderPipeline>,
     vertex: Option<wgpu::Buffer>,
     index: wgpu::Buffer,
     tree: SpatialTree,
@@ -45,48 +45,57 @@ impl VolumeRenderer {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
+        sample_counts: &[u32],
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::include_wgsl!("../volume.wgsl"));
+        let shader = super::shaders::module(device, "volume");
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("transparent volume layout"),
             bind_group_layouts: &[camera_layout],
             push_constant_ranges: &[],
         });
         let pipeline = |label, vertex_entry, fragment_entry, buffers, depth_compare, bias| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vertex_entry),
-                    buffers,
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fragment_entry),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    // Both sides remain visible when swimming inside a volume.
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    depth_write_enabled: false,
-                    depth_compare,
-                    bias,
-                    ..super::depth_state()
-                }),
-                multisample: Default::default(),
-                multiview: None,
-                cache: None,
-            })
+            sample_counts
+                .iter()
+                .map(|&sample_count| {
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some(vertex_entry),
+                            buffers,
+                            compilation_options: Default::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some(fragment_entry),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format,
+                                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: Default::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            // Both sides remain visible when swimming inside a volume.
+                            cull_mode: None,
+                            ..Default::default()
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            depth_write_enabled: false,
+                            depth_compare,
+                            bias,
+                            ..super::depth_state()
+                        }),
+                        multisample: wgpu::MultisampleState {
+                            count: sample_count,
+                            ..Default::default()
+                        },
+                        multiview: None,
+                        cache: None,
+                    })
+                })
+                .collect()
         };
         Self {
             pipeline: pipeline(
@@ -185,17 +194,22 @@ impl VolumeRenderer {
         self.indices.len() / 3
     }
 
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, underwater: bool) {
+    pub fn draw<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        underwater: bool,
+        sample_index: usize,
+    ) {
         if let Some(vertex) = &self.vertex {
             if !self.indices.is_empty() {
-                pass.set_pipeline(&self.pipeline);
+                pass.set_pipeline(&self.pipeline[sample_index]);
                 pass.set_vertex_buffer(0, vertex.slice(..));
                 pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.indices.len() as u32, 0, 0..1);
             }
         }
         if underwater {
-            pass.set_pipeline(&self.underwater_pipeline);
+            pass.set_pipeline(&self.underwater_pipeline[sample_index]);
             pass.draw(0..3, 0..1);
         }
     }

@@ -30,6 +30,7 @@ pub fn take_write_error() -> Option<String> {
 #[serde(default)]
 pub struct Preferences {
     pub invert_scroll: bool,
+    pub render: crate::render::settings::RenderSettings,
 }
 
 /// Launcher choices live separately from in-game settings so either can save

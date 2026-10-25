@@ -123,9 +123,22 @@ transparent regions and large visible water surfaces in runtime checks: sorting
 uses face centers and can show ordering artifacts for overlapping views of large
 faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
 
-Lighting is dynamic. The sun shadow window follows the player with texel-snapped
-motion; eight nearby light nodes cast shadows with 512 px maps and light-volume
-culling. Nodes have no visible model in play; their editor guides do not cast
+The scene renders in linear HDR, with a filmic exposure/tonemapping pass before
+egui. Settings include bloom (zero disables it), anti-aliasing, render scale
+(50–100%), exposure, and vsync. Anti-aliasing defaults to Auto: 4× MSAA where
+supported while the scene has at most 2560×1440 pixels, and none above that,
+because 4× MSAA on a 4K HDR scene measured over a 144 Hz frame budget on an
+M3 Pro. On and Off override it. Render scale affects only the scene; egui
+stays at output resolution. Vsync off selects Mailbox, then Immediate if
+available, otherwise Fifo. The surface requests one frame of latency, clamped by
+the backend. Local movement and remote player poses interpolate between 60 Hz
+steps; mouse look remains immediate.
+
+Lighting is dynamic. The sun shadow window follows the player in six-metre,
+texel-aligned light-space steps; eight nearby light nodes cast shadows with 512 px
+maps and light-volume culling. Static shadow geometry is cached until geometry,
+light position or the sun window changes. Actors draw over fresh copies of those
+caches each frame. Nodes have no visible model in play; their guides do not cast
 shadows. Lamp props are independent decoration, with emissive surfaces but no
 automatic local light. The current node renderer is still a fixed warm downward
 spotlight with a 12 metre range, not an omnidirectional point light. Color, radius,
@@ -136,7 +149,10 @@ and the first-person weapon do not cast shadows.
 
 Terrain uses world-space texture coordinates. Materials share albedo/AO and
 normal/roughness texture arrays with linear-light color mipmaps and renormalized
-normals. Repeated props use GPU instancing, near/distant meshes, and distance and
+normals. Opaque terrain culls back faces except when the eye touches or enters
+terrain; that fallback preserves interior faces during editor flight. Props,
+procedural meshes, actors, guides, and transparent volumes remain two-sided.
+Repeated props use GPU instancing, near/distant meshes, and distance and
 light-range culling. Sources and conversion commands live with the
 [materials](../assets/materials/README.md) and [props](../assets/props/README.md).
 
@@ -157,9 +173,41 @@ cargo run --release -p sauerteig-import --example profile_ogz -- path/to/map.ogz
 
 These report meshing, edit, movement, and ray-query timings. The OGZ profile also
 reports original-scale storage, load time, query percentiles, and dirty remeshing.
-They exclude GPU
-execution and networking. F3 shows rendering counts and CPU edit/remesh timing,
-including GPU upload submission; it does not measure GPU completion or latency.
+They exclude GPU execution and networking. F3 shows rendering counts, CPU
+edit/remesh timing, effective scene resolution/MSAA/present mode, static shadow
+updates and per-pass GPU timestamps where supported. It explicitly reports
+unavailable timestamps otherwise. The asynchronous profiler never waits for a
+sample during play. Pass spans can overlap on Metal, so do not add them to obtain
+a GPU frame time. Browser timestamps can also be quantized.
+
+For fixed native renderer comparisons, source `scripts/env.sh`, then run:
+
+```sh
+cargo run --release --locked -p sauerteig-client --bin capture -- \
+  --poses scripts/capture-poses.json --output .local/captures/review \
+  --width 3840 --height 2160 --frames 60 --warmup 10
+```
+
+Each pose names a world file (or `arena`/`materials` test scene), eye, look-at
+point, fixed animation time and optional guides. The supplied imported poses
+expect a **copy** of the library's `the_cube1m` at `.local/the_cube1m.json`. Supply
+your own pose manifest for other worlds. The tool refuses to replace existing
+PNGs. `--settings FILE` accepts a JSON object with `scale`, `msaa`
+(`"auto"`, `"on"` or `"off"`), `bloom`, `exposure` and `vsync`; omitted fields
+take the normal defaults. Measurements include CPU submission, completed-frame
+median/p95 and individual GPU pass medians. They exclude simulation,
+presentation and PNG readback; they do not prove perceived smoothness on a
+monitor.
+
+`scripts/profile-browser.mjs URL OUTPUT_PREFIX` records five seconds of the
+running browser client's timestamps and frame intervals at a verified 3840×2160,
+plus a screenshot and validation errors. Use Playwright's isolated Chromium;
+`PLAYWRIGHT_MODULE` can point to a temporary installation's `index.mjs`. Restart
+the test server for each comparison so the assigned player/spawn is identical.
+The native GPU cache regression can be run explicitly with
+`cargo test -p sauerteig-client --lib gpu_cached_shadows -- --ignored` on a host
+with GPU access. Normal workspace tests leave that hardware-dependent test
+ignored.
 
 To compare the built-in movement profiles with a literal port of Sauerbraten's
 velocity math, run the example below. It prints top speeds, time to 90% of top

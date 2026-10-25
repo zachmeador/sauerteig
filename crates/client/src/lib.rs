@@ -1,5 +1,7 @@
 mod audio;
 mod blueprints;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod capture;
 mod editor;
 mod game;
 #[cfg(not(target_arch = "wasm32"))]
@@ -7,6 +9,7 @@ mod hosting;
 mod launcher;
 mod lighting;
 mod materials;
+mod motion;
 mod props;
 mod regions;
 mod render;
@@ -572,13 +575,13 @@ impl Runtime {
                 );
             }
         }
+        self.renderer.apply_settings(self.game.render_settings());
         let mesh = self.game.geometry();
         match self.renderer.draw(
             self.game.eye(),
             self.game.direction(),
             self.game.time,
-            self.game.world.volume_material_at(self.game.eye())
-                == Some(sauerteig_core::VolumeMaterial::Water),
+            &self.game.world,
             &self.game.objects,
             &mesh.vertices,
             &mesh.indices,

@@ -1,6 +1,9 @@
 //! GPU meshes and instance batches for embedded props.
 
-use super::{GpuMesh, GpuVertex};
+use super::{
+    culling::{Bounds, Frustum},
+    GpuMesh, GpuVertex,
+};
 use crate::{
     lighting::{LocalLight, LIGHT_RANGE, LOCAL_LIGHTS},
     props::{self, PropMesh},
@@ -28,6 +31,7 @@ struct PropLod {
     transforms: Vec<Transform>,
     world_count: u32,
     light_ranges: [(u32, u32); LOCAL_LIGHTS],
+    sun_range: (u32, u32),
 }
 
 impl PropLod {
@@ -45,7 +49,7 @@ impl PropLod {
             })
             .collect();
         // The world pass and each local light have their own instance range.
-        let capacity = MAX_INSTANCES_PER_KIND * (LOCAL_LIGHTS + 1);
+        let capacity = MAX_INSTANCES_PER_KIND * (LOCAL_LIGHTS + 2);
         Ok(Self {
             mesh: GpuMesh::new(device, &vertices, &mesh.indices).ok_or("Empty prop mesh")?,
             instances: device.create_buffer(&wgpu::BufferDescriptor {
@@ -57,6 +61,7 @@ impl PropLod {
             transforms: Vec::with_capacity(capacity),
             world_count: 0,
             light_ranges: [(0, 0); LOCAL_LIGHTS],
+            sun_range: (0, 0),
         })
     }
 }
@@ -113,6 +118,7 @@ impl PropRenderer {
         objects: &[WorldObject],
         eye: Vec3,
         lights: &[Option<LocalLight>; LOCAL_LIGHTS],
+        sun_frustum: &Frustum,
     ) {
         for batch in &mut self.batches {
             batch.near.transforms.clear();
@@ -138,24 +144,43 @@ impl PropRenderer {
                     object.rotation,
                 ]);
             }
-            for lod in [&mut batch.near, &mut batch.distant] {
-                lod.world_count = lod.transforms.len() as u32;
-                for (i, light) in lights.iter().enumerate() {
-                    let start = lod.transforms.len() as u32;
-                    if let Some(light) = light {
-                        for index in 0..lod.world_count as usize {
-                            let t = lod.transforms[index];
-                            let center = Vec3::new(t[0], t[1], t[2])
-                                + glam::Mat3::from_rotation_y(t[3]) * batch.bounds_center;
-                            if center.distance_squared(light.position)
-                                <= (LIGHT_RANGE + batch.bounds_radius).powi(2)
-                            {
-                                lod.transforms.push(t);
-                            }
-                        }
+            batch.near.world_count = batch.near.transforms.len() as u32;
+            batch.distant.world_count = batch.distant.transforms.len() as u32;
+            // Static shadow geometry uses the near mesh, independent of view
+            // LOD or draw distance. Its cached projection is stable as we move.
+            let mut append = |frustum: &Frustum, light: Option<Vec3>| {
+                let start = batch.near.transforms.len() as u32;
+                for object in objects
+                    .iter()
+                    .filter(|o| o.kind == batch.kind)
+                    .take(MAX_INSTANCES_PER_KIND)
+                {
+                    let center = object.position
+                        + glam::Mat3::from_rotation_y(object.rotation) * batch.bounds_center;
+                    let radius = Vec3::splat(batch.bounds_radius);
+                    if frustum.intersects(Bounds {
+                        min: center - radius,
+                        max: center + radius,
+                    }) && light.is_none_or(|p| {
+                        center.distance_squared(p) <= (LIGHT_RANGE + batch.bounds_radius).powi(2)
+                    }) {
+                        batch.near.transforms.push([
+                            object.position.x,
+                            object.position.y,
+                            object.position.z,
+                            object.rotation,
+                        ]);
                     }
-                    lod.light_ranges[i] = (start, lod.transforms.len() as u32);
                 }
+                (start, batch.near.transforms.len() as u32)
+            };
+            batch.near.sun_range = append(sun_frustum, None);
+            for (i, light) in lights.iter().enumerate() {
+                batch.near.light_ranges[i] = light.map_or((0, 0), |light| {
+                    append(&Frustum::new(light.view_proj), Some(light.position))
+                });
+            }
+            for lod in [&mut batch.near, &mut batch.distant] {
                 if !lod.transforms.is_empty() {
                     queue.write_buffer(&lod.instances, 0, bytemuck::cast_slice(&lod.transforms));
                 }
@@ -163,18 +188,27 @@ impl PropRenderer {
         }
     }
 
-    pub(super) fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, light: Option<usize>) {
+    pub(super) fn draw_shadow<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, light: Option<usize>) {
+        for batch in &self.batches {
+            let lod = &batch.near;
+            let (start, end) = light.map_or(lod.sun_range, |i| lod.light_ranges[i]);
+            Self::draw_lod(pass, lod, start, end);
+        }
+    }
+    pub(super) fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         for batch in &self.batches {
             for lod in [&batch.near, &batch.distant] {
-                let (start, end) = light.map_or((0, lod.world_count), |i| lod.light_ranges[i]);
-                if start == end {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, lod.mesh.vertex.slice(..));
-                pass.set_vertex_buffer(1, lod.instances.slice(..));
-                pass.set_index_buffer(lod.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..lod.mesh.count, 0, start..end);
+                Self::draw_lod(pass, lod, 0, lod.world_count);
             }
         }
+    }
+    fn draw_lod<'a>(pass: &mut wgpu::RenderPass<'a>, lod: &'a PropLod, start: u32, end: u32) {
+        if start == end {
+            return;
+        }
+        pass.set_vertex_buffer(0, lod.mesh.vertex.slice(..));
+        pass.set_vertex_buffer(1, lod.instances.slice(..));
+        pass.set_index_buffer(lod.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..lod.mesh.count, 0, start..end);
     }
 }

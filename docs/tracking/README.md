@@ -23,7 +23,7 @@ touch the same code.
 | --- | --- | --- |
 | [Shared sandbox](shared-sandbox.md) | Active | Stage 1: the simulation never waits for saves, joins, or large edits. |
 | [World format](world-format.md) | Active | Stage 1 (movement styles in the core) is complete. Next: world settings with the profiles wired in, then object properties and a material library with texture alignment. |
-| [Renderer](renderer.md) | Active | Stage 1: HDR pipeline, bloom, anti-aliasing, smooth motion, GPU timing, and cached shadows. |
+| [Renderer](renderer.md) | Active | Stage 1 (HDR, anti-aliasing, cached shadows, smooth motion) is merged and awaits the maintainer's 144 Hz check. Next: stage 2, many real lights. |
 | [Large worlds and performance](large-worlds.md) | Partial | Viewing distance, streaming, and traversal, once the first three tracks lay their foundations. |
 | [Editor feel](editor-feel.md) | Active | Stage 1: extrusion copies the faces behind, and Delete empties the selection. |
 | [Legacy map restoration](legacy-import.md) | Partial | Original textures, models, and lights once the world format and renderer support them. |

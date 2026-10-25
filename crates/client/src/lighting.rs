@@ -65,8 +65,10 @@ pub fn sun_shadow_matrix(sun: Vec3, focus: Vec3) -> Mat4 {
     let view = Mat4::look_to_rh(Vec3::ZERO, -sun, up);
     let mut center = view.transform_point3(focus);
     let texel = 2.0 * HALF_WIDTH / RESOLUTION;
-    center.x = (center.x / texel).round() * texel;
-    center.y = (center.y / texel).round() * texel;
+    // A six-metre window step (64 texels) keeps the projection stable while
+    // strafing. Quantize depth too; a continuous depth origin defeats caching.
+    let step = texel * 64.0;
+    center = (center / step).round() * step;
     Mat4::orthographic_rh(
         center.x - HALF_WIDTH,
         center.x + HALF_WIDTH,

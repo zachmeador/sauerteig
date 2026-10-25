@@ -1,13 +1,3 @@
-// This prefix has the same offsets as the shared Camera uniform. sun.w selects
-// explicit display encoding when the surface itself is not sRGB.
-struct CameraPrefix {
-    view_proj: mat4x4<f32>,
-    light_view_proj: mat4x4<f32>,
-    eye_time: vec4<f32>,
-    sun: vec4<f32>,
-};
-@group(0) @binding(0) var<uniform> camera: CameraPrefix;
-
 struct SkyOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex fn vs_main(@builtin(vertex_index) index:u32) -> SkyOutput {
     var positions = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
@@ -35,9 +25,5 @@ fn cloud_noise(p: vec2<f32>) -> f32 {
         + cloud_noise(v.uv * vec2<f32>(11.0, 15.0)) * 0.35;
     var col = mix(horizon, zenith, smoothstep(0.15, 1.0, v.uv.y));
     col *= 0.86 + 0.25 * clouds;
-    if (camera.sun.w > 0.5) {
-        col = select(1.055 * pow(col, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
-            col * 12.92, col <= vec3<f32>(0.0031308));
-    }
     return vec4<f32>(col,1.0);
 }

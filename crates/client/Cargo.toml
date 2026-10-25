@@ -3,6 +3,7 @@ name = "sauerteig-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "sauerteig-client"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -42,4 +43,3 @@ console_log = "1"
 
 [dev-dependencies]
 naga = { version = "24", features = ["wgsl-in"] }
-
