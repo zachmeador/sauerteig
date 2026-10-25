@@ -67,25 +67,112 @@ Gaps:
 - **Untested hardware paths:** adapters without timestamps or MSAA, and non-Fifo
   native presentation.
 
+## Stage 2: many real lights
+
+State: active on branch `render-many-lights`.
+
+Every light node in view lights the scene as a real light with shadows, instead
+of only the nearest eight downward cones. Imported maps render with all of their
+hundreds of lights. The design follows the [research](../../research/many-lights.md),
+which holds the budgets and test plan.
+
+Decisions:
+
+- **Light model.**
+  - Each light becomes a `LightDesc`: position, linear color, intensity, range,
+    kind (point, or spot with direction and inner and outer cone), and a shadow
+    mode (off, static, or dynamic).
+  - Light nodes become **point lights** by default: warm `[1.0, 0.74, 0.46]`,
+    12 m range, static shadows.
+  - One function maps a `WorldObject` to a `LightDesc`. The world format's object
+    properties will fill it from real values later.
+  - Spot lights exist in the data and shaders now, exercised by tests and
+    synthetic captures.
+- **Clustered forward shading.**
+  - A 16×9×24 view-cluster grid: slice 0 runs from the near plane to 4 m, then
+    slices grow exponentially to the far plane.
+  - A compute pass builds a 256-bit light mask per cluster from up to 256 visible
+    lights, sorted by importance.
+  - Light records are 64 bytes each, in a storage buffer.
+  - One shared WGSL lighting function serves the world, props, and water and
+    glass, with a soft cap of 16 lights per fragment.
+  - Draw chunks front to back. No depth pre-pass in this stage.
+- **Paged shadow atlas.**
+  - A `texture_depth_2d_array` of 1024² D32F pages, each holding one tile size:
+    4 × 512², 16 × 256², or 64 × 128².
+  - Point lights use six tiles, with major-axis face selection and a two-texel
+    guard band. Spot lights use one tile.
+  - Tile size comes from projected radius, with ×1.5 hysteresis and 1 second of
+    residency. The light being edited ranks first, and lights under 2 m radius
+    are unshadowed.
+  - Render one pass per dirty page, placing tiles with viewport and scissor and
+    clearing a tile by drawing a depth-1 quad.
+- **Static caches and an actor overlay.**
+  - A tile re-renders only when its version changes: a light edit, or a chunk
+    edit inside the light's sphere. Caches are keyed by tile and version,
+    replacing stage 1's per-light caches.
+  - Moving actors go into a small overlay page that lights with actors in range
+    also sample.
+  - At most 6 faces render per frame (12 for three frames after a teleport or
+    join), capped at 1.5 ms by measured cost.
+  - Stale tiles stay in use while waiting.
+  - New lights fade in once their shadows are valid, and lights over budget fade
+    out rather than leak light through walls.
+- **Water and glass** use the shared lighting function with premultiplied alpha
+  (`color·α + specular`), capped at specular-only with 8 lights.
+- **Fallbacks.**
+  - Keep fragment storage buffers at four or fewer and workgroups at 64, so
+    compatibility-class adapters still run the main path.
+  - Adapters without compute or storage buffers use uniform buffers with CPU-built
+    64-bit masks and 64 lights.
+  - Today's nearest-eight path stays as the last resort.
+
+Not in this stage:
+- sun cascades and quality tiers (stage 2b);
+- editing light properties ([world format](world-format.md));
+- importing light radius and color;
+- sky (stage 3).
+
+Parallel work: the shared-sandbox stage 1 fixes are being finished on another
+branch. Leave `crates/server`, `crates/core`, and protocol types untouched; stay
+within client rendering, `lighting.rs`, and the capture tool.
+
+Acceptance:
+
+- **Checks.** fmt, Clippy, all workspace tests, the native build, and a wasm
+  `cargo check` pass.
+  - Disk is tight: run release builds only for the capture binary, delete
+    `target/release` afterwards, and skip `build-web.sh`.
+- **Correctness.**
+  - Clustered output matches a brute-force all-lights render, and compute-built
+    masks match CPU-built ones, on synthetic scenes.
+  - Shadow invalidation tests: an edit in range re-renders a tile, an edit out of
+    range doesn't, and a moved light re-renders.
+  - Every assembled shader validates with Naga.
+- **Captures** with the stage 1 tool, kept under the worktree's `.local/captures/`
+  and listed in Evidence:
+  - the arena and the materials scene;
+  - the largest imported map from three poses, before (eight cones) and after
+    (all lights);
+  - the research's synthetic scenes: 64 lights in a room around the camera, a
+    corridor, a pose heavy with water and glass, and an edit storm that
+    invalidates everything.
+- **Measurements** on this Mac, natively, at 1080p and 3840×2160:
+  - frame time and per-pass GPU time for the arena, the largest imported map, and
+    the 64-light room;
+  - shadow updates per frame and cache hit rate.
+
+  Targets from the research: shadows ≤1.5 ms on average and ≤3 ms at p99; culling
+  ≤0.1 ms; and the largest imported map at ≤14 ms p95 at 1080p on this Mac. If a
+  target is missed, record by how much and why.
+- **Not observable by the session:** feel in a native window and in the browser.
+  List these checks precisely as not yet observed.
+
 ## Later stages
 
-- **Stage 2, many real lights:** point and spot lights with color, intensity,
-  radius, cone, and a shadow mode (off, static, or dynamic) from the
-  [world format](world-format.md). This completes most of the
-  [lighting](lighting.md) outcome. Design decided after
-  [research](../../research/many-lights.md):
-  - Clustered forward shading with compute-built 256-bit light masks per cluster,
-    and one shared lighting function for opaque geometry, props, water, and glass.
-  - Water and glass switch to premultiplied alpha.
-  - A paged shadow atlas: static caches keyed by tile and version, a small overlay
-    for moving actors, and a per-frame update budget.
-  - Three cached sun cascades.
-  - 4× MSAA stays. No deferred shading and no radiance-hints global illumination.
-  - Build order: lights and clusters, then the atlas, then cascades, then quality
-    tiers that adapt to measured GPU time.
-
-  The research file holds the budgets, fallbacks, and test plan. Until object
-  properties land, the stage can be built and measured against synthetic lights.
+- **Stage 2b, sun cascades and quality tiers:** three cached sun cascades, and
+  tiers that step render scale, then shadowed lights, then visible lights down
+  from measured frame time.
 - **Stage 3, sky and atmosphere:** sun, sky, and fog from world settings instead
   of constants.
 - **Stage 4, effects:** particles and decals for building and combat feedback.
