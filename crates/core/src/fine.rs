@@ -3,6 +3,7 @@
 use crate::{Cell, CellEdit, CellPos, ChunkKey, Vec3, World};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub const FINE_UNITS: i32 = 8;
 pub const MAX_ROOT_FRAGMENTS: usize = 512;
@@ -131,7 +132,7 @@ pub(crate) struct FineTriangle {
 }
 #[derive(Clone, Debug)]
 pub(crate) struct FineRoot {
-    pub fragments: Vec<CellFragment>,
+    pub fragments: Arc<Vec<CellFragment>>,
     pub triangles: Vec<FineTriangle>,
 }
 
@@ -255,7 +256,7 @@ impl World {
     }
     pub fn root_fragments(&self, pos: CellPos) -> Vec<CellFragment> {
         if let Some(root) = self.fine.get(&pos) {
-            return root.fragments.clone();
+            return root.fragments.as_ref().clone();
         }
         if let Some(cell) = self.get(pos) {
             return vec![CellFragment::from_cell(pos, cell)];
@@ -276,7 +277,7 @@ impl World {
             .iter()
             .map(|(&pos, r)| RootEdit {
                 pos,
-                fragments: r.fragments.clone(),
+                fragments: r.fragments.as_ref().clone(),
             })
             .collect()
     }
@@ -298,15 +299,6 @@ impl World {
         }
         let mut prepared = Vec::with_capacity(edits.len());
         for edit in edits {
-            if let [fragment] = edit.fragments.as_slice() {
-                if fragment.bounds == FineBox::root(edit.pos)
-                    && fragment.origin == fragment.bounds.min
-                    && fragment.size == 8
-                {
-                    prepared.push((edit.pos, Prepared::Coarse(fragment.cell)));
-                    continue;
-                }
-            }
             let normalized = canonical_root_fragments(edit.pos, &edit.fragments);
             if let [fragment] = normalized.as_slice() {
                 if fragment.bounds == FineBox::root(edit.pos)
@@ -341,7 +333,7 @@ impl World {
             prepared.push((
                 edit.pos,
                 Prepared::Detailed(FineRoot {
-                    fragments,
+                    fragments: Arc::new(fragments),
                     triangles,
                 }),
             ));
@@ -358,7 +350,7 @@ impl World {
                     Prepared::Coarse(cell) => {
                         previous == vec![CellFragment::from_cell(*pos, *cell)]
                     }
-                    Prepared::Detailed(root) => previous == root.fragments,
+                    Prepared::Detailed(root) => previous == *root.fragments,
                 };
                 (!same).then_some(*pos)
             })
@@ -381,7 +373,8 @@ impl World {
                 Prepared::Detailed(root) => {
                     self.set_storage(pos, None);
                     if !root.fragments.is_empty() {
-                        self.fine.insert(pos, root);
+                        self.authored_roots.insert(pos, root.fragments.clone());
+                        self.fine.insert(pos, Arc::new(root));
                     }
                 }
             }

@@ -1,6 +1,7 @@
 //! Sparse material space, independent of the terrain's surface textures.
 use crate::{FineBox, RayHit, Vec3, World, FINE_UNITS};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub const MAX_MATERIAL_VOLUMES: usize = 16_384;
 /// A maximum-size pasted layer can also clear an equally detailed destination.
@@ -210,16 +211,19 @@ impl BoxIndex {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VolumeLayer {
-    volumes: Vec<MaterialVolume>,
+    volumes: Arc<Vec<MaterialVolume>>,
     boxes: Vec<FineBox>,
     index: BoxIndex,
 }
 impl VolumeLayer {
+    pub(crate) fn authored(&self) -> Arc<Vec<MaterialVolume>> {
+        self.volumes.clone()
+    }
     fn new(volumes: Vec<MaterialVolume>) -> Self {
         let boxes: Vec<_> = volumes.iter().map(|volume| volume.bounds).collect();
         let index = BoxIndex::new(&boxes);
         Self {
-            volumes,
+            volumes: Arc::new(volumes),
             boxes,
             index,
         }
@@ -384,7 +388,9 @@ impl World {
 
     pub fn replace_volumes(&mut self, volumes: &[MaterialVolume]) -> Result<(), String> {
         validate_material_volumes(volumes, self.bounds().fine_box())?;
-        self.volumes = VolumeLayer::new(coalesce_material_volumes(volumes.to_vec()));
+        self.volumes = Arc::new(VolumeLayer::new(coalesce_material_volumes(
+            volumes.to_vec(),
+        )));
         Ok(())
     }
 
@@ -452,7 +458,7 @@ impl World {
     }
 
     pub fn apply_volume_edits(&mut self, edits: &[VolumeEdit]) -> Result<(), String> {
-        self.volumes = VolumeLayer::new(self.prepare_volume_edits(edits)?);
+        self.volumes = Arc::new(VolumeLayer::new(self.prepare_volume_edits(edits)?));
         Ok(())
     }
 

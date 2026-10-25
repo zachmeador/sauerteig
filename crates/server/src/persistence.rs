@@ -32,6 +32,30 @@ pub(super) struct SavedWorld {
     pub(super) next_object: u32,
 }
 
+/// Only authored state crosses to save/join workers.
+#[derive(Clone)]
+pub(crate) struct SavedSnapshot {
+    pub revision: u64,
+    pub world: sauerteig_core::WorldSnapshot,
+    pub objects: std::sync::Arc<Vec<WorldObject>>,
+    pub next_object: u32,
+}
+impl SavedSnapshot {
+    pub fn expand(&self) -> SavedWorld {
+        SavedWorld {
+            revision: self.revision,
+            format_version: WORLD_FORMAT_VERSION,
+            bounds: self.world.bounds(),
+            regions: self.world.regions().to_vec(),
+            cells: self.world.cells(),
+            roots: self.world.root_overrides(),
+            volumes: self.world.volumes().to_vec(),
+            objects: self.objects.as_ref().clone(),
+            next_object: self.next_object,
+        }
+    }
+}
+
 pub(super) fn load_world(path: &Path) -> Result<SavedWorld, String> {
     if !path.exists() {
         return Ok(SavedWorld {
@@ -107,7 +131,22 @@ pub(super) fn load_world(path: &Path) -> Result<SavedWorld, String> {
     Ok(saved)
 }
 
+#[cfg(test)]
 pub(super) fn write_world(path: &Path, saved: &SavedWorld) -> Result<(), String> {
+    write_guarded(path, saved, || true)
+}
+pub(crate) fn write_snapshot(
+    path: &Path,
+    snapshot: &SavedSnapshot,
+    can_commit: impl FnOnce() -> bool,
+) -> Result<(), String> {
+    write_guarded(path, &snapshot.expand(), can_commit)
+}
+fn write_guarded(
+    path: &Path,
+    saved: &SavedWorld,
+    can_commit: impl FnOnce() -> bool,
+) -> Result<(), String> {
     use std::io::Write;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -118,6 +157,10 @@ pub(super) fn write_world(path: &Path, saved: &SavedWorld) -> Result<(), String>
     serde_json::to_writer(&mut writer, saved).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
     writer.get_ref().sync_all().map_err(|e| e.to_string())?;
+    if !can_commit() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err("Save cancelled because the simulation failed.".into());
+    }
     std::fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 

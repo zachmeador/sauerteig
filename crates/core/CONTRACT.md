@@ -41,6 +41,14 @@ expose coarse overrides only; use fragment queries for complete geometry and
 `try_roots_in` for bounded editor expansion. `regions()` and `root_overrides()`
 together with `cells()` preserve the full save state, including empty masks.
 
+`World::snapshot()` retains authored regions, coarse cells, detailed roots,
+empty override masks, and volumes through structural sharing. It contains no
+triangles, mesh batches, or spatial query indexes. Expanding a snapshot into save
+or protocol vectors is worker work. `World::clone()` is also cheap, but shares
+both authored and derived data for off-thread edit preparation; mutations copy
+only changed map paths/chunks/regions. A snapshot or edit view remains consistent
+while the live world changes.
+
 Edits invalidate affected compact mesh batches, local chunks, and face neighbors.
 Compact batch keys are opaque identifiers, not world coordinates; use mesh bounds
 for culling. Rendering, aiming, and collision share the same cell surfaces.
@@ -154,6 +162,13 @@ The server keeps only the latest movement snapshot while preserving ordered
 world events. A `Sync`/`Synced` barrier acknowledges all earlier commands before
 a client leaves. Full world snapshots must fit the native transport's 64 MiB
 message limit; geometry reserves 1 MiB for objects, players, and the envelope.
+The owner captures Welcome at one revision before accepting later patches into
+that peer's reliable queue. Welcome is serialized and sent first; queued patches
+then retain revision order. Queue pressure delays an edit on the edit worker for up
+to two seconds, then rejects it as busy, rather than dropping a joining peer. A
+client that vanishes without `Sync` still has the commands it already sent
+applied, in order. A progressing transfer has no whole-message time
+limit; 30 seconds without a successful TCP write ends a stalled connection.
 Request, history, world, and connection limits live with their
 validation code in [`crates/server`](../server/src/).
 

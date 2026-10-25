@@ -1,6 +1,7 @@
 use crate::{Vec3, CHUNK_SIZE};
+use im::{OrdMap, OrdSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::BTreeSet, sync::Arc};
 
 pub type CellPos = [i32; 3];
 pub type ChunkKey = [i32; 3];
@@ -220,12 +221,68 @@ impl Default for Chunk {
 
 #[derive(Clone, Debug, Default)]
 pub struct World {
-    chunks: BTreeMap<ChunkKey, Chunk>,
-    pub(crate) fine: BTreeMap<CellPos, crate::fine::FineRoot>,
+    chunks: OrdMap<ChunkKey, Arc<Chunk>>,
+    pub(crate) fine: OrdMap<CellPos, Arc<crate::fine::FineRoot>>,
+    pub(crate) authored_roots: OrdMap<CellPos, Arc<Vec<crate::CellFragment>>>,
     pub(crate) bounds: crate::WorldBounds,
     pub(crate) compact: crate::compact::CompactWorld,
-    pub(crate) overrides: BTreeSet<CellPos>,
-    pub(crate) volumes: crate::volumes::VolumeLayer,
+    pub(crate) overrides: OrdSet<CellPos>,
+    pub(crate) volumes: Arc<crate::volumes::VolumeLayer>,
+}
+
+/// A consistent, constant-time copy of authored data. Expanding it to wire/save
+/// vectors belongs on a worker; no triangles, mesh batches, or query indexes are
+/// retained here. Edits copy only the affected persistent-map paths/chunks.
+#[derive(Clone, Debug)]
+pub struct WorldSnapshot {
+    bounds: crate::WorldBounds,
+    regions: Arc<Vec<crate::CellFragment>>,
+    chunks: OrdMap<ChunkKey, Arc<Chunk>>,
+    roots: OrdMap<CellPos, Arc<Vec<crate::CellFragment>>>,
+    overrides: OrdSet<CellPos>,
+    volumes: Arc<Vec<crate::MaterialVolume>>,
+}
+impl WorldSnapshot {
+    pub fn bounds(&self) -> crate::WorldBounds {
+        self.bounds
+    }
+    pub fn regions(&self) -> &[crate::CellFragment] {
+        &self.regions
+    }
+    pub fn volumes(&self) -> &[crate::MaterialVolume] {
+        &self.volumes
+    }
+    pub fn cells(&self) -> Vec<CellEdit> {
+        stored_cells(&self.chunks)
+    }
+    pub fn root_overrides(&self) -> Vec<crate::RootEdit> {
+        let mut roots: Vec<_> = self
+            .roots
+            .iter()
+            .map(|(&pos, fragments)| crate::RootEdit {
+                pos,
+                fragments: fragments.as_ref().clone(),
+            })
+            .collect();
+        roots.extend(
+            self.overrides
+                .iter()
+                .filter(|&&pos| {
+                    !self.roots.contains_key(&pos)
+                        && self
+                            .chunks
+                            .get(&World::cell_chunk(pos))
+                            .and_then(|c| c.cells[local_index(pos)])
+                            .is_none()
+                })
+                .map(|&pos| crate::RootEdit {
+                    pos,
+                    fragments: Vec::new(),
+                }),
+        );
+        roots.sort_by_key(|r| r.pos);
+        roots
+    }
 }
 
 // Old array/object saves remain readable; new snapshots name their format explicitly.
@@ -363,15 +420,17 @@ impl World {
 
     pub(crate) fn set_storage(&mut self, pos: CellPos, cell: Option<Cell>) {
         self.fine.remove(&pos);
+        self.authored_roots.remove(&pos);
         let key = Self::cell_chunk(pos);
         let index = local_index(pos);
         if let Some(cell) = cell {
-            let chunk = self.chunks.entry(key).or_default();
+            let chunk = Arc::make_mut(self.chunks.entry(key).or_default());
             if chunk.cells[index].is_none() {
                 chunk.occupied += 1;
             }
             chunk.cells[index] = Some(cell);
         } else if let Some(chunk) = self.chunks.get_mut(&key) {
+            let chunk = Arc::make_mut(chunk);
             if chunk.cells[index].take().is_some() {
                 chunk.occupied -= 1;
             }
@@ -382,26 +441,18 @@ impl World {
     }
 
     pub fn cells(&self) -> Vec<CellEdit> {
-        let mut cells = Vec::new();
-        for (&key, chunk) in &self.chunks {
-            for (index, &cell) in chunk.cells.iter().enumerate() {
-                if cell.is_none() {
-                    continue;
-                }
-                let x = index as i32 % CHUNK_SIZE;
-                let y = index as i32 / CHUNK_SIZE % CHUNK_SIZE;
-                let z = index as i32 / (CHUNK_SIZE * CHUNK_SIZE);
-                cells.push(CellEdit {
-                    pos: [
-                        key[0] * CHUNK_SIZE + x,
-                        key[1] * CHUNK_SIZE + y,
-                        key[2] * CHUNK_SIZE + z,
-                    ],
-                    cell,
-                });
-            }
+        stored_cells(&self.chunks)
+    }
+
+    pub fn snapshot(&self) -> WorldSnapshot {
+        WorldSnapshot {
+            bounds: self.bounds,
+            regions: self.compact.sources.clone(),
+            chunks: self.chunks.clone(),
+            roots: self.authored_roots.clone(),
+            overrides: self.overrides.clone(),
+            volumes: self.volumes.authored(),
         }
-        cells
     }
 
     pub fn chunk_keys(&self) -> Vec<ChunkKey> {
@@ -710,6 +761,29 @@ pub fn block_edits_in(
         }
     }
     edits
+}
+
+fn stored_cells(chunks: &OrdMap<ChunkKey, Arc<Chunk>>) -> Vec<CellEdit> {
+    let mut cells = Vec::new();
+    for (&key, chunk) in chunks {
+        for (index, &cell) in chunk.cells.iter().enumerate() {
+            if cell.is_none() {
+                continue;
+            }
+            let x = index as i32 % CHUNK_SIZE;
+            let y = index as i32 / CHUNK_SIZE % CHUNK_SIZE;
+            let z = index as i32 / (CHUNK_SIZE * CHUNK_SIZE);
+            cells.push(CellEdit {
+                pos: [
+                    key[0] * CHUNK_SIZE + x,
+                    key[1] * CHUNK_SIZE + y,
+                    key[2] * CHUNK_SIZE + z,
+                ],
+                cell,
+            });
+        }
+    }
+    cells
 }
 
 #[cfg(test)]

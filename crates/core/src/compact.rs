@@ -5,8 +5,10 @@ use crate::{
     CellEdit, CellFragment, CellPos, ChunkKey, FineBox, RootEdit, Vec3, World, CHUNK_SIZE,
     WORLD_HEIGHT, WORLD_MAX, WORLD_MIN,
 };
+use im::{OrdSet, Vector};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub const WORLD_FORMAT_VERSION: u32 = 3;
 pub const MAX_COMPACT_REGIONS: usize = 400_000;
@@ -60,8 +62,8 @@ impl WorldBounds {
 #[derive(Clone, Debug)]
 pub(crate) struct Region {
     pub source: CellFragment,
-    pub active: FineRoot,
-    masked: BTreeSet<CellPos>,
+    pub active: Arc<FineRoot>,
+    masked: OrdSet<CellPos>,
     pub key: ChunkKey,
 }
 #[derive(Clone, Debug)]
@@ -76,9 +78,10 @@ enum NodeKind {
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CompactWorld {
-    pub regions: Vec<Region>,
-    nodes: Vec<Node>,
-    pub batches: BTreeMap<ChunkKey, Vec<usize>>,
+    pub regions: Vector<Arc<Region>>,
+    pub sources: Arc<Vec<CellFragment>>,
+    nodes: Arc<Vec<Node>>,
+    pub batches: Arc<BTreeMap<ChunkKey, Vec<usize>>>,
 }
 
 fn union(a: FineBox, b: FineBox) -> FineBox {
@@ -105,7 +108,7 @@ pub(crate) fn compile_fragments(fragments: Vec<CellFragment>) -> Result<FineRoot
         kept.push(fragment);
     }
     Ok(FineRoot {
-        fragments: kept,
+        fragments: Arc::new(kept),
         triangles,
     })
 }
@@ -118,12 +121,12 @@ impl CompactWorld {
             .reduce(union)
             .unwrap();
         let index = self.nodes.len();
-        self.nodes.push(Node {
+        Arc::make_mut(&mut self.nodes).push(Node {
             bounds,
             kind: NodeKind::Leaf(Vec::new()),
         });
         if ids.len() <= 8 {
-            self.nodes[index].kind = NodeKind::Leaf(ids);
+            Arc::make_mut(&mut self.nodes)[index].kind = NodeKind::Leaf(ids);
         } else {
             let axis = (0..3)
                 .max_by_key(|&a| bounds.max[a] - bounds.min[a])
@@ -135,7 +138,7 @@ impl CompactWorld {
             let right = ids.split_off(ids.len() / 2);
             let left = self.build_node(ids);
             let right = self.build_node(right);
-            self.nodes[index].kind = NodeKind::Branch(left, right);
+            Arc::make_mut(&mut self.nodes)[index].kind = NodeKind::Branch(left, right);
         }
         index
     }
@@ -204,7 +207,7 @@ impl CompactWorld {
     pub fn prepare_masks(
         &self,
         positions: &[CellPos],
-    ) -> Result<Vec<(usize, FineRoot, BTreeSet<CellPos>)>, String> {
+    ) -> Result<Vec<(usize, FineRoot, OrdSet<CellPos>)>, String> {
         let mut affected: BTreeMap<usize, BTreeSet<CellPos>> = BTreeMap::new();
         for &pos in positions {
             for id in self.query(FineBox::root(pos)) {
@@ -216,7 +219,7 @@ impl CompactWorld {
         let mut result = Vec::new();
         for (id, added) in affected {
             let region = &self.regions[id];
-            let mut pieces = region.active.fragments.clone();
+            let mut pieces = region.active.fragments.as_ref().clone();
             for &pos in &added {
                 pieces = pieces
                     .into_iter()
@@ -258,10 +261,11 @@ impl CompactWorld {
         }
         Ok(result)
     }
-    pub fn apply_masks(&mut self, prepared: Vec<(usize, FineRoot, BTreeSet<CellPos>)>) {
+    pub fn apply_masks(&mut self, prepared: Vec<(usize, FineRoot, OrdSet<CellPos>)>) {
         for (id, active, masked) in prepared {
-            self.regions[id].active = active;
-            self.regions[id].masked = masked;
+            let region = Arc::make_mut(&mut self.regions[id]);
+            region.active = Arc::new(active);
+            region.masked = masked;
         }
     }
 }
@@ -318,16 +322,17 @@ impl World {
         }
         let mut world = Self::default();
         world.bounds = bounds;
+        world.compact.sources = Arc::new(regions.to_vec());
         for source in regions {
             if !source.is_valid() || !bounds.fine_box().contains(source.bounds) {
                 return Err("Invalid compact region bounds or geometry.".into());
             }
-            world.compact.regions.push(Region {
+            world.compact.regions.push_back(Arc::new(Region {
                 source: source.clone(),
-                active: compile_fragments(vec![source.clone()])?,
-                masked: BTreeSet::new(),
+                active: Arc::new(compile_fragments(vec![source.clone()])?),
+                masked: OrdSet::new(),
                 key: [0; 3],
-            });
+            }));
         }
         if !regions.is_empty() {
             world.compact.build_node((0..regions.len()).collect());
@@ -356,9 +361,9 @@ impl World {
             for (batch, ids) in order.chunks(MESH_BATCH_REGIONS).enumerate() {
                 let key = [MESH_KEY_BASE + batch as i32, 0, 0];
                 for &id in ids {
-                    world.compact.regions[id].key = key;
+                    Arc::make_mut(&mut world.compact.regions[id]).key = key;
                 }
-                world.compact.batches.insert(key, ids.to_vec());
+                Arc::make_mut(&mut world.compact.batches).insert(key, ids.to_vec());
             }
         }
         let mut seen = BTreeSet::new();
@@ -437,7 +442,7 @@ impl World {
             out.extend(
                 self.fine
                     .values()
-                    .flat_map(|r| &r.fragments)
+                    .flat_map(|r| r.fragments.iter())
                     .filter(|f| f.bounds.intersection(bounds).is_some())
                     .cloned(),
             );

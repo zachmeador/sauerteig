@@ -85,6 +85,34 @@ waits for queued edits, an ordered server acknowledgment, and local document wri
 An existing file is loaded at startup; an unused path starts a fresh
 arena. Stop the server before replacing its save file.
 
+The server runs `Session` on a dedicated 60 Hz thread. Network tasks use typed
+commands; they do not lock the simulation. One ordered edit worker validates,
+clips, canonicalizes, and compiles replacements on a structurally shared world
+view. The simulation checks current conflicts, budgets, and fighter overlap
+before committing. Movement frames continue while that player's edit prepares;
+mode changes remain barriers and save/sync requests wait for earlier edits.
+Deferred commands are bounded to 32 MiB per peer. Save and join workers expand and serialize cheap authored
+snapshots. Retired edit geometry, and the undo history of a peer that leaves, is
+also freed on the worker. Commands a client sent before its socket closed still
+apply, in order, even without a `Sync`; only their results have nowhere to go.
+
+Reliable peer queues have a conservative 128 MiB payload budget, including the
+packet being written. Before an edit commits, every queue must have room for the
+exact patch it will broadcast, sized by the same function as the packet, plus
+64 KiB for the result that follows. Otherwise the commit waits in the edit
+worker, which retries for two seconds and then answers that edit with a "busy"
+error and moves on, so one lagging peer never holds up the others' edits. The
+simulation continues and the joining peer keeps its revision backlog.
+Movement snapshots are replaceable. A world transfer times out only after 30
+seconds without a successful TCP write, including transfers longer than a minute.
+Server sockets enable TCP_NODELAY. The native client's locked blocking
+`tungstenite` connector already enables it through `ewebsock`.
+
+A simulation panic closes the room with an error, returns that error to the
+embedded host, and skips its final save. A pending autosave checks for failure
+before replacing the saved file. The home screen's existing host-error path
+reports the failure; reopening uses the last successful save.
+
 For a trusted LAN session:
 
 ```sh
@@ -217,3 +245,15 @@ core tests assert that Sauerbraten agrees with the reference within 3%.
 ```sh
 cargo run -p sauerteig-core --example movement_profiles
 ```
+
+The server's `/health` endpoint publishes player count, revision, tick, and
+`timing`: p50/p99/max active tick work, scheduler lateness, the largest tick's
+main cause, and per-operation timings (including edit checks/apply/publication).
+Active tick work includes commands handled since the preceding tick plus that
+physics step; it excludes time asleep. Percentiles use the most recent 36,000
+samples per category; maxima and counts cover the process lifetime. Statistics
+refresh once a second and appear in server logs every ten seconds. These are
+wall-clock durations, so OS descheduling can contribute to an observed spike.
+
+Scripted WebSocket clients in `crates/server/src/bots.rs` drive the acceptance
+tests that check ticks keep running through saves, joins, and large edits.

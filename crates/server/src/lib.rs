@@ -1,25 +1,33 @@
 //! Authoritative room simulation, combat, and collaborative edit history.
 //! Networking and world persistence are isolated in their own modules.
 
+#[cfg(test)]
+mod bots;
+mod edits;
+mod metrics;
 mod network;
+mod outbound;
 mod persistence;
+mod simulation;
 
 pub use network::serve;
 
+use outbound::{cost, Events, Packet, FOLLOW_UP_BYTES};
 use persistence::SavedWorld;
 use sauerteig_core::{
     forward, player_intersects_fragment, player_intersects_volume, ray_player, simulate_player,
-    spawn_point, validate_root_edits, Cell, CellEdit, CellFragment, CellPos, ClientMessage,
-    FineBox, InputFrame, MaterialVolume, ObjectEdit, ObjectKind, ObjectPlacement, Player,
-    Projectile, RootEdit, ServerMessage, ShotEffect, Vec3, VolumeEdit, VolumeMaterial, World,
-    WorldObject, FIXED_DT, PLAYER_HEIGHT, PLAYER_RADIUS, WORLD_FORMAT_VERSION,
+    spawn_point, Cell, CellEdit, CellFragment, CellPos, ClientMessage, FineBox, InputFrame,
+    MaterialVolume, ObjectEdit, ObjectKind, ObjectPlacement, Player, Projectile, RootEdit,
+    ServerMessage, ShotEffect, Vec3, VolumeEdit, VolumeMaterial, World, WorldObject, FIXED_DT,
+    PLAYER_HEIGHT, PLAYER_RADIUS,
 };
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 const MAX_PLAYERS: usize = 16;
 const MAX_EDITS: usize = 16_384;
@@ -73,10 +81,52 @@ enum EditPatch {
     Transaction,
 }
 
+/// The reliable message that announces a committed change. The room reserves
+/// space for it before committing and broadcasts it afterwards; both start from
+/// this choice and from `outbound::cost`, so they cannot disagree about its size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Publication {
+    Transaction,
+    Objects,
+    WorldPatch,
+    RootPatch,
+}
+impl Publication {
+    fn choose(
+        patch: EditPatch,
+        roots: &[RootEdit],
+        object_patch: bool,
+        volume_patch: bool,
+    ) -> Self {
+        if matches!(patch, EditPatch::Transaction) || volume_patch {
+            Self::Transaction
+        } else if object_patch {
+            Self::Objects
+        } else if !matches!(patch, EditPatch::Roots)
+            && roots.iter().all(|root| root_as_legacy(root).is_some())
+        {
+            Self::WorldPatch
+        } else {
+            Self::RootPatch
+        }
+    }
+    /// `objects` is the length of the object list after the change; `volumes` the
+    /// length of the replacement layer when the change carries one.
+    fn cost(self, roots: &[RootEdit], objects: usize, volumes: Option<usize>) -> usize {
+        match self {
+            Self::Transaction => cost::transaction_patch(roots, objects, volumes),
+            Self::Objects => cost::objects_patch(objects),
+            Self::WorldPatch => cost::world_patch(roots.len()),
+            Self::RootPatch => cost::root_patch(roots),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct UndoEntry {
     revision: u64,
-    before: Vec<RootEdit>,
-    after: Vec<RootEdit>,
+    before: Arc<Vec<RootEdit>>,
+    after: Arc<Vec<RootEdit>>,
     previous_revisions: Vec<Option<u64>>,
     patch: EditPatch,
     objects_before: Vec<ObjectState>,
@@ -88,6 +138,10 @@ struct UndoEntry {
     complexity: usize,
 }
 
+/// History that left the room with its builder. The simulation hands it to the
+/// edit worker to free, as it does for replaced worlds.
+type Retired = Vec<UndoEntry>;
+
 struct Peer {
     player: Player,
     input: InputFrame,
@@ -97,9 +151,9 @@ struct Peer {
     received_mode: bool,
     last_input_at: Instant,
     next_shot: u64,
-    events: mpsc::Sender<String>,
+    events: Events,
     // Replace old snapshots instead of accumulating stale movement updates.
-    snapshots: watch::Sender<String>,
+    snapshots: watch::Sender<Option<Arc<Packet>>>,
     undo: VecDeque<UndoEntry>,
     redo: Vec<UndoEntry>,
     edit_tokens: f64,
@@ -130,7 +184,7 @@ impl RootCost {
 
 struct Session {
     world: World,
-    objects: Vec<WorldObject>,
+    objects: Arc<Vec<WorldObject>>,
     revision: u64,
     cell_revisions: HashMap<CellPos, u64>,
     // Unlike undo ownership, this clock never rewinds. A stale root replacement
@@ -145,6 +199,7 @@ struct Session {
     geometry_root_costs: HashMap<CellPos, RootCost>,
     geometry_bytes: usize,
     peers: HashMap<u64, Peer>,
+    retired: Retired,
     rockets: Vec<FlyingRocket>,
     tick: u64,
     next_player: u64,
@@ -156,7 +211,12 @@ struct Session {
 }
 
 impl Session {
+    #[cfg(test)]
     fn new(saved: SavedWorld, editing_allowed: bool) -> Self {
+        Self::from_saved(saved, editing_allowed).unwrap()
+    }
+
+    fn from_saved(saved: SavedWorld, editing_allowed: bool) -> Result<Self, String> {
         let cell_revisions: HashMap<_, _> = saved
             .cells
             .iter()
@@ -164,11 +224,8 @@ impl Session {
             .chain(saved.roots.iter().map(|e| (e.pos, saved.revision)))
             .collect();
         let mut world =
-            World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)
-                .expect("validated saved world");
-        world
-            .replace_volumes(&saved.volumes)
-            .expect("validated saved material volumes");
+            World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)?;
+        world.replace_volumes(&saved.volumes)?;
         let volume_bytes = json_bytes(&world.volumes());
         let volume_revision = (!world.volumes().is_empty()).then_some(saved.revision);
         let geometry_root_costs: HashMap<_, _> = world
@@ -214,9 +271,9 @@ impl Session {
             .unwrap_or(0)
             .saturating_add(1)
             .max(saved.next_object);
-        Self {
+        Ok(Self {
             world,
-            objects: saved.objects,
+            objects: Arc::new(saved.objects),
             revision: saved.revision,
             root_changed_at: cell_revisions.clone(),
             cell_revisions,
@@ -229,6 +286,7 @@ impl Session {
             geometry_root_costs,
             geometry_bytes,
             peers: HashMap::new(),
+            retired: Vec::new(),
             rockets: Vec::new(),
             tick: 0,
             next_player: 1,
@@ -237,21 +295,31 @@ impl Session {
             editing_allowed,
             dirty: false,
             last_edit: Instant::now(),
-        }
+        })
     }
 
-    fn saved(&self) -> SavedWorld {
-        SavedWorld {
+    fn saved_snapshot(&self) -> persistence::SavedSnapshot {
+        persistence::SavedSnapshot {
             revision: self.revision,
-            format_version: WORLD_FORMAT_VERSION,
-            bounds: self.world.bounds(),
-            regions: self.world.regions(),
-            cells: self.world.cells(),
-            roots: self.world.root_overrides(),
-            volumes: self.world.volumes().to_vec(),
+            world: self.world.snapshot(),
             objects: self.objects.clone(),
             next_object: self.next_object,
         }
+    }
+    #[cfg(test)]
+    fn saved(&self) -> SavedWorld {
+        self.saved_snapshot().expand()
+    }
+
+    fn peer(&self, id: u64) -> Result<&Peer, String> {
+        self.peers
+            .get(&id)
+            .ok_or_else(|| "Session has ended; reconnect.".into())
+    }
+    fn peer_mut(&mut self, id: u64) -> Result<&mut Peer, String> {
+        self.peers
+            .get_mut(&id)
+            .ok_or_else(|| "Session has ended; reconnect.".into())
     }
 
     fn changed(&mut self) {
@@ -268,9 +336,9 @@ impl Session {
 
     fn join(
         &mut self,
-        events: mpsc::Sender<String>,
-        snapshots: watch::Sender<String>,
-    ) -> Result<(u64, ServerMessage), &'static str> {
+        events: Events,
+        snapshots: watch::Sender<Option<Arc<Packet>>>,
+    ) -> Result<(u64, simulation::Welcome), &'static str> {
         if self.peers.len() >= MAX_PLAYERS {
             return Err("This room is full (16 players).");
         }
@@ -299,54 +367,112 @@ impl Session {
         );
         Ok((
             id,
-            ServerMessage::Welcome {
+            simulation::Welcome {
                 id,
-                revision: self.revision,
-                format_version: WORLD_FORMAT_VERSION,
-                bounds: self.world.bounds(),
-                regions: self.world.regions(),
-                cells: self.world.cells(),
-                roots: self.world.root_overrides(),
-                volumes: self.world.volumes().to_vec(),
-                objects: self.objects.clone(),
+                saved: self.saved_snapshot(),
                 players: self.players(),
                 editing_allowed: self.editing_allowed,
             },
         ))
     }
 
-    fn send(&mut self, id: u64, message: ServerMessage) {
-        let text = serde_json::to_string(&message).expect("finite server message");
-        if self
+    /// Removes a peer from the room. Its undo and redo history can be large, so
+    /// it is retired for the edit worker to free rather than dropped here.
+    fn remove_peer(&mut self, id: u64) {
+        if let Some(peer) = self.peers.remove(&id) {
+            let Peer { undo, redo, .. } = peer;
+            self.retired.extend(undo);
+            self.retired.extend(redo);
+        }
+    }
+    /// Removes peers whose connection is gone.
+    fn reap(&mut self) {
+        let gone: Vec<u64> = self
             .peers
-            .get(&id)
-            .is_some_and(|p| p.events.try_send(text).is_err())
-        {
-            // Reliable edits cannot be silently dropped. A slow peer must rejoin.
-            self.peers.remove(&id);
+            .iter()
+            .filter(|(_, peer)| peer.events.closed())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in gone {
+            self.remove_peer(id);
         }
     }
 
-    fn broadcast(&mut self, message: ServerMessage) {
-        let text = serde_json::to_string(&message).expect("finite server message");
-        self.peers
-            .retain(|_, p| p.events.try_send(text.clone()).is_ok());
+    fn send(&mut self, id: u64, message: ServerMessage) {
+        let packet = Packet::new(message);
+        if self.peers.get(&id).is_some_and(|p| !p.events.send(packet)) {
+            self.remove_peer(id);
+        }
     }
-
+    fn broadcast(&mut self, message: ServerMessage) {
+        let packet = Packet::new(message);
+        let gone: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| !peer.events.send(packet.clone()))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in gone {
+            self.remove_peer(id);
+        }
+    }
+    /// Whether every connected peer's reliable queue can take `bytes` more.
+    fn peers_have_room(&self, bytes: usize) -> bool {
+        self.peers
+            .values()
+            .all(|p| p.events.closed() || p.events.available(bytes))
+    }
+    /// Leaves exactly `leave` bytes free in a peer's queue, as if a slow writer
+    /// were holding the rest.
+    #[cfg(test)]
+    fn fill_backlog(&self, id: u64, leave: usize) -> bool {
+        let Some(peer) = self.peers.get(&id) else {
+            return false;
+        };
+        let Some(bytes) = outbound::PEER_BACKLOG_BYTES.checked_sub(peer.events.used() + leave)
+        else {
+            return false;
+        };
+        peer.events.send(Packet::ballast(bytes))
+    }
+    /// Queues a message the peer's writer cannot encode, so its writer fails.
+    #[cfg(test)]
+    fn poison_peer(&self, id: u64) -> bool {
+        self.peers
+            .get(&id)
+            .is_some_and(|peer| peer.events.send(Packet::poison()))
+    }
+    /// Like `fill_backlog`, but the peer's writer is wedged on the filler until
+    /// the returned sender is used or dropped.
+    #[cfg(test)]
+    fn stall_peer(&self, id: u64, leave: usize) -> Option<std::sync::mpsc::Sender<()>> {
+        let peer = self.peers.get(&id)?;
+        let bytes = outbound::PEER_BACKLOG_BYTES.checked_sub(peer.events.used() + leave)?;
+        let (packet, release) = Packet::stall(bytes);
+        peer.events.send(packet).then_some(release)
+    }
     fn snapshot(&self) {
-        let message = ServerMessage::Snapshot {
+        let packet = Packet::new(ServerMessage::Snapshot {
             tick: self.tick,
             revision: self.revision,
             players: self.players(),
             projectiles: self.rockets.iter().map(|r| r.data.clone()).collect(),
-        };
-        let text = serde_json::to_string(&message).expect("finite snapshot");
+        });
         for peer in self.peers.values() {
-            peer.snapshots.send_replace(text.clone());
+            peer.snapshots.send_replace(Some(packet.clone()));
         }
     }
-
+    #[cfg(test)]
     fn handle(&mut self, id: u64, message: ClientMessage) -> Result<(), String> {
+        if simulation::is_edit(&message) {
+            let mut edit = self.edit_plan(id, message)?.prepare()?;
+            self.commit_prepared(id, &mut edit)
+                .map_err(edits::CommitError::message)
+        } else {
+            self.handle_control(id, message)
+        }
+    }
+    fn handle_control(&mut self, id: u64, message: ClientMessage) -> Result<(), String> {
         if !self.peers.contains_key(&id) {
             return Err("Session has ended; reconnect.".into());
         }
@@ -359,12 +485,12 @@ impl Session {
                     .take(24)
                     .collect();
                 if !name.is_empty() {
-                    self.peers.get_mut(&id).unwrap().player.name = name;
+                    self.peer_mut(id)?.player.name = name;
                 }
             }
             ClientMessage::Input { input } => {
                 validate_input(&input)?;
-                let p = self.peers.get_mut(&id).unwrap();
+                let p = self.peer_mut(id)?;
                 let distance = input.seq.wrapping_sub(p.received_seq);
                 if !p.received_input || (distance > 0 && distance < (1 << 31)) {
                     if p.inputs.len() == MAX_INPUT_BACKLOG {
@@ -375,7 +501,7 @@ impl Session {
                                     .into(),
                             },
                         );
-                        self.peers.remove(&id);
+                        self.remove_peer(id);
                         return Ok(());
                     }
                     p.inputs.push_back(input);
@@ -384,7 +510,7 @@ impl Session {
                 }
             }
             ClientMessage::SetMode { request, editing } => {
-                let peer = &self.peers[&id];
+                let peer = self.peer(id)?;
                 let distance = request.wrapping_sub(peer.player.mode_request);
                 if peer.received_mode && (distance == 0 || distance >= (1 << 31)) {
                     self.send(
@@ -397,13 +523,13 @@ impl Session {
                     return Ok(());
                 }
                 let denied = editing && !self.editing_allowed;
-                let p = &self.peers[&id].player;
+                let p = &self.peer(id)?.player;
                 let safe = if !denied && !editing && self.blocked(p) {
                     Some(self.safe_spawn(id as u32))
                 } else {
                     None
                 };
-                let p = self.peers.get_mut(&id).unwrap();
+                let p = self.peer_mut(id)?;
                 p.inputs.clear();
                 if p.received_input {
                     p.player.last_input = p.received_seq;
@@ -437,63 +563,8 @@ impl Session {
                     return Err("Editing is disabled on this server.".into());
                 }
             }
-            ClientMessage::Edit { edits, .. } => self.edit(id, edits)?,
-            ClientMessage::EditRoots {
-                base_revision,
-                roots,
-                ..
-            } => {
-                self.edit_roots(id, base_revision, roots)?;
-            }
-            ClientMessage::EditTransaction {
-                base_revision,
-                roots,
-                objects,
-                volumes,
-                ..
-            } => {
-                self.commit_transaction(
-                    id,
-                    roots,
-                    objects,
-                    volumes,
-                    Some(base_revision),
-                    EditPatch::Transaction,
-                )?;
-            }
-            ClientMessage::PlaceObject {
-                kind,
-                position,
-                rotation,
-            } => {
-                self.commit_transaction(
-                    id,
-                    vec![],
-                    vec![ObjectEdit::Create {
-                        object: ObjectPlacement {
-                            kind,
-                            position,
-                            rotation,
-                        },
-                    }],
-                    vec![],
-                    None,
-                    EditPatch::Legacy,
-                )?;
-            }
-            ClientMessage::RemoveObject { id: object_id } => {
-                self.commit_transaction(
-                    id,
-                    vec![],
-                    vec![ObjectEdit::Delete { id: object_id }],
-                    vec![],
-                    None,
-                    EditPatch::Legacy,
-                )?;
-            }
             ClientMessage::Sync { request } => self.send(id, ServerMessage::Synced { request }),
-            ClientMessage::Undo => self.undo(id)?,
-            ClientMessage::Redo => self.redo(id)?,
+
             ClientMessage::Save => {
                 self.require_editor(id)?;
                 self.dirty = true;
@@ -505,6 +576,7 @@ impl Session {
                     },
                 );
             }
+            _ => return Err("Edit requires worker preparation.".into()),
         }
         Ok(())
     }
@@ -513,14 +585,14 @@ impl Session {
         if self.revision == u64::MAX {
             return Err("The room has exhausted its edit revisions.".into());
         }
-        if !self.editing_allowed || !self.peers[&id].player.editing {
+        if !self.editing_allowed || !self.peer(id)?.player.editing {
             return Err("Enter edit mode before changing the world.".into());
         }
         Ok(())
     }
 
     fn charge_edit(&mut self, id: u64, count: usize) -> Result<(), String> {
-        let peer = self.peers.get_mut(&id).unwrap();
+        let peer = self.peer_mut(id)?;
         let now = Instant::now();
         peer.edit_tokens = (peer.edit_tokens
             + now.duration_since(peer.edit_token_time).as_secs_f64() * EDIT_RATE)
@@ -533,274 +605,18 @@ impl Session {
         Ok(())
     }
 
-    fn edit(&mut self, id: u64, edits: Vec<CellEdit>) -> Result<(), String> {
-        validate_edits(&edits)?;
-        self.commit_roots(
-            id,
-            edits.into_iter().map(legacy_root).collect(),
-            None,
-            false,
-        )
-    }
-
-    fn edit_roots(
-        &mut self,
-        id: u64,
-        base_revision: u64,
-        roots: Vec<RootEdit>,
-    ) -> Result<(), String> {
-        self.commit_roots(id, roots, Some(base_revision), true)
-    }
-
-    fn commit_roots(
-        &mut self,
-        id: u64,
-        roots: Vec<RootEdit>,
-        base_revision: Option<u64>,
-        root_patch: bool,
-    ) -> Result<(), String> {
-        validate_root_request(&roots)?;
-        self.commit_transaction(
-            id,
-            roots,
-            vec![],
-            vec![],
-            base_revision,
-            if root_patch {
-                EditPatch::Roots
-            } else {
-                EditPatch::Legacy
-            },
-        )
-    }
-
-    fn commit_transaction(
-        &mut self,
-        id: u64,
-        roots: Vec<RootEdit>,
-        objects: Vec<ObjectEdit>,
-        volumes: Vec<VolumeEdit>,
-        base_revision: Option<u64>,
-        patch: EditPatch,
-    ) -> Result<(), String> {
-        self.require_editor(id)?;
-        if roots.is_empty() && objects.is_empty() && volumes.is_empty() {
-            return Err("An edit must change geometry, objects, or material volumes.".into());
-        }
-        if !roots.is_empty() {
-            validate_root_request(&roots)?;
-        }
-        if roots.iter().any(|root| !self.world.contains_pos(root.pos)) {
-            return Err("These cells are outside the world bounds.".into());
-        }
-        if objects.len() > MAX_OBJECTS * 2 {
-            return Err("An edit may contain at most 2,048 object changes.".into());
-        }
-        if let Some(base_revision) = base_revision {
-            if base_revision > self.revision {
-                return Err("Edit revision is ahead of the server.".into());
-            }
-            if roots.iter().any(|root| {
-                self.root_changed_at
-                    .get(&root.pos)
-                    .is_some_and(|&r| r > base_revision)
-            }) {
-                return Err("These cells changed after the edit began; try again.".into());
-            }
-            if !volumes.is_empty() && self.volumes_changed_at > base_revision {
-                return Err("Material volumes changed after the edit began; try again.".into());
-            }
-        }
-        let volumes_after = if volumes.is_empty() {
-            None
-        } else {
-            let after = self.world.prepare_volume_edits(&volumes)?;
-            (after != self.world.volumes()).then_some(after)
-        };
-        let volume_bytes = volumes_after.as_ref().map_or(self.volume_bytes, json_bytes);
-        let volumes_before = volumes_after
-            .as_ref()
-            .map(|_| self.world.volumes().to_vec());
-        if let Some(after) = &volumes_after {
-            self.validate_volume_fighter_overlap(after)?;
-        }
-        // Resolve every object before mutating either part of the world. IDs
-        // are reserved locally and become consumed only on a successful commit.
-        let mut next_object = self.next_object;
-        let mut seen = HashSet::new();
-        let mut objects_before = Vec::new();
-        let mut objects_after = Vec::new();
-        for edit in objects {
-            let (object_id, placement) = match edit {
-                ObjectEdit::Create { object } => {
-                    if next_object == u32::MAX {
-                        return Err("No object IDs remain.".into());
-                    }
-                    let object_id = next_object;
-                    next_object += 1;
-                    (object_id, Some(object))
-                }
-                ObjectEdit::Update { id, object } => {
-                    if !self.objects.iter().any(|o| o.id == id) {
-                        return Err("That object no longer exists.".into());
-                    }
-                    (id, Some(object))
-                }
-                ObjectEdit::Delete { id } => {
-                    if !self.objects.iter().any(|o| o.id == id) {
-                        return Err("That object no longer exists.".into());
-                    }
-                    (id, None)
-                }
-            };
-            if !seen.insert(object_id) {
-                return Err("An object may be changed only once per edit.".into());
-            }
-            if base_revision.is_some_and(|base| {
-                self.object_changed_at
-                    .get(&object_id)
-                    .is_some_and(|&r| r > base)
-            }) {
-                return Err("This object changed after the edit began; try again.".into());
-            }
-            let value = if let Some(object) = placement {
-                validate_object_position(object.position, object.rotation)?;
-                if !self
-                    .world
-                    .contains_pos(object.position.floor().as_ivec3().to_array())
-                {
-                    return Err("Object must be inside the world bounds.".into());
-                }
-                Some(WorldObject {
-                    id: object_id,
-                    kind: object.kind,
-                    position: object.position,
-                    rotation: object.rotation,
-                })
-            } else {
-                None
-            };
-            let before = self.objects.iter().find(|o| o.id == object_id).cloned();
-            if before != value {
-                objects_before.push(ObjectState {
-                    id: object_id,
-                    value: before,
-                });
-                objects_after.push(ObjectState {
-                    id: object_id,
-                    value,
-                });
-            }
-        }
-        self.validate_object_count(&objects_after)?;
-        let roots: Vec<_> = roots
-            .into_iter()
-            .map(|root| RootEdit {
-                pos: root.pos,
-                fragments: sauerteig_core::canonical_root_fragments(root.pos, &root.fragments),
-            })
-            .filter(|root| self.world.root_fragments(root.pos) != root.fragments)
-            .collect();
-        if roots.is_empty() && objects_after.is_empty() && volumes_after.is_none() {
-            return Ok(());
-        }
-        self.validate_fighter_overlap(&roots)?;
-        let before: Vec<_> = roots
-            .iter()
-            .map(|root| RootEdit {
-                pos: root.pos,
-                fragments: self.world.root_fragments(root.pos),
-            })
-            .collect();
-        if roots_complexity(&before) > MAX_EDIT_FRAGMENTS {
-            return Err(
-                "This edit replaces too much detailed geometry at once; use a smaller selection."
-                    .into(),
-            );
-        }
-        let previous_revisions: Vec<_> = roots
-            .iter()
-            .map(|e| self.cell_revisions.get(&e.pos).copied())
-            .collect();
-        let previous_object_revisions = objects_before
-            .iter()
-            .map(|o| self.object_revisions.get(&o.id).copied())
-            .collect();
-        self.charge_edit(
-            id,
-            roots_complexity(&roots) + objects_after.len() + volumes.len(),
-        )?;
-        let geometry_changed = self.apply_roots(&roots, volume_bytes)?;
-        if !geometry_changed && objects_after.is_empty() && volumes_after.is_none() {
-            return Ok(());
-        }
-        if !geometry_changed {
-            self.changed();
-        }
-        let mut changed_before = Vec::new();
-        let mut changed_after = Vec::new();
-        let mut changed_previous = Vec::new();
-        for (before, previous) in before.into_iter().zip(previous_revisions) {
-            let after = RootEdit {
-                pos: before.pos,
-                fragments: self.world.root_fragments(before.pos),
-            };
-            if before != after {
-                changed_before.push(before);
-                changed_after.push(after);
-                changed_previous.push(previous);
-            }
-        }
-        let (before, roots, previous_revisions) = (changed_before, changed_after, changed_previous);
-        self.apply_object_states(&objects_after);
-        let previous_volume_revision = self.volume_revision;
-        if let Some(after) = &volumes_after {
-            self.apply_volumes(after);
-        }
-        self.next_object = next_object;
-        let complexity = roots_complexity(&before)
-            + roots_complexity(&roots)
-            + objects_before.len() * 2
-            + volumes_before.as_ref().map_or(0, Vec::len)
-            + volumes_after.as_ref().map_or(0, Vec::len);
-        let entry = UndoEntry {
-            revision: self.revision,
-            before,
-            after: roots.clone(),
-            previous_revisions,
-            patch,
-            objects_before,
-            objects_after,
-            previous_object_revisions,
-            volumes_before,
-            volumes_after,
-            previous_volume_revision,
-            complexity,
-        };
-        let peer = self.peers.get_mut(&id).unwrap();
-        peer.redo.clear();
-        let undo = &mut peer.undo;
-        let mut history_complexity = undo.iter().map(|entry| entry.complexity).sum::<usize>();
-        while undo.len() >= 32 || history_complexity + complexity > MAX_HISTORY_COMPLEXITY {
-            let Some(discarded) = undo.pop_front() else {
-                break;
-            };
-            history_complexity -= discarded.complexity;
-        }
-        let object_patch = !entry.objects_after.is_empty();
-        let volume_patch = entry.volumes_after.is_some();
-        undo.push_back(entry);
-        self.broadcast_change(roots, patch, object_patch, volume_patch);
-        Ok(())
-    }
-
-    fn validate_object_count(&self, states: &[ObjectState]) -> Result<(), String> {
+    /// How many objects the room would hold after applying `states`.
+    fn object_count_after(&self, states: &[ObjectState]) -> usize {
         let removed = states
             .iter()
             .filter(|s| self.objects.iter().any(|o| o.id == s.id))
             .count();
         let added = states.iter().filter(|s| s.value.is_some()).count();
-        if self.objects.len() - removed + added > MAX_OBJECTS {
+        self.objects.len() - removed + added
+    }
+
+    fn validate_object_count(&self, states: &[ObjectState]) -> Result<(), String> {
+        if self.object_count_after(states) > MAX_OBJECTS {
             return Err("The room has reached its object limit.".into());
         }
         Ok(())
@@ -810,18 +626,20 @@ impl Session {
         for state in states {
             if let Some(index) = self.objects.iter().position(|o| o.id == state.id) {
                 if let Some(object) = &state.value {
-                    self.objects[index] = object.clone();
+                    Arc::make_mut(&mut self.objects)[index] = object.clone();
                 } else {
-                    self.objects.remove(index);
+                    Arc::make_mut(&mut self.objects).remove(index);
                 }
             } else if let Some(object) = &state.value {
-                self.objects.push(object.clone());
+                Arc::make_mut(&mut self.objects).push(object.clone());
             }
             // Deleted IDs keep their ownership token and monotonic clock.
             self.object_revisions.insert(state.id, self.revision);
             self.object_changed_at.insert(state.id, self.revision);
         }
-        self.objects.sort_by_key(|o| o.id);
+        if !states.is_empty() {
+            Arc::make_mut(&mut self.objects).sort_by_key(|o| o.id);
+        }
     }
 
     fn validate_volume_fighter_overlap(&self, volumes: &[MaterialVolume]) -> Result<(), String> {
@@ -836,142 +654,6 @@ impl Session {
         Ok(())
     }
 
-    fn apply_volumes(&mut self, volumes: &[MaterialVolume]) {
-        self.world
-            .replace_volumes(volumes)
-            .expect("previously validated material volume state");
-        self.volume_bytes = json_bytes(&self.world.volumes());
-        self.volume_revision = Some(self.revision);
-        self.volumes_changed_at = self.revision;
-    }
-
-    fn undo(&mut self, id: u64) -> Result<(), String> {
-        self.require_editor(id)?;
-        let Some(entry) = self.peers[&id].undo.back() else {
-            return Err("Nothing to undo.".into());
-        };
-        if entry
-            .before
-            .iter()
-            .any(|e| self.cell_revisions.get(&e.pos) != Some(&entry.revision))
-        {
-            return Err("Cannot undo: a later edit changed these cells.".into());
-        }
-        if entry
-            .objects_before
-            .iter()
-            .any(|o| self.object_revisions.get(&o.id) != Some(&entry.revision))
-        {
-            return Err("Cannot undo: a later edit changed these objects.".into());
-        }
-        if entry.volumes_before.is_some() && self.volume_revision != Some(entry.revision) {
-            return Err("Cannot undo: a later edit changed material volumes.".into());
-        }
-        self.validate_fighter_overlap(&entry.before)?;
-        self.validate_object_count(&entry.objects_before)?;
-        if let Some(volumes) = &entry.volumes_before {
-            self.validate_volume_fighter_overlap(volumes)?;
-        }
-        let edits = entry.before.clone();
-        let objects = entry.objects_before.clone();
-        let volumes = entry.volumes_before.clone();
-        let volume_bytes = volumes.as_ref().map_or(self.volume_bytes, json_bytes);
-        self.charge_edit(
-            id,
-            roots_complexity(&edits) + objects.len() + volumes.as_ref().map_or(0, Vec::len),
-        )?;
-        if !self.apply_roots(&edits, volume_bytes)? {
-            self.changed();
-        }
-        self.apply_object_states(&objects);
-        if let Some(volumes) = &volumes {
-            self.apply_volumes(volumes);
-        }
-        let entry = self.peers.get_mut(&id).unwrap().undo.pop_back().unwrap();
-        // Restore ownership lineage; monotonic stale-snapshot clocks never rewind.
-        for (e, previous) in edits.iter().zip(&entry.previous_revisions) {
-            if let Some(revision) = previous {
-                self.cell_revisions.insert(e.pos, *revision);
-            } else {
-                self.cell_revisions.remove(&e.pos);
-            }
-        }
-        for (object, previous) in objects.iter().zip(&entry.previous_object_revisions) {
-            if let Some(revision) = previous {
-                self.object_revisions.insert(object.id, *revision);
-            } else {
-                self.object_revisions.remove(&object.id);
-            }
-        }
-        if volumes.is_some() {
-            self.volume_revision = entry.previous_volume_revision;
-        }
-        let patch = entry.patch;
-        self.peers.get_mut(&id).unwrap().redo.push(entry);
-        self.broadcast_change(edits, patch, !objects.is_empty(), volumes.is_some());
-        Ok(())
-    }
-
-    fn redo(&mut self, id: u64) -> Result<(), String> {
-        self.require_editor(id)?;
-        let Some(entry) = self.peers[&id].redo.last() else {
-            return Err("Nothing to redo.".into());
-        };
-        if entry
-            .before
-            .iter()
-            .zip(&entry.previous_revisions)
-            .any(|(e, previous)| self.cell_revisions.get(&e.pos).copied() != *previous)
-        {
-            return Err("Cannot redo: a later edit changed these cells.".into());
-        }
-        if entry
-            .objects_before
-            .iter()
-            .zip(&entry.previous_object_revisions)
-            .any(|(o, previous)| self.object_revisions.get(&o.id).copied() != *previous)
-        {
-            return Err("Cannot redo: a later edit changed these objects.".into());
-        }
-        if entry.volumes_after.is_some() && self.volume_revision != entry.previous_volume_revision {
-            return Err("Cannot redo: a later edit changed material volumes.".into());
-        }
-        self.validate_fighter_overlap(&entry.after)?;
-        self.validate_object_count(&entry.objects_after)?;
-        if let Some(volumes) = &entry.volumes_after {
-            self.validate_volume_fighter_overlap(volumes)?;
-        }
-        let edits = entry.after.clone();
-        let objects = entry.objects_after.clone();
-        let volumes = entry.volumes_after.clone();
-        let volume_bytes = volumes.as_ref().map_or(self.volume_bytes, json_bytes);
-        self.charge_edit(
-            id,
-            roots_complexity(&edits) + objects.len() + volumes.as_ref().map_or(0, Vec::len),
-        )?;
-        if !self.apply_roots(&edits, volume_bytes)? {
-            self.changed();
-        }
-        self.apply_object_states(&objects);
-        if let Some(volumes) = &volumes {
-            self.apply_volumes(volumes);
-        }
-        let entry = self.peers.get_mut(&id).unwrap().redo.pop().unwrap();
-        for edit in &edits {
-            self.cell_revisions.insert(edit.pos, entry.revision);
-        }
-        for object in &objects {
-            self.object_revisions.insert(object.id, entry.revision);
-        }
-        if volumes.is_some() {
-            self.volume_revision = Some(entry.revision);
-        }
-        let patch = entry.patch;
-        self.peers.get_mut(&id).unwrap().undo.push_back(entry);
-        self.broadcast_change(edits, patch, !objects.is_empty(), volumes.is_some());
-        Ok(())
-    }
-
     fn broadcast_change(
         &mut self,
         roots: Vec<RootEdit>,
@@ -979,21 +661,27 @@ impl Session {
         object_patch: bool,
         volume_patch: bool,
     ) {
-        if matches!(patch, EditPatch::Transaction) || volume_patch {
-            self.broadcast(ServerMessage::TransactionPatch {
+        let message = match Publication::choose(patch, &roots, object_patch, volume_patch) {
+            Publication::Transaction => ServerMessage::TransactionPatch {
                 revision: self.revision,
                 roots,
-                objects: self.objects.clone(),
+                objects: self.objects.as_ref().clone(),
                 volumes: volume_patch.then(|| self.world.volumes().to_vec()),
-            });
-        } else if object_patch {
-            self.broadcast(ServerMessage::Objects {
+            },
+            Publication::Objects => ServerMessage::Objects {
                 revision: self.revision,
-                objects: self.objects.clone(),
-            });
-        } else {
-            self.broadcast_roots(roots, matches!(patch, EditPatch::Roots));
-        }
+                objects: self.objects.as_ref().clone(),
+            },
+            Publication::WorldPatch => ServerMessage::WorldPatch {
+                revision: self.revision,
+                edits: roots.iter().filter_map(root_as_legacy).collect(),
+            },
+            Publication::RootPatch => ServerMessage::RootPatch {
+                revision: self.revision,
+                roots,
+            },
+        };
+        self.broadcast(message);
     }
 
     fn validate_fighter_overlap(&self, roots: &[RootEdit]) -> Result<(), String> {
@@ -1017,106 +705,6 @@ impl Session {
             }
         }
         Ok(())
-    }
-
-    fn apply_roots(&mut self, roots: &[RootEdit], volume_bytes: usize) -> Result<bool, String> {
-        // Requests were validated before reaching this method; history entries
-        // are previously accepted state. Charge the room budget for the same
-        // canonical representation that the world will store, not its authored
-        // subdivision count.
-        let roots: Vec<_> = roots
-            .iter()
-            .map(|root| RootEdit {
-                pos: root.pos,
-                fragments: sauerteig_core::canonical_root_fragments(root.pos, &root.fragments),
-            })
-            .collect();
-        let previous: Vec<_> = roots
-            .iter()
-            .map(|r| self.world.root_fragments(r.pos))
-            .collect();
-        let removed: Vec<_> = roots
-            .iter()
-            .map(|root| {
-                self.geometry_root_costs
-                    .get(&root.pos)
-                    .copied()
-                    .unwrap_or_default()
-            })
-            .collect();
-        let added: Vec<_> = roots
-            .iter()
-            .map(|root| RootCost::new(root, self.world.has_regions()))
-            .collect();
-        if self.geometry_fragments - removed.iter().map(|cost| cost.fragments).sum::<usize>()
-            + added.iter().map(|cost| cost.fragments).sum::<usize>()
-            > MAX_WORLD_FRAGMENTS
-        {
-            return Err("The room has reached its detailed geometry limit.".into());
-        }
-        if self.geometry_bytes - removed.iter().map(|cost| cost.bytes).sum::<usize>()
-            + added.iter().map(|cost| cost.bytes).sum::<usize>()
-            + volume_bytes
-            > MAX_GEOMETRY_BYTES
-        {
-            return Err(SNAPSHOT_LIMIT_ERROR.into());
-        }
-        self.world.apply_root_edits(&roots)?;
-        let after: Vec<_> = roots
-            .iter()
-            .map(|r| self.world.root_fragments(r.pos))
-            .collect();
-        let mut changed = false;
-        for ((root, before), after) in roots.iter().zip(&previous).zip(&after) {
-            if before != after {
-                changed = true;
-                let cost = RootCost::new(
-                    &RootEdit {
-                        pos: root.pos,
-                        fragments: after.clone(),
-                    },
-                    self.world.has_regions(),
-                );
-                let old = if cost.fragments == 0 {
-                    self.geometry_root_costs
-                        .remove(&root.pos)
-                        .unwrap_or_default()
-                } else {
-                    self.geometry_root_costs
-                        .insert(root.pos, cost)
-                        .unwrap_or_default()
-                };
-                self.geometry_fragments = self.geometry_fragments - old.fragments + cost.fragments;
-                self.geometry_bytes = self.geometry_bytes - old.bytes + cost.bytes;
-            }
-        }
-        if !changed {
-            return Ok(false);
-        }
-        self.changed();
-        for ((root, before), after) in roots.iter().zip(previous).zip(after) {
-            if before != after {
-                self.cell_revisions.insert(root.pos, self.revision);
-                self.root_changed_at.insert(root.pos, self.revision);
-            }
-        }
-        Ok(true)
-    }
-
-    fn broadcast_roots(&mut self, roots: Vec<RootEdit>, root_patch: bool) {
-        if !root_patch {
-            if let Some(edits) = roots.iter().map(root_as_legacy).collect::<Option<Vec<_>>>() {
-                self.broadcast(ServerMessage::WorldPatch {
-                    revision: self.revision,
-                    edits,
-                });
-                return;
-            }
-        }
-        self.broadcast(ServerMessage::RootPatch {
-            revision: self.revision,
-            roots,
-        });
     }
 
     fn blocked(&self, player: &Player) -> bool {
@@ -1222,7 +810,9 @@ impl Session {
     }
 
     fn fire(&mut self, id: u64, shots: &mut Vec<ShotEffect>) {
-        let peer = self.peers.get_mut(&id).unwrap();
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return;
+        };
         let origin = peer.player.eye();
         let direction = forward(peer.player.yaw, peer.player.pitch);
         let weapon = peer.input.weapon;
@@ -1455,22 +1045,6 @@ fn validate_root_request(roots: &[RootEdit]) -> Result<(), String> {
                 .into(),
         );
     }
-    validate_root_edits(roots)
-}
-
-fn validate_edits(edits: &[CellEdit]) -> Result<(), String> {
-    if edits.is_empty() || edits.len() > MAX_EDITS {
-        return Err("An edit must contain 1–16,384 cells.".into());
-    }
-    let mut seen = HashSet::new();
-    for e in edits {
-        if !World::is_valid_pos(e.pos)
-            || e.cell.is_some_and(|c| !validate_cell(c))
-            || !seen.insert(e.pos)
-        {
-            return Err("Invalid cell position, shape, material, or duplicate cell.".into());
-        }
-    }
     Ok(())
 }
 
@@ -1501,7 +1075,9 @@ fn json_bytes(value: &impl serde::Serialize) -> usize {
         }
     }
     let mut counter = Counter(0);
-    serde_json::to_writer(&mut counter, value).expect("valid world JSON");
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return MAX_WORLD_SNAPSHOT_BYTES;
+    }
     counter.0
 }
 

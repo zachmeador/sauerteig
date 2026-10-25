@@ -1,4 +1,6 @@
+use crate::edits::CommitError;
 use crate::network::{MESSAGE_BYTES, OUTBOUND_WRITE_BYTES};
+use crate::outbound::FOLLOW_UP_BYTES;
 use crate::persistence::{load_world, write_world, SavedWorld};
 use crate::{
     legacy_root, serve, Config, Session, EDIT_BURST, MAX_EDITS, MAX_HISTORY_COMPLEXITY,
@@ -85,7 +87,7 @@ fn volume_layer_history_preserves_multiplayer_ownership_and_stale_clear_clocks()
     )
     .unwrap();
     assert_eq!(session.revision, 1);
-    match serde_json::from_str::<ServerMessage>(&events.try_recv().unwrap()).unwrap() {
+    match events.try_recv().unwrap().packet.message.clone() {
         ServerMessage::TransactionPatch {
             volumes: Some(volumes),
             roots,
@@ -250,9 +252,12 @@ fn water_does_not_block_combat_but_glass_stops_shots_and_blast_visibility() {
     assert!(session.peers[&target].player.health < 100);
 }
 
-fn peer(session: &mut Session, editing: bool) -> (u64, mpsc::Receiver<String>) {
-    let (events, receiver) = mpsc::channel(256);
-    let (snapshots, _) = watch::channel(String::new());
+fn peer(
+    session: &mut Session,
+    editing: bool,
+) -> (u64, mpsc::UnboundedReceiver<crate::outbound::Queued>) {
+    let (events, receiver) = crate::outbound::channel();
+    let (snapshots, _) = watch::channel(None);
     let (id, _) = session.join(events, snapshots).unwrap();
     session.peers.get_mut(&id).unwrap().player.editing = editing;
     (id, receiver)
@@ -813,7 +818,7 @@ fn overflowing_input_queue_disconnects_instead_of_skipping_prediction_frames() {
             .unwrap();
     }
     assert!(!session.peers.contains_key(&id));
-    let message: ServerMessage = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+    let message: ServerMessage = events.try_recv().unwrap().packet.message.clone();
     assert!(matches!(message, ServerMessage::Error { message } if message.contains("backlog")));
 }
 
@@ -851,7 +856,7 @@ fn mode_acknowledges_request_and_discards_old_mode_inputs() {
     assert_eq!(p.player.mode_request, 7);
     assert!(p.player.editing);
     assert!(!p.input.fire);
-    let message: ServerMessage = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+    let message: ServerMessage = events.try_recv().unwrap().packet.message.clone();
     assert!(matches!(
         message,
         ServerMessage::ModeChanged {
@@ -888,7 +893,7 @@ fn denied_edit_mode_still_acknowledges_authoritative_mode() {
             }
         )
         .is_err());
-    let message: ServerMessage = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+    let message: ServerMessage = events.try_recv().unwrap().packet.message.clone();
     assert!(matches!(
         message,
         ServerMessage::ModeChanged {
@@ -1658,7 +1663,7 @@ fn mixed_history_fighter_checks_and_object_limit_are_atomic() {
     // Another builder may use the freed capacity. Undo must keep both halves
     // unchanged if restoring the deleted object would exceed the room limit.
     for id in 2..=MAX_OBJECTS as u32 + 1 {
-        session.objects.push(WorldObject {
+        std::sync::Arc::make_mut(&mut session.objects).push(WorldObject {
             id,
             kind: ObjectKind::Light,
             position: Vec3::new(4.0, 2.0, 4.0),
@@ -1995,9 +2000,10 @@ fn compact_snapshot_accounting_is_small_conservative_and_survives_cuts() {
             .map(|root| crate::json_bytes(root) + 1)
             .sum::<usize>();
     assert_eq!(session.geometry_bytes, expected);
-    let (events, _receiver) = mpsc::channel(16);
-    let (snapshots, _) = watch::channel(String::new());
+    let (events, _receiver) = crate::outbound::channel();
+    let (snapshots, _) = watch::channel(None);
     let (_, welcome) = session.join(events, snapshots).unwrap();
+    let welcome = welcome.expand();
     assert!(crate::json_bytes(&welcome) < session.geometry_bytes + crate::SNAPSHOT_ENVELOPE_BYTES);
     assert_eq!(Session::new(saved, true).geometry_bytes, expected);
 }
@@ -2028,8 +2034,8 @@ fn sync_acknowledges_prior_history_changes_without_requiring_edit_mode() {
     session
         .handle(builder, ClientMessage::Sync { request: 42 })
         .unwrap();
-    let patch: ServerMessage = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
-    let synced: ServerMessage = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+    let patch: ServerMessage = events.try_recv().unwrap().packet.message.clone();
+    let synced: ServerMessage = events.try_recv().unwrap().packet.message.clone();
     assert!(matches!(
         patch,
         ServerMessage::WorldPatch { revision: 2, .. }
@@ -2041,7 +2047,7 @@ fn sync_acknowledges_prior_history_changes_without_requiring_edit_mode() {
     session
         .handle(builder, ClientMessage::Sync { request: 43 })
         .unwrap();
-    let synced: ServerMessage = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+    let synced: ServerMessage = events.try_recv().unwrap().packet.message.clone();
     assert!(matches!(synced, ServerMessage::Synced { request: 43 }));
     assert_eq!(session.revision, 2);
 }
@@ -2086,4 +2092,277 @@ fn snapshot_load_budget_counts_canonical_growth_before_accepting_roots() {
         projected_bytes, room.geometry_bytes,
         "load must budget the canonical representation"
     );
+}
+
+#[test]
+fn a_full_peer_backlog_defers_publication_without_losing_the_joiner() {
+    let mut session = room();
+    let (id, mut incoming) = peer(&mut session, true);
+    let packet = crate::outbound::Packet::new(ServerMessage::Synced { request: 1 });
+    while session.peers[&id].events.available(packet.bytes) {
+        assert!(session.peers[&id].events.send(packet.clone()));
+    }
+    let mut prepared = session
+        .edit_plan(
+            id,
+            ClientMessage::Edit {
+                request: 1,
+                edits: edit(1),
+            },
+        )
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let (fragments, bytes) = (session.geometry_fragments, session.geometry_bytes);
+    assert!(matches!(
+        session.commit_prepared(id, &mut prepared),
+        Err(CommitError::Busy)
+    ));
+    // Busy changes nothing, so the same prepared edit can be offered again.
+    assert_eq!(session.revision, 0);
+    assert!(session.peers.contains_key(&id));
+    assert!(session.peers[&id].undo.is_empty());
+    assert_eq!(session.peers[&id].edit_tokens, EDIT_BURST);
+    assert_eq!(
+        (session.geometry_fragments, session.geometry_bytes),
+        (fragments, bytes)
+    );
+    while incoming.try_recv().is_ok() {}
+    session.commit_prepared(id, &mut prepared).unwrap();
+    assert_eq!(session.revision, 1);
+    assert!(session.peers.contains_key(&id));
+}
+
+/// A commit that can be rebuilt identically: a builder, whose queue stays open,
+/// and the message it publishes next.
+struct Scenario {
+    session: Session,
+    builder: u64,
+    _events: mpsc::UnboundedReceiver<crate::outbound::Queued>,
+    message: ClientMessage,
+}
+
+fn scenario(message: impl FnOnce(&mut Session, u64) -> ClientMessage) -> Scenario {
+    let mut session = room();
+    let (builder, events) = peer(&mut session, true);
+    let message = message(&mut session, builder);
+    Scenario {
+        session,
+        builder,
+        _events: events,
+        message,
+    }
+}
+
+/// Every cell of a full 128 by 128 layer, the most a legacy edit may change.
+fn cap_erase() -> Scenario {
+    let cells: Vec<CellEdit> = (WORLD_MIN..WORLD_MAX)
+        .flat_map(|x| {
+            (WORLD_MIN..WORLD_MAX).map(move |z| CellEdit {
+                pos: [x, 8, z],
+                cell: Some(Cell::solid(0)),
+            })
+        })
+        .collect();
+    assert_eq!(cells.len(), MAX_EDITS);
+    let mut session = Session::new(
+        SavedWorld {
+            volumes: Vec::new(),
+            format_version: 2,
+            bounds: Default::default(),
+            regions: Vec::new(),
+            revision: 0,
+            cells: cells.clone(),
+            roots: Vec::new(),
+            objects: Vec::new(),
+            next_object: 0,
+        },
+        true,
+    );
+    let (builder, events) = peer(&mut session, true);
+    let erase = cells
+        .into_iter()
+        .map(|cell| CellEdit { cell: None, ..cell })
+        .collect();
+    Scenario {
+        session,
+        builder,
+        _events: events,
+        message: ClientMessage::Edit {
+            request: 1,
+            edits: erase,
+        },
+    }
+}
+
+/// Commits the scenario three times on identical rooms. With plenty of room the
+/// first shows the packet the commit queues. The others leave a watcher, and the
+/// builder whose result must still fit, exactly that packet plus the follow-up
+/// space, then one byte less. The reservation has to be the packet's own cost:
+/// less could drop a peer that was promised room, more would turn away edits
+/// that fit. Returns the packet's cost.
+fn assert_reservation_is_the_packet(build: impl Fn() -> Scenario) -> usize {
+    let published = {
+        let Scenario {
+            mut session,
+            builder,
+            _events,
+            message,
+        } = build();
+        let (_watcher, mut seen) = peer(&mut session, false);
+        let mut prepared = session
+            .edit_plan(builder, message)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        session.commit_prepared(builder, &mut prepared).unwrap();
+        let patch = seen.try_recv().unwrap().packet.clone();
+        assert!(
+            patch.encode().unwrap().len() <= patch.bytes,
+            "the accounting must cover the real encoding"
+        );
+        patch.bytes
+    };
+    for fits in [false, true] {
+        let room = published + FOLLOW_UP_BYTES - usize::from(!fits);
+        let Scenario {
+            mut session,
+            builder,
+            _events,
+            message,
+        } = build();
+        let (watcher, _seen) = peer(&mut session, false);
+        let mut prepared = session
+            .edit_plan(builder, message)
+            .unwrap()
+            .prepare()
+            .unwrap();
+        assert!(session.fill_backlog(watcher, room) && session.fill_backlog(builder, room));
+        let revision = session.revision;
+        let result = session.commit_prepared(builder, &mut prepared);
+        if fits {
+            result.unwrap();
+            assert_eq!(session.revision, revision + 1);
+            // The result that follows the patch still fits in both queues.
+            session.send(
+                builder,
+                ServerMessage::EditResult {
+                    request: 1,
+                    error: None,
+                },
+            );
+            assert!(session.peers.contains_key(&builder));
+            assert!(session.peers.contains_key(&watcher));
+        } else {
+            assert!(matches!(result, Err(CommitError::Busy)), "{result:?}");
+            assert_eq!(session.revision, revision);
+        }
+    }
+    published
+}
+
+#[test]
+fn a_legacy_erase_at_the_cap_reserves_exactly_its_world_patch() {
+    // Sixteen thousand emptied roots. A legacy patch costs the same per cell
+    // edit however empty its root is, so an estimate that follows the roots'
+    // fragments falls millions of bytes short here.
+    let published = assert_reservation_is_the_packet(cap_erase);
+    assert_eq!(published, crate::outbound::cost::world_patch(MAX_EDITS));
+}
+
+#[test]
+fn every_kind_of_patch_reserves_exactly_its_packet() {
+    use sauerteig_core::{ObjectEdit, VolumeMaterial::Water};
+    // Detailed roots publish a root patch.
+    assert_reservation_is_the_packet(|| {
+        scenario(|_, _| ClientMessage::EditRoots {
+            request: 1,
+            base_revision: 0,
+            roots: vec![
+                fine_root([20, 4, 20], [1, 2, 3], 2),
+                fine_root([21, 4, 20], [0, 2, 3], 1),
+            ],
+        })
+    });
+    // An object publishes the whole object list, however long it has grown.
+    assert_reservation_is_the_packet(|| {
+        scenario(|session, _| {
+            std::sync::Arc::make_mut(&mut session.objects).extend((1..=500).map(|id| {
+                WorldObject {
+                    id,
+                    kind: ObjectKind::Light,
+                    position: Vec3::new(4.0, 2.0, 4.0),
+                    rotation: 0.0,
+                }
+            }));
+            session.next_object = 501;
+            ClientMessage::PlaceObject {
+                kind: ObjectKind::Light,
+                position: Vec3::new(5.0, 2.0, 5.0),
+                rotation: 0.0,
+            }
+        })
+    });
+    // A transaction carries roots, the object list, and the replacement volume layer.
+    assert_reservation_is_the_packet(|| {
+        scenario(|_, _| ClientMessage::EditTransaction {
+            request: 1,
+            base_revision: 0,
+            roots: vec![fine_root([20, 4, 20], [1, 2, 3], 2)],
+            objects: vec![ObjectEdit::Create {
+                object: object_at(Vec3::new(4.0, 2.0, 4.0)),
+            }],
+            volumes: vec![volume_edit([160, 32, 160], [176, 48, 176], Some(Water))],
+        })
+    });
+    // Undo publishes with the patch kind its entry was made with.
+    assert_reservation_is_the_packet(|| {
+        let mut scenario = scenario(|_, _| ClientMessage::Undo);
+        scenario.session.edit(scenario.builder, edit(1)).unwrap();
+        scenario
+    });
+}
+
+#[test]
+fn a_leaving_peers_history_is_retired_not_freed_by_the_thread_that_removes_it() {
+    let mut session = room();
+    let (a, _a) = peer(&mut session, true);
+    let (b, events_b) = peer(&mut session, true);
+    let (c, _c) = peer(&mut session, true);
+    for (index, builder) in [a, b, c].into_iter().enumerate() {
+        for material in [1, 2] {
+            let cell = CellEdit {
+                pos: [20 + index as i32, 4, 20],
+                cell: Some(Cell::solid(material)),
+            };
+            session.edit(builder, vec![cell]).unwrap();
+        }
+        session.undo(builder).unwrap();
+    }
+    let undo = std::sync::Arc::downgrade(&session.peers[&a].undo.back().unwrap().before);
+    let redo = std::sync::Arc::downgrade(&session.peers[&a].redo.last().unwrap().before);
+    session.remove_peer(a);
+    assert!(!session.peers.contains_key(&a));
+    assert_eq!(session.retired.len(), 2, "one undo and one redo entry");
+    assert!(
+        undo.upgrade().is_some() && redo.upgrade().is_some(),
+        "removal must not free the history on this thread"
+    );
+    // A connection that went away is reaped the same way, and so is a peer
+    // whose queue overflows.
+    drop(events_b);
+    session.reap();
+    assert!(!session.peers.contains_key(&b));
+    assert_eq!(session.retired.len(), 4);
+    assert!(session.fill_backlog(c, 0));
+    session.send(
+        c,
+        ServerMessage::Notice {
+            message: "x".into(),
+        },
+    );
+    assert!(!session.peers.contains_key(&c));
+    assert_eq!(session.retired.len(), 6);
+    drop(std::mem::take(&mut session.retired));
+    assert!(undo.upgrade().is_none() && redo.upgrade().is_none());
 }

@@ -21,7 +21,7 @@ touch the same code.
 
 | Work | State | Next |
 | --- | --- | --- |
-| [Shared sandbox](shared-sandbox.md) | Active | Stage 1: the simulation never waits for saves, joins, or large edits. |
+| [Shared sandbox](shared-sandbox.md) | Active | Stage 1 (single-owner simulation, snapshot saves and joins) is merged and awaits the maintainer's check in the app. Stages 3 and 4 are parked; stage 2 is next when big-map loading needs it. |
 | [World format](world-format.md) | Active | Stage 1 (movement styles in the core) is complete. Next: world settings with the profiles wired in, then object properties and a material library with texture alignment. |
 | [Renderer](renderer.md) | Active | Stage 1 (HDR, anti-aliasing, cached shadows, smooth motion) is merged and awaits the maintainer's 144 Hz check. Stage 2 (many real lights with a shadow atlas) is in progress. |
 | [Large worlds and performance](large-worlds.md) | Partial | Viewing distance, streaming, and traversal, once the first three tracks lay their foundations. |
