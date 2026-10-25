@@ -106,6 +106,15 @@ Acceptance:
     [internet play](../../research/internet-play.md).
   - Send the world in independently decodable chunks with a progress display.
   - The client builds and meshes incrementally without freezing the browser.
+  - **Design decided after [research](../../research/wire-encoding.md):**
+    - postcard for messages;
+    - a hand-packed delta format for bulk tables;
+    - zstd per chunk (ruzstd to decode in wasm);
+    - chunks ordered by distance from spawn;
+    - a build time-sliced by clock.
+
+    The largest library world shrinks from 44.9 MB of JSON to 165 KB. Building it
+    on the client (about 1 s of CPU in wasm) becomes the main work.
 - **Stages 3 and 4 are parked** (maintainer, 2026-10-25): internet multiplayer and
   multiplayer playtesting aren't current priorities, so don't spend effort on them
   until the maintainer asks.
