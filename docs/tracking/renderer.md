@@ -11,13 +11,14 @@ assumed.
 
 ## Current behavior
 
-- **Stage 1 is in place.** The scene renders in linear HDR with bloom, filmic
-  tonemapping, Auto 4× MSAA, render scaling, cached static shadows, motion
-  interpolation between fixed steps, and per-pass GPU timings in F3.
-- **Lighting is still limited.** It is one sun plus the eight nearest light
-  nodes, all with the same fixed warm downward 12 m cone ([lighting](lighting.md)).
-- **Still constants:** sun direction, fog, field of view, and the 180 m far
-  plane.
+- **Stages 1 and 2 are in place.** The scene renders in linear HDR with bloom,
+  filmic tonemapping, Auto 4× MSAA, render scaling, motion interpolation, and
+  per-pass GPU timings in F3.
+- **Lights.** Every light node in view is a clustered point light, with shadows
+  from a cached atlas for up to 149 lights. Players cast shadows under the eight
+  most important lamps.
+- **Still constants:** light color and range (until object properties land), sun
+  direction, fog, field of view, and the 180 m far plane.
 
 ## Stage 1: render foundation
 
@@ -42,9 +43,9 @@ look on the 144 Hz 4K monitor, natively or in the browser.
 - **Shared shader code.** One WGSL module is assembled into each shader, and all
   five validate with Naga.
 - **Cached shadows.**
-  - The sun window (192 m, moving in 6 m steps) and local lights keep
-    static-geometry shadow caches.
-  - Any geometry or object rebuild invalidates them.
+  - The sun window (192 m, moving in 6 m steps) keeps a static-geometry shadow
+    cache, as local lights did until stage 2.
+  - Any geometry or object rebuild invalidates the sun's.
   - Moving actors are drawn over a copy each frame.
 - **Back-face culling** on opaque terrain.
   - Terrain falls back to two-sided drawing when the camera is inside geometry.
@@ -59,114 +60,76 @@ look on the 144 Hz 4K monitor, natively or in the browser.
 
 Gaps:
 
-- **Large imported worlds stay slow.** They take 16–38 ms per frame at 4K even
-  without MSAA. They are limited by geometry rather than pixels, which is a job
-  for the [large-worlds](large-worlds.md) track.
-- **Shadow invalidation is coarse.** Any geometry rebuild invalidates every cache.
-  Stage 2's atlas should key caches by tile and version.
+- **Large imported worlds stay slow.** They took 16–38 ms per frame at 4K even
+  without MSAA; stage 2's shader change brings the same poses to 11–20 ms with 149
+  real lights. They are limited by geometry more than pixels, which is a job for
+  the [large-worlds](large-worlds.md) track.
+- **Sun shadow invalidation is coarse.** Any geometry rebuild invalidates its
+  cache. Stage 2 keys local light caches by tile and version; the sun's cascades
+  (stage 2b) should too.
 - **Untested hardware paths:** adapters without timestamps or MSAA, and non-Fifo
   native presentation.
 
 ## Stage 2: many real lights
 
-State: active on branch `render-many-lights`.
-
-Every light node in view lights the scene as a real light with shadows, instead
-of only the nearest eight downward cones. Imported maps render with all of their
-hundreds of lights. The design follows the [research](../../research/many-lights.md),
-which holds the budgets and test plan.
-
-Decisions:
+State: merged on 2026-10-25. The maintainer has not yet looked at it natively or
+in the browser.
 
 - **Light model.**
-  - Each light becomes a `LightDesc`: position, linear color, intensity, range,
-    kind (point, or spot with direction and inner and outer cone), and a shadow
-    mode (off, static, or dynamic).
-  - Light nodes become **point lights** by default: warm `[1.0, 0.74, 0.46]`,
-    12 m range, static shadows.
-  - One function maps a `WorldObject` to a `LightDesc`. The world format's object
-    properties will fill it from real values later.
-  - Spot lights exist in the data and shaders now, exercised by tests and
-    synthetic captures.
+  - Light nodes are warm point lights: 12 m range, intensity 16, which keeps mean
+    image brightness within 3% of stage 1 on the arena and spawn poses.
+  - Each becomes a `LightDesc` through `light_from_object`. Spot lights work in
+    data and shaders but have no editing UI yet.
 - **Clustered forward shading.**
-  - A 16×9×24 view-cluster grid: slice 0 runs from the near plane to 4 m, then
-    slices grow exponentially to the far plane.
-  - A compute pass builds a 256-bit light mask per cluster from up to 256 visible
-    lights, sorted by importance.
-  - Light records are 64 bytes each, in a storage buffer.
-  - One shared WGSL lighting function serves the world, props, and water and
-    glass, with a soft cap of 16 lights per fragment.
-  - Draw chunks front to back. No depth pre-pass in this stage.
-- **Paged shadow atlas.**
-  - A `texture_depth_2d_array` of 1024² D32F pages, each holding one tile size:
-    4 × 512², 16 × 256², or 64 × 128².
-  - Point lights use six tiles, with major-axis face selection and a two-texel
-    guard band. Spot lights use one tile.
-  - Tile size comes from projected radius, with ×1.5 hysteresis and 1 second of
-    residency. The light being edited ranks first, and lights under 2 m radius
-    are unshadowed.
-  - Render one pass per dirty page, placing tiles with viewport and scissor and
-    clearing a tile by drawing a depth-1 quad.
-- **Static caches and an actor overlay.**
-  - A tile re-renders only when its version changes: a light edit, or a chunk
-    edit inside the light's sphere. Caches are keyed by tile and version,
-    replacing stage 1's per-light caches.
-  - Moving actors go into a small overlay page that lights with actors in range
-    also sample.
-  - At most 6 faces render per frame (12 for three frames after a teleport or
-    join), capped at 1.5 ms by measured cost.
-  - Stale tiles stay in use while waiting.
-  - New lights fade in once their shadows are valid, and lights over budget fade
-    out rather than leak light through walls.
-- **Water and glass** use the shared lighting function with premultiplied alpha
-  (`color·α + specular`), capped at specular-only with 8 lights.
-- **Fallbacks.**
-  - Keep fragment storage buffers at four or fewer and workgroups at 64, so
-    compatibility-class adapters still run the main path.
-  - Adapters without compute or storage buffers use uniform buffers with CPU-built
-    64-bit masks and 64 lights.
-  - Today's nearest-eight path stays as the last resort.
+  - A 16×9×24 cluster grid with compute-built 256-bit masks over up to 256
+    visible lights, ranked by range over distance.
+  - One shared lighting function serves terrain, props, water, and glass, with up
+    to 16 lights per fragment.
+  - Water and glass use premultiplied alpha.
+- **Shadow atlas.**
+  - 14 pages (60 MiB with the overlay page), holding 149 point lights at the
+    smallest tile size. Lights beyond that fade out rather than leak through
+    walls.
+  - Static caches are keyed by tile and version.
+  - The eight most important shadowed lights also sample an actor overlay, so
+    players cast shadows under nearby lamps.
+  - Filling the atlas after a join takes about 2.5 seconds, nearest lights first.
+  - At least one face renders each frame.
+- **Fallbacks.** A uniform-buffer path and today's nearest-eight path are
+  settings of the same shaders.
+- **One `unsafe` block.**
+  - `render/shaders.rs::trusted` compiles our shaders without wgpu's forced
+    loop bounding; bounds checks stay on.
+  - The reason: on Metal that bounding made the clustered loop about three times
+    slower.
+  - Its `SAFETY` comment explains why every shader loop is bounded.
+  - WebGPU ignores the option.
+- **Tooling.** F3 shows the lighting path and the light and shadow counts. The
+  capture tool gained synthetic scenes (light room, corridor, water and glass,
+  lamp hall) and flags for comparing paths.
 
-Not in this stage:
-- sun cascades and quality tiers (stage 2b);
-- editing light properties ([world format](world-format.md));
-- importing light radius and color;
-- sky (stage 3).
+Gaps:
 
-Parallel work: the shared-sandbox stage 1 fixes are being finished on another
-branch. Leave `crates/server`, `crates/core`, and protocol types untouched; stay
-within client rendering, `lighting.rs`, and the capture tool.
-
-Acceptance:
-
-- **Checks.** fmt, Clippy, all workspace tests, the native build, and a wasm
-  `cargo check` pass.
-  - Disk is tight: run release builds only for the capture binary, delete
-    `target/release` afterwards, and skip `build-web.sh`.
-- **Correctness.**
-  - Clustered output matches a brute-force all-lights render, and compute-built
-    masks match CPU-built ones, on synthetic scenes.
-  - Shadow invalidation tests: an edit in range re-renders a tile, an edit out of
-    range doesn't, and a moved light re-renders.
-  - Every assembled shader validates with Naga.
-- **Captures** with the stage 1 tool, kept under the worktree's `.local/captures/`
-  and listed in Evidence:
-  - the arena and the materials scene;
-  - the largest imported map from three poses, before (eight cones) and after
-    (all lights);
-  - the research's synthetic scenes: 64 lights in a room around the camera, a
-    corridor, a pose heavy with water and glass, and an edit storm that
-    invalidates everything.
-- **Measurements** on this Mac, natively, at 1080p and 3840×2160:
-  - frame time and per-pass GPU time for the arena, the largest imported map, and
-    the 64-light room;
-  - shadow updates per frame and cache hit rate.
-
-  Targets from the research: shadows ≤1.5 ms on average and ≤3 ms at p99; culling
-  ≤0.1 ms; and the largest imported map at ≤14 ms p95 at 1080p on this Mac. If a
-  target is missed, record by how much and why.
-- **Not observable by the session:** feel in a native window and in the browser.
-  List these checks precisely as not yet observed.
+- **Busy 4K scenes can't hold 144 Hz.** Dense lights cost 1.6–1.95× stage 1 at
+  4K, for example the imported tower at 19.7 ms. Stage 2b's quality tiers are
+  the lever. At 1080p, stage 2 is faster than stage 1.
+- **Imported maps draw 149 of their 339 lights.** Lights don't have
+  per-light brightness until object properties arrive, and the 16-light cap per
+  fragment can bind in dense clusters.
+- **Some targets are borderline.**
+  - The largest imported map's p95 at 1080p is 13.2–13.6 ms against a 14 ms
+    target, and some earlier sessions missed it.
+  - An edit storm at 4K has a 4.16 ms p99 for atlas updates, against a 3 ms
+    target.
+- **The sun's static pass costs 7–9 ms** whenever its window or geometry changes.
+  Stage 2b's cascades address it.
+- **The actor overlay's 15 tiles run out** with four or more actors in a crowded,
+  lit room. The lowest-ranked of the eight lights then drop actor shadows on some
+  faces.
+- **Not exercised:**
+  - the uniform and nearest paths, except when forced on this Mac;
+  - browser frames (the shaders do compile in Chrome 155);
+  - the research's full sweeps of light counts, MSAA, and render scale.
 
 ## Later stages
 
@@ -214,3 +177,39 @@ Stage 1, 2026-10-25, on this Mac's Apple M3 Pro at 3840×2160:
     monitor;
   - interaction in a native window;
   - shadow updates during continuous editing.
+
+Stage 2, 2026-10-25, on this Mac's Apple M3 Pro. Captures and raw numbers are
+kept outside the repository in `.local/captures/render-stage2/` in the main
+checkout.
+
+- **Checks.**
+  - fmt, Clippy, the workspace tests (363, plus 6 GPU tests run explicitly), the
+    native builds, and the wasm check passed for the implementer and again in the
+    design lead's review.
+  - The GPU tests compare clustered output with a brute-force render, compute
+    masks with CPU masks, and cached shadows with fresh ones.
+  - All 18 assembled shaders validate with Naga and compile in Chrome 155.
+- **Frame times** (median / p95 ms):
+
+  | Pose | 1080p stage 1 | 1080p stage 2 | 4K stage 1 | 4K stage 2 |
+  | --- | ---: | ---: | ---: | ---: |
+  | arena-yard | 4.9 / 6.5 | 3.5 / 5.0 | 4.2 / 6.6 | 5.4 / 6.0 |
+  | materials-lamp-shadow | 5.5 / 6.5 | 4.6 / 5.8 | 5.5 / 7.1 | 6.8 / 8.1 |
+  | imported-spawn | 16.3 / 18.1 | 12.4 / 13.6 | 15.1 / 16.1 | 14.5 / 16.0 |
+  | imported-overlook | 20.0 / 21.2 | 12.2 / 13.2 | 15.7 / 17.2 | 17.3 / 18.7 |
+  | imported-tower | 13.1 / 14.7 | 8.5 / 9.0 | 12.1 / 13.0 | 19.7 / 20.1 |
+  | lightroom-center | 8.0 / 9.5 | 5.5 / 6.8 | 8.0 / 8.3 | 15.6 / 17.1 |
+
+  The 144 Hz budget is 6.94 ms. Gaps between sessions under 15% are noise on this
+  shared machine.
+- **Atlas updates** (mean / p99 ms):
+  - flights and teleports: ≤0.51 / ≤2.05;
+  - imported-map edit storm: 1.43 / 2.67 at 1080p and 1.30 / 4.16 at 4K.
+- **Culling** takes 0.09–0.12 ms on imported maps.
+- **Actor overlay.** The overlay pass costs 0.02–0.04 ms on the GPU and 0.1–0.2 ms
+  of CPU planning. With 4 or 16 actors, shading adds 0.4–1.4 ms.
+- **Not observed:**
+  - the look in a native window or in the browser;
+  - lights popping or shimmering while moving;
+  - actor shadows switching as lights enter or leave the top eight;
+  - 144 Hz feel.

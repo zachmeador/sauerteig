@@ -2060,10 +2060,20 @@ impl Game {
                 ),
                 egui::Align2::RIGHT_TOP,
                 format!(
-                    "{} / static shadows updated: {}",
+                    "{} / shadow maps rendered: {}",
                     renderer.render_description(),
                     renderer.shadow_updates
                 ),
+                mono(10.0),
+                MUTED,
+            );
+            painter.text(
+                egui::pos2(
+                    screen.right() - 24.0,
+                    124.0 + renderer.gpu_times().map_or(1, |t| t.len().max(1)) as f32 * 12.0,
+                ),
+                egui::Align2::RIGHT_TOP,
+                renderer.lighting_description(),
                 mono(10.0),
                 MUTED,
             );

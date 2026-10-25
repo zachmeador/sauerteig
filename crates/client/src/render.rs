@@ -1,4 +1,8 @@
+pub(crate) mod atlas;
+pub(crate) mod clusters;
 pub(crate) mod culling;
+mod lights;
+pub(crate) mod lightset;
 mod post;
 mod props;
 pub mod settings;
@@ -8,22 +12,50 @@ mod timing;
 mod volumes;
 use post::{PostProcess, HDR_FORMAT};
 use settings::RenderSettings;
-use shadows::CachedShadow;
+use shadows::{CachedShadow, ShadowAtlasGpu};
 
+pub use self::lightset::{LightingTier, OverBudget};
 use self::{
     culling::{Bounds, Frustum},
-    props::{instance_layout, PropRenderer},
+    lights::{ClusterView, LightGpu},
+    lightset::{FrameInput, LightSet, LightingStats, TileJob, View},
+    props::{instance_layout, PropRenderer, ShadowTarget, TileView},
+    shaders::LightLayout,
     volumes::VolumeRenderer,
 };
-use crate::lighting::{
-    closest_lights, sun_shadow_matrix, LIGHT_RANGE, LOCAL_LIGHTS, LOCAL_SHADOW_SIZE,
-};
+use crate::lighting::{sun_shadow_matrix, LightDesc, ShadowMode};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
-use sauerteig_core::{ChunkKey, Mesh, World, WorldObject};
+use glam::{Mat4, Vec2, Vec3};
+use sauerteig_core::{ChunkKey, Mesh, World, WorldObject, CHUNK_SIZE};
 use std::{collections::BTreeMap, sync::Arc};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+const FOV_Y: f32 = 78.0 * std::f32::consts::PI / 180.0;
+const NEAR_PLANE: f32 = 0.06;
+const FAR_PLANE: f32 = 180.0;
+/// GPU time a frame may spend rendering shadow faces, at the measured cost.
+const SHADOW_BUDGET_MS: f64 = 1.5;
+
+/// Choices a test or comparison capture can make that the game does not.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RendererOptions {
+    /// Use this lighting path instead of the best one the adapter supports.
+    pub tier: Option<LightingTier>,
+    /// Evaluate every light at every fragment instead of reading cluster masks.
+    pub brute_force: bool,
+    pub over_budget: OverBudget,
+    /// Shadow mode of the lights light nodes place.
+    pub node_shadows: ShadowMode,
+    /// Shadow atlas pages instead of the lighting path's default, up to 14.
+    pub atlas_pages: Option<usize>,
+    /// How many of the most important shadowed lights shadow moving actors,
+    /// instead of the default.
+    pub actor_lights: Option<usize>,
+    /// Advance light fades and residency by this much each frame, not by the
+    /// clock, so captures repeat.
+    pub fixed_frame_time: Option<f32>,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -47,22 +79,12 @@ impl GpuVertex {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct CameraUniform {
+pub(crate) struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     light_view_proj: [[f32; 4]; 4],
     eye_time: [f32; 4],
     sun: [f32; 4],
     fog: [f32; 4],
-    points: [[f32; 4]; 8],
-    point_colors: [[f32; 4]; 8],
-    local_view_proj: [[[f32; 4]; 4]; LOCAL_LIGHTS],
-}
-struct LocalShadow {
-    cache: CachedShadow,
-    position: Option<Vec3>,
-    depth: wgpu::TextureView,
-    camera: wgpu::Buffer,
-    group: wgpu::BindGroup,
 }
 pub struct GpuMesh {
     vertex: wgpu::Buffer,
@@ -150,13 +172,13 @@ impl GpuMesh {
         }
         self.count = indices.len() as u32;
     }
-    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         self.draw_prefix(pass, self.count);
     }
-    fn draw_prefix<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, count: u32) {
+    fn draw_prefix(&self, pass: &mut wgpu::RenderPass<'_>, count: u32) {
         self.draw_range(pass, 0..count);
     }
-    fn draw_range<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, range: std::ops::Range<u32>) {
+    fn draw_range(&self, pass: &mut wgpu::RenderPass<'_>, range: std::ops::Range<u32>) {
         let range = range.start.min(self.count)..range.end.min(self.count);
         if range.is_empty() {
             return;
@@ -180,8 +202,8 @@ pub struct Renderer {
     shadow: wgpu::TextureView,
     shadow_texture: wgpu::Texture,
     sun_cache: CachedShadow,
-    local_depth: wgpu::Texture,
     geometry_revision: u64,
+    /// Shadow maps rendered by the last frame: the sun's window and atlas faces.
     pub shadow_updates: usize,
     camera_buffer: wgpu::Buffer,
     pub materials: crate::materials::Materials,
@@ -189,12 +211,20 @@ pub struct Renderer {
     props: PropRenderer,
     volumes: VolumeRenderer,
     camera_group: wgpu::BindGroup,
-    shadow_group: wgpu::BindGroup,
+    options: RendererOptions,
+    clock: FrameClock,
+    lights: LightSet,
+    light_gpu: LightGpu,
+    atlas: ShadowAtlasGpu,
+    extra_lights: Vec<LightDesc>,
+    actor_points: Vec<Vec3>,
+    lighting: LightingStats,
+    lighting_settled: bool,
+    lighting_plan_ms: f64,
+    shadow_cost: ShadowCost,
     pipeline: Vec<wgpu::RenderPipeline>,
     two_sided_pipeline: Vec<wgpu::RenderPipeline>,
     shadow_pipeline: wgpu::RenderPipeline,
-    local_shadow_pipeline: wgpu::RenderPipeline,
-    local_shadows: [LocalShadow; LOCAL_LIGHTS],
     sky_pipeline: Vec<wgpu::RenderPipeline>,
     chunks: BTreeMap<ChunkKey, GpuMesh>,
     objects: Option<GpuMesh>,
@@ -204,16 +234,91 @@ pub struct Renderer {
     visible_world_triangles: usize,
     pub adapter_name: String,
 }
+
+/// Shadow faces can be cheap or very costly, depending on the geometry around
+/// their light. This follows the measured GPU time per face, from frames whose
+/// timestamps have come back, so updates can be held to a time budget.
+struct ShadowCost {
+    ms_per_face: f64,
+    submitted: std::collections::VecDeque<(u64, usize)>,
+    seen: u64,
+}
+impl Default for ShadowCost {
+    fn default() -> Self {
+        Self {
+            // Until a frame is measured, assume a full update takes the budget.
+            ms_per_face: SHADOW_BUDGET_MS / 6.0,
+            submitted: Default::default(),
+            seen: 0,
+        }
+    }
+}
+impl ShadowCost {
+    fn observe(&mut self, timing: &timing::GpuTiming) {
+        let serial = timing.latest_serial();
+        if serial == self.seen {
+            return;
+        }
+        self.seen = serial;
+        while self.submitted.front().is_some_and(|&(s, _)| s < serial) {
+            self.submitted.pop_front();
+        }
+        if let (Some(&(s, faces)), Some(span)) = (self.submitted.front(), timing.latest_shadow_span)
+        {
+            if s == serial && faces > 0 {
+                self.ms_per_face += (span / faces as f64 - self.ms_per_face) * 0.3;
+            }
+        }
+    }
+    fn faces_limit(&self) -> usize {
+        (SHADOW_BUDGET_MS / self.ms_per_face.max(1.0e-3)) as usize
+    }
+}
+
+/// Seconds between frames, for fading lights and timing tile residency.
+struct FrameClock {
+    last: Option<web_time::Instant>,
+    fixed: Option<f32>,
+}
+impl FrameClock {
+    fn tick(&mut self) -> f32 {
+        if let Some(fixed) = self.fixed {
+            return fixed;
+        }
+        let now = web_time::Instant::now();
+        let dt = self
+            .last
+            .map_or(1.0 / 60.0, |last| (now - last).as_secs_f32());
+        self.last = Some(now);
+        dt.clamp(0.0, 0.1)
+    }
+}
+
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Result<Self, String> {
         let size = window.inner_size();
-        Self::create(Some(window), size.width.max(1), size.height.max(1)).await
+        Self::create(
+            Some(window),
+            size.width.max(1),
+            size.height.max(1),
+            RendererOptions::default(),
+        )
+        .await
     }
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn headless(width: u32, height: u32) -> Result<Self, String> {
-        Self::create(None, width, height).await
+    pub async fn headless_with(
+        width: u32,
+        height: u32,
+        options: RendererOptions,
+    ) -> Result<Self, String> {
+        Self::create(None, width, height, options).await
     }
-    async fn create(window: Option<Arc<Window>>, width: u32, height: u32) -> Result<Self, String> {
+    async fn create(
+        window: Option<Arc<Window>>,
+        width: u32,
+        height: u32,
+        options: RendererOptions,
+    ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -244,6 +349,8 @@ impl Renderer {
             )
             .await
             .map_err(|e| e.to_string())?;
+        let tier = options.tier.unwrap_or_else(|| lighting_tier(&adapter));
+        log::info!("{adapter_name}: {tier:?} lighting");
         // Browser window sizing can settle while adapter/device creation awaits.
         let [width, height] = window.as_ref().map_or([width, height], |window| {
             let size = window.inner_size();
@@ -314,7 +421,7 @@ impl Renderer {
         let shadow = shadow_texture.create_view(&Default::default());
         let sun_cache = CachedShadow::new(&device, 2048);
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera and lights"),
+            label: Some("camera"),
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -340,77 +447,14 @@ impl Renderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-        let local_depth = shadows::depth_texture(
-            &device,
-            LOCAL_SHADOW_SIZE,
-            LOCAL_LIGHTS as u32,
-            "local working shadows",
-        );
-        let local_depth_array = local_depth.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("all fixture shadows"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-        let local_shadows = std::array::from_fn(|i| {
-            let camera = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fixture shadow camera"),
-                size: 64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fixture shadow camera"),
-                layout: &camera_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera.as_entire_binding(),
-                }],
-            });
-            LocalShadow {
-                cache: CachedShadow::new(&device, LOCAL_SHADOW_SIZE),
-                position: None,
-                depth: local_depth.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some("fixture shadow layer"),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: i as u32,
-                    array_layer_count: Some(1),
-                    ..Default::default()
-                }),
-                camera,
-                group,
-            }
-        });
-        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shadows layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let mut tier_config = tier.config();
+        if let Some(pages) = options.atlas_pages {
+            tier_config.pages = pages.clamp(1, shadows::MAX_PAGES);
+        }
+        if let Some(lights) = options.actor_lights {
+            tier_config.actor_lights = lights;
+        }
+        let light_layout = LightLayout::for_tier(&tier_config);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison"),
             compare: Some(wgpu::CompareFunction::LessEqual),
@@ -418,36 +462,32 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let shadow_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadows"),
-            layout: &shadow_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&shadow),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&local_depth_array),
-                },
-            ],
-        });
-        let materials = crate::materials::Materials::new(&device, &queue)?;
-        let props = PropRenderer::new(&device)?;
-        let volumes = VolumeRenderer::new(&device, HDR_FORMAT, &camera_layout, sample_counts);
         let identity_instance = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("world identity transform"),
             contents: bytemuck::cast_slice(&[[0.0f32; 4]]),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let shader = shaders::module(&device, "world");
+        let atlas = ShadowAtlasGpu::new(
+            &device,
+            tier_config.pages,
+            &shaders::module(&device, "shadow", light_layout),
+            &[GpuVertex::layout(), instance_layout()],
+        );
+        let light_gpu = LightGpu::new(&device, tier_config, &shadow, &sampler, &atlas.array);
+        let materials = crate::materials::Materials::new(&device, &queue)?;
+        let props = PropRenderer::new(&device)?;
+        let volumes = VolumeRenderer::new(
+            &device,
+            HDR_FORMAT,
+            &camera_layout,
+            &light_gpu.bind_layout,
+            light_layout,
+            sample_counts,
+        );
+        let shader = shaders::module(&device, "world", light_layout);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world pipeline layout"),
-            bind_group_layouts: &[&camera_layout, &shadow_layout, &materials.layout],
+            bind_group_layouts: &[&camera_layout, &light_gpu.bind_layout, &materials.layout],
             push_constant_ranges: &[],
         });
         let world_pipeline = |sample_count, cull_mode| {
@@ -523,35 +563,7 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
-        let local_shader = shaders::module(&device, "shadow");
-        let local_shadow_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("fixture depth"),
-                layout: Some(&shadow_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &local_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[GpuVertex::layout(), instance_layout()],
-                    compilation_options: Default::default(),
-                },
-                fragment: None,
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    bias: wgpu::DepthBiasState {
-                        constant: 1,
-                        slope_scale: 0.0,
-                        clamp: 0.0,
-                    },
-                    ..depth_state()
-                }),
-                multisample: Default::default(),
-                multiview: None,
-                cache: None,
-            });
-        let sky = shaders::module(&device, "sky");
+        let sky = shaders::module(&device, "sky", light_layout);
         let sky_pipeline = sample_counts
             .iter()
             .map(|&sample_count| {
@@ -604,7 +616,6 @@ impl Renderer {
             shadow,
             shadow_texture,
             sun_cache,
-            local_depth,
             geometry_revision: 0,
             shadow_updates: 0,
             camera_buffer,
@@ -613,12 +624,23 @@ impl Renderer {
             props,
             volumes,
             camera_group,
-            shadow_group,
+            options,
+            clock: FrameClock {
+                last: None,
+                fixed: options.fixed_frame_time,
+            },
+            lights: LightSet::new(tier_config, options.over_budget, options.node_shadows),
+            light_gpu,
+            atlas,
+            extra_lights: Vec::new(),
+            actor_points: Vec::new(),
+            lighting: LightingStats::default(),
+            lighting_settled: false,
+            lighting_plan_ms: 0.0,
+            shadow_cost: ShadowCost::default(),
             pipeline,
             two_sided_pipeline,
             shadow_pipeline,
-            local_shadow_pipeline,
-            local_shadows,
             sky_pipeline,
             chunks: BTreeMap::new(),
             objects: None,
@@ -655,6 +677,51 @@ impl Renderer {
             "{}x{} / {}x MSAA / {:?}",
             self.post.size[0], self.post.size[1], self.post.samples, self.config.present_mode
         )
+    }
+    /// Lights drawn, shadowed and rendered this frame, for the debug overlay.
+    pub fn lighting_description(&self) -> String {
+        let l = &self.lighting;
+        format!(
+            "{:?} lights: {} drawn / {} in view / {} total, {} shadowed ({} with actors), {} over budget, {} waiting; shadow faces {} new / {} resident",
+            self.lights.config().tier,
+            l.drawn,
+            l.visible,
+            l.world_lights,
+            l.shadowed,
+            l.actor_shadowed,
+            l.over_budget,
+            l.waiting,
+            l.tiles_rendered,
+            l.tiles_resident,
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lighting_stats(&self) -> LightingStats {
+        self.lighting
+    }
+    /// No shadow face is waiting to render and no light is fading.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lighting_settled(&self) -> bool {
+        self.lighting_settled
+    }
+    /// CPU time spent choosing lights and shadow tiles in the last frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lighting_plan_ms(&self) -> f64 {
+        self.lighting_plan_ms
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn lighting_tier(&self) -> LightingTier {
+        self.lights.config().tier
+    }
+    /// How many of the last frame's lights reach each view cluster.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cluster_counts(&self) -> Vec<u32> {
+        self.light_gpu.cluster_counts()
+    }
+    /// Lights beyond those the world's objects place, for captures and tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_extra_lights(&mut self, lights: Vec<LightDesc>) {
+        self.extra_lights = lights;
     }
     pub fn gpu_times(&self) -> Option<&BTreeMap<String, f64>> {
         self.timing.supported().then_some(&self.timing.latest)
@@ -748,9 +815,17 @@ impl Renderer {
     }
     pub fn rebuild_all(&mut self, world: &World) {
         self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.lights.invalidate_all();
         self.chunks.clear();
-        self.rebuild(world, &world.chunk_keys());
+        self.rebuild_meshes(world, &world.chunk_keys());
         self.rebuild_volumes(world);
+    }
+    /// Treat every cached shadow as stale, as after an edit that touches
+    /// everything, without rebuilding any geometry.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn invalidate_shadows(&mut self) {
+        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.lights.invalidate_all();
     }
     pub fn rebuild_volumes(&mut self, world: &World) {
         self.volumes.rebuild(&self.device, world);
@@ -759,6 +834,9 @@ impl Renderer {
         if !keys.is_empty() {
             self.geometry_revision = self.geometry_revision.wrapping_add(1);
         }
+        self.rebuild_meshes(world, keys);
+    }
+    fn rebuild_meshes(&mut self, world: &World, keys: &[ChunkKey]) {
         for &key in keys {
             let Mesh { vertices, indices } = world.mesh_chunk(key);
             let gpu: Vec<_> = vertices
@@ -772,11 +850,24 @@ impl Renderer {
                     material: v.material as u32,
                 })
                 .collect();
-            if let Some(mesh) = GpuMesh::new(&self.device, &gpu, &indices) {
-                self.chunks.insert(key, mesh);
-            } else {
-                self.chunks.remove(&key);
+            // Lights whose reach touches the old or new mesh redraw their tiles.
+            let min = Vec3::from_array(key.map(|v| (v * CHUNK_SIZE) as f32));
+            let mut dirty = Bounds {
+                min,
+                max: min + Vec3::splat(CHUNK_SIZE as f32),
+            };
+            if let Some(old) = self.chunks.get(&key) {
+                dirty = dirty.union(old.bounds);
             }
+            let mesh = GpuMesh::new(&self.device, &gpu, &indices);
+            if let Some(mesh) = &mesh {
+                dirty = dirty.union(mesh.bounds);
+            }
+            self.lights.invalidate_bounds(dirty);
+            match mesh {
+                Some(mesh) => self.chunks.insert(key, mesh),
+                None => self.chunks.remove(&key),
+            };
         }
         self.triangles = self.chunks.values().map(|m| m.count as usize / 3).sum();
     }
@@ -801,23 +892,30 @@ impl Renderer {
         output: egui::FullOutput,
         context: &egui::Context,
     ) -> Result<(), wgpu::SurfaceError> {
+        // A lost or outdated surface must end the frame before the light planner
+        // marks shadow faces as rendered, or they would never be.
+        let frame = self
+            .surface
+            .as_ref()
+            .map(|s| s.get_current_texture())
+            .transpose()?;
         self.timing.begin(&self.device, &self.queue);
         let underwater =
             world.volume_material_at(eye) == Some(sauerteig_core::VolumeMaterial::Water);
         let two_sided_terrain = culling::camera_intersects_terrain(world, eye);
         let view = Mat4::look_to_rh(eye, direction, Vec3::Y);
         let proj = Mat4::perspective_rh(
-            78.0_f32.to_radians(),
+            FOV_Y,
             self.config.width as f32 / self.config.height as f32,
-            0.06,
-            180.0,
+            NEAR_PLANE,
+            FAR_PLANE,
         );
         let view_projection = proj * view;
         let camera_frustum = Frustum::new(view_projection);
         let sun = Vec3::new(-0.44, 0.76, 0.34).normalize();
         let sun_projection = sun_shadow_matrix(sun, eye);
         let sun_frustum = Frustum::new(sun_projection);
-        let mut uniform = CameraUniform {
+        let uniform = CameraUniform {
             view_proj: view_projection.to_cols_array_2d(),
             light_view_proj: sun_projection.to_cols_array_2d(),
             eye_time: [eye.x, eye.y, eye.z, time],
@@ -827,9 +925,6 @@ impl Renderer {
             } else {
                 [0.105, 0.125, 0.135, 0.00005]
             },
-            points: [[0.0; 4]; 8],
-            point_colors: [[0.0; 4]; 8],
-            local_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); LOCAL_LIGHTS],
         };
         self.visible_world_triangles = self
             .chunks
@@ -837,37 +932,69 @@ impl Renderer {
             .filter(|mesh| camera_frustum.intersects(mesh.bounds))
             .map(|mesh| mesh.count as usize / 3)
             .sum();
-        let nearby = shadows::stable_slots(
-            closest_lights(objects, eye),
-            self.local_shadows.each_ref().map(|s| s.position),
-        );
-        for (shadow, light) in self.local_shadows.iter_mut().zip(nearby) {
-            shadow.position = light.map(|l| l.position);
+
+        self.actor_points.clear();
+        if shadow_index_count > 0
+            && (self.lights.shadows_actors()
+                || self
+                    .extra_lights
+                    .iter()
+                    .any(|l| l.shadow == ShadowMode::Dynamic))
+        {
+            self.actor_points.extend(
+                indices[..shadow_index_count as usize]
+                    .iter()
+                    .map(|&i| Vec3::from_array(vertices[i as usize].position)),
+            );
         }
+        let scene_height = self.post.size[1] as f32;
+        self.shadow_cost.observe(&self.timing);
+        let planning = web_time::Instant::now();
+        let plan = self.lights.plan(&FrameInput {
+            objects,
+            extra: &self.extra_lights,
+            view: View {
+                eye,
+                frustum: &camera_frustum,
+                view,
+                pixels_per_radian: scene_height * 0.5 / (FOV_Y * 0.5).tan(),
+            },
+            dt: self.clock.tick(),
+            actors: &self.actor_points,
+            faces_limit: if self.timing.supported() {
+                self.shadow_cost.faces_limit()
+            } else {
+                usize::MAX
+            },
+        });
+        self.lighting_plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+        self.lighting = plan.stats;
+        self.lighting_settled = plan.settled;
+        let tile_views: Vec<TileView> = plan
+            .jobs
+            .iter()
+            .map(|job| TileView {
+                frustum: Frustum::new(job.matrix),
+                center: job.center,
+                range: job.range,
+            })
+            .collect();
         self.props
-            .prepare(&self.queue, objects, eye, &nearby, &sun_frustum);
+            .prepare(&self.queue, objects, eye, &sun_frustum, &tile_views);
         self.volumes
             .prepare(&self.queue, eye, direction, &camera_frustum);
-        for (i, light) in nearby.iter().enumerate() {
-            if let Some(light) = light {
-                let p = light.position;
-                uniform.points[i] = [p.x, p.y, p.z, 40.0];
-                uniform.point_colors[i] = [1.0, 0.74, 0.46, LIGHT_RANGE];
-                uniform.local_view_proj[i] = light.view_proj.to_cols_array_2d();
-                self.queue.write_buffer(
-                    &self.local_shadows[i].camera,
-                    0,
-                    bytemuck::bytes_of(&uniform.local_view_proj[i]),
-                );
-            }
-        }
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        let frame = self
-            .surface
-            .as_ref()
-            .map(|s| s.get_current_texture())
-            .transpose()?;
+        self.light_gpu.upload(
+            &self.queue,
+            &plan,
+            ClusterView {
+                size: Vec2::new(self.post.size[0] as f32, self.post.size[1] as f32),
+                scale: Vec2::new(proj.x_axis.x, proj.y_axis.y),
+            },
+            self.options.brute_force,
+        );
+
         let texture = frame
             .as_ref()
             .map(|f| &f.texture)
@@ -897,7 +1024,7 @@ impl Renderer {
             &paint_jobs,
             &screen,
         );
-        self.shadow_updates = 0;
+        self.shadow_updates = plan.jobs.len();
         if self
             .sun_cache
             .stamp
@@ -929,7 +1056,7 @@ impl Renderer {
             if let Some(mesh) = &self.objects {
                 mesh.draw(&mut pass);
             }
-            self.props.draw_shadow(&mut pass, None);
+            self.props.draw_shadow(&mut pass, ShadowTarget::Sun);
         }
         self.sun_cache
             .copy_to(&mut encoder, &self.shadow_texture, 0);
@@ -953,72 +1080,46 @@ impl Renderer {
             pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             self.dynamic.draw_prefix(&mut pass, shadow_index_count);
         }
-        for (i, light) in nearby.iter().enumerate() {
-            let Some(light) = light else {
-                continue;
-            };
-            let shadow = &mut self.local_shadows[i];
-            if shadow
-                .cache
-                .stamp
-                .update(light.view_proj, self.geometry_revision)
-            {
-                self.shadow_updates += 1;
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("local static"),
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &shadow.cache.depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: self.timing.pass(shadows::STATIC_LABELS[i]),
-                    occlusion_query_set: None,
-                });
-                pass.set_pipeline(&self.local_shadow_pipeline);
-                pass.set_bind_group(0, &shadow.group, &[]);
-                pass.set_vertex_buffer(1, self.identity_instance.slice(..));
-                let light_frustum = Frustum::new(light.view_proj);
-                for mesh in self.chunks.values() {
-                    if mesh.bounds.within_radius(light.position, LIGHT_RANGE)
-                        && light_frustum.intersects(mesh.bounds)
-                    {
-                        mesh.draw(&mut pass);
+        {
+            let chunks = &self.chunks;
+            let objects_mesh = &self.objects;
+            let props = &self.props;
+            let identity = &self.identity_instance;
+            self.atlas.render(
+                &mut encoder,
+                &self.queue,
+                &mut self.timing,
+                &plan.jobs,
+                &mut |pass, i| {
+                    let job: &TileJob = &plan.jobs[i];
+                    pass.set_vertex_buffer(1, identity.slice(..));
+                    for mesh in chunks.values() {
+                        if mesh.bounds.within_radius(job.center, job.range)
+                            && tile_views[i].frustum.intersects(mesh.bounds)
+                        {
+                            mesh.draw(pass);
+                        }
                     }
-                }
-                if let Some(mesh) = &self.objects {
-                    mesh.draw(&mut pass);
-                }
-                self.props.draw_shadow(&mut pass, Some(i));
-            }
-            // Copy the static map afresh so last frame's actor shadows cannot persist.
-            shadow
-                .cache
-                .copy_to(&mut encoder, &self.local_depth, i as u32);
-            if shadow_index_count > 0 {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("local actors"),
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &shadow.depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: self.timing.pass(shadows::ACTOR_LABELS[i]),
-                    occlusion_query_set: None,
-                });
-                pass.set_pipeline(&self.local_shadow_pipeline);
-                pass.set_bind_group(0, &shadow.group, &[]);
-                pass.set_vertex_buffer(1, self.identity_instance.slice(..));
-                self.dynamic.draw_prefix(&mut pass, shadow_index_count);
-            }
+                    if let Some(mesh) = objects_mesh {
+                        mesh.draw(pass);
+                    }
+                    props.draw_shadow(pass, ShadowTarget::Tile(i));
+                },
+            );
+            let dynamic = &self.dynamic;
+            self.atlas.render_overlay(
+                &mut encoder,
+                &self.queue,
+                &mut self.timing,
+                plan.jobs.len(),
+                &plan.overlay,
+                &mut |pass| {
+                    pass.set_vertex_buffer(1, identity.slice(..));
+                    dynamic.draw_prefix(pass, shadow_index_count);
+                },
+            );
         }
+        self.light_gpu.cull(&mut encoder, &mut self.timing);
         {
             let sample_index = usize::from(self.post.samples == 4);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1060,13 +1161,22 @@ impl Renderer {
                 &self.pipeline[sample_index]
             });
             pass.set_bind_group(0, &self.camera_group, &[]);
-            pass.set_bind_group(1, &self.shadow_group, &[]);
+            pass.set_bind_group(1, &self.light_gpu.group, &[]);
             pass.set_bind_group(2, &self.materials.group, &[]);
             pass.set_vertex_buffer(1, self.identity_instance.slice(..));
-            for mesh in self.chunks.values() {
-                if camera_frustum.intersects(mesh.bounds) {
-                    mesh.draw(&mut pass);
-                }
+            // Nearest first, so what is hidden behind it is never shaded.
+            let mut visible: Vec<(f32, &GpuMesh)> = self
+                .chunks
+                .values()
+                .filter(|mesh| camera_frustum.intersects(mesh.bounds))
+                .map(|mesh| {
+                    let center = (mesh.bounds.min + mesh.bounds.max) * 0.5;
+                    (center.distance_squared(eye), mesh)
+                })
+                .collect();
+            visible.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, mesh) in visible {
+                mesh.draw(&mut pass);
             }
             pass.set_pipeline(&self.two_sided_pipeline[sample_index]);
             if let Some(mesh) = &self.objects {
@@ -1080,7 +1190,7 @@ impl Renderer {
             // before the transparent boundaries and retain normal occlusion.
             pass.set_pipeline(&self.two_sided_pipeline[sample_index]);
             pass.set_bind_group(0, &self.camera_group, &[]);
-            pass.set_bind_group(1, &self.shadow_group, &[]);
+            pass.set_bind_group(1, &self.light_gpu.group, &[]);
             pass.set_bind_group(2, &self.materials.group, &[]);
             pass.set_vertex_buffer(1, self.identity_instance.slice(..));
             self.dynamic
@@ -1117,7 +1227,13 @@ impl Renderer {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
+        let timed = self.timing.serial();
         self.timing.submitted(&self.queue);
+        if self.timing.serial() != timed {
+            self.shadow_cost
+                .submitted
+                .push_back((self.timing.serial(), plan.jobs.len()));
+        }
         if let Some(frame) = frame {
             frame.present();
         }
@@ -1127,6 +1243,59 @@ impl Renderer {
         Ok(())
     }
 }
+
+/// The best lighting path the adapter can run: compute-built clusters over
+/// storage buffers where it has them, else uniform buffers with CPU masks.
+fn lighting_tier(adapter: &wgpu::Adapter) -> LightingTier {
+    let limits = adapter.limits();
+    let compute = adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+    if compute
+        && limits.max_storage_buffers_per_shader_stage >= 3
+        && limits.max_compute_invocations_per_workgroup >= 64
+        && limits.max_compute_workgroup_size_x >= 64
+    {
+        LightingTier::Clustered
+    } else if limits.max_uniform_buffer_binding_size >= 16384 {
+        LightingTier::Uniform
+    } else {
+        LightingTier::Nearest
+    }
+}
+
+#[cfg(test)]
+impl Renderer {
+    /// The cluster masks the GPU wrote last frame, the light spheres they were
+    /// built from, and the projection scales of that frame.
+    pub(crate) fn cluster_readback(&self) -> (Vec<u32>, Vec<[f32; 4]>, Vec2) {
+        let buffer = self.light_gpu.mask_buffer();
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mask readback"),
+            size: buffer.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let masks = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let scale = Vec2::new(
+            1.0 / (aspect * (FOV_Y * 0.5).tan()),
+            1.0 / (FOV_Y * 0.5).tan(),
+        );
+        (masks, self.light_gpu.last_views.clone(), scale)
+    }
+}
+
 fn depth_state() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: wgpu::TextureFormat::Depth32Float,

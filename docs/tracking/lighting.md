@@ -17,11 +17,15 @@ but a separate node supplies illumination. Existing saves keep their object IDs;
 no map rewrite is needed to remove forced fixtures from Light nodes. Worlds that
 relied on lamp props alone for illumination now need separate Light nodes.
 
-Local lighting is still fixed: eight nearest nodes, warm color, downward 120°
-spotlights, 12 metre range, and 512 px shadow maps. Color, intensity, radius,
-direction, and cone are not editable. These are substantial limitations, especially
-for imported point lights. The sun is also a fixed environment light; no baked
-lighting or global illumination is implemented.
+Every Light node now lights the scene as a warm omnidirectional point light with a
+12 metre range, 16 units of intensity and static shadows, through the clustered
+renderer ([renderer](renderer.md) stage 2). The eight most important shadowed
+lights in view also shadow players. Spot lights exist in the renderer but
+nothing places one yet. Color, intensity, radius, direction, and cone are fixed
+defaults, not editable or imported, which is a substantial limitation for imported
+lights: a dense imported map is lit at the same strength everywhere. The sun is
+also a fixed environment light; no baked lighting or global illumination is
+implemented.
 
 ## Remaining work
 
@@ -31,7 +35,8 @@ lighting or global illumination is implemented.
   save/reopen, copy/paste, blueprints, and undo. Planned as typed object
   properties in the [world format](world-format.md).
 - [ ] Render point and spot lights with suitable shadows and a measured GPU budget.
-  Planned as [renderer](renderer.md) stage 2.
+  Implemented in [renderer](renderer.md) stage 2 and measured on this Mac; native
+  and browser play checks are still to do.
 - [ ] Import and apply source light properties and sun/environment settings, after
   the two items above, as part of [legacy map restoration](legacy-import.md).
 - [ ] Compare representative indoor/outdoor lighting with original maps, noting

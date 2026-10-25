@@ -23,11 +23,11 @@ touch the same code.
 | --- | --- | --- |
 | [Shared sandbox](shared-sandbox.md) | Active | Stage 1 (single-owner simulation, snapshot saves and joins) is merged and awaits the maintainer's check in the app. Stages 3 and 4 are parked; stage 2 is next when big-map loading needs it. |
 | [World format](world-format.md) | Active | Stage 1 (movement styles in the core) is complete. Next: world settings with the profiles wired in, then object properties and a material library with texture alignment. |
-| [Renderer](renderer.md) | Active | Stage 1 (HDR, anti-aliasing, cached shadows, smooth motion) is merged and awaits the maintainer's 144 Hz check. Stage 2 (many real lights with a shadow atlas) is in progress. |
+| [Renderer](renderer.md) | Active | Stages 1 (HDR, anti-aliasing, smooth motion) and 2 (every light in view, with a shadow atlas) are merged and await the maintainer's look. Next: stage 2b, sun cascades and quality tiers. |
 | [Large worlds and performance](large-worlds.md) | Partial | Viewing distance, streaming, and traversal, once the first three tracks lay their foundations. |
 | [Editor feel](editor-feel.md) | Active | Stage 1 (fill copies the faces behind; Delete empties the selection) is merged; play-testing is pending. Next: in-place selection transforms, keymap parity, heightmap brush. |
 | [Legacy map restoration](legacy-import.md) | Partial | Original textures, models, and lights once the world format and renderer support them. |
-| [Lighting](lighting.md) | Partial | Editable light properties from the world format and many real lights from renderer stage 2. |
+| [Lighting](lighting.md) | Partial | Every light node is a real point light with shadows (renderer stage 2, awaiting review). Next: editable light properties from the world format. |
 | [Game layer](game-layer.md) | Planned | Combat networking, weapons, items, and modes, after the sandbox core. |
 
 **Active** means work is underway. **Partial** means useful behavior exists but

@@ -2,12 +2,10 @@
 
 use super::{
     culling::{Bounds, Frustum},
+    lightset::MAX_TILE_JOBS,
     GpuMesh, GpuVertex,
 };
-use crate::{
-    lighting::{LocalLight, LIGHT_RANGE, LOCAL_LIGHTS},
-    props::{self, PropMesh},
-};
+use crate::props::{self, PropMesh};
 use glam::Vec3;
 use sauerteig_core::{ObjectKind, WorldObject};
 
@@ -25,12 +23,26 @@ pub(super) fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// A shadow tile's view of the props: which are inside it and in the light's reach.
+pub(super) struct TileView {
+    pub frustum: Frustum,
+    pub center: Vec3,
+    pub range: f32,
+}
+
+/// What a shadow draw of props is for.
+#[derive(Clone, Copy)]
+pub(super) enum ShadowTarget {
+    Sun,
+    Tile(usize),
+}
+
 struct PropLod {
     mesh: GpuMesh,
     instances: wgpu::Buffer,
     transforms: Vec<Transform>,
     world_count: u32,
-    light_ranges: [(u32, u32); LOCAL_LIGHTS],
+    tile_ranges: Vec<(u32, u32)>,
     sun_range: (u32, u32),
 }
 
@@ -48,8 +60,9 @@ impl PropLod {
                 material: v.material,
             })
             .collect();
-        // The world pass and each local light have their own instance range.
-        let capacity = MAX_INSTANCES_PER_KIND * (LOCAL_LIGHTS + 2);
+        // The world pass, the sun and each tile rendered in a frame have their
+        // own instance range.
+        let capacity = MAX_INSTANCES_PER_KIND * (MAX_TILE_JOBS + 2);
         Ok(Self {
             mesh: GpuMesh::new(device, &vertices, &mesh.indices).ok_or("Empty prop mesh")?,
             instances: device.create_buffer(&wgpu::BufferDescriptor {
@@ -60,7 +73,7 @@ impl PropLod {
             }),
             transforms: Vec::with_capacity(capacity),
             world_count: 0,
-            light_ranges: [(0, 0); LOCAL_LIGHTS],
+            tile_ranges: Vec::new(),
             sun_range: (0, 0),
         })
     }
@@ -117,8 +130,8 @@ impl PropRenderer {
         queue: &wgpu::Queue,
         objects: &[WorldObject],
         eye: Vec3,
-        lights: &[Option<LocalLight>; LOCAL_LIGHTS],
         sun_frustum: &Frustum,
+        tiles: &[TileView],
     ) {
         for batch in &mut self.batches {
             batch.near.transforms.clear();
@@ -148,7 +161,7 @@ impl PropRenderer {
             batch.distant.world_count = batch.distant.transforms.len() as u32;
             // Static shadow geometry uses the near mesh, independent of view
             // LOD or draw distance. Its cached projection is stable as we move.
-            let mut append = |frustum: &Frustum, light: Option<Vec3>| {
+            let mut append = |frustum: &Frustum, reach: Option<(Vec3, f32)>| {
                 let start = batch.near.transforms.len() as u32;
                 for object in objects
                     .iter()
@@ -161,8 +174,8 @@ impl PropRenderer {
                     if frustum.intersects(Bounds {
                         min: center - radius,
                         max: center + radius,
-                    }) && light.is_none_or(|p| {
-                        center.distance_squared(p) <= (LIGHT_RANGE + batch.bounds_radius).powi(2)
+                    }) && reach.is_none_or(|(p, range)| {
+                        center.distance_squared(p) <= (range + batch.bounds_radius).powi(2)
                     }) {
                         batch.near.transforms.push([
                             object.position.x,
@@ -175,11 +188,10 @@ impl PropRenderer {
                 (start, batch.near.transforms.len() as u32)
             };
             batch.near.sun_range = append(sun_frustum, None);
-            for (i, light) in lights.iter().enumerate() {
-                batch.near.light_ranges[i] = light.map_or((0, 0), |light| {
-                    append(&Frustum::new(light.view_proj), Some(light.position))
-                });
-            }
+            batch.near.tile_ranges = tiles
+                .iter()
+                .map(|tile| append(&tile.frustum, Some((tile.center, tile.range))))
+                .collect();
             for lod in [&mut batch.near, &mut batch.distant] {
                 if !lod.transforms.is_empty() {
                     queue.write_buffer(&lod.instances, 0, bytemuck::cast_slice(&lod.transforms));
@@ -188,21 +200,24 @@ impl PropRenderer {
         }
     }
 
-    pub(super) fn draw_shadow<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, light: Option<usize>) {
+    pub(super) fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, target: ShadowTarget) {
         for batch in &self.batches {
             let lod = &batch.near;
-            let (start, end) = light.map_or(lod.sun_range, |i| lod.light_ranges[i]);
+            let (start, end) = match target {
+                ShadowTarget::Sun => lod.sun_range,
+                ShadowTarget::Tile(i) => lod.tile_ranges.get(i).copied().unwrap_or_default(),
+            };
             Self::draw_lod(pass, lod, start, end);
         }
     }
-    pub(super) fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         for batch in &self.batches {
             for lod in [&batch.near, &batch.distant] {
                 Self::draw_lod(pass, lod, 0, lod.world_count);
             }
         }
     }
-    fn draw_lod<'a>(pass: &mut wgpu::RenderPass<'a>, lod: &'a PropLod, start: u32, end: u32) {
+    fn draw_lod(pass: &mut wgpu::RenderPass<'_>, lod: &PropLod, start: u32, end: u32) {
         if start == end {
             return;
         }

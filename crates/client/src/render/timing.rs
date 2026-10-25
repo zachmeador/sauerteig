@@ -32,6 +32,9 @@ pub(super) struct GpuTiming {
     serial: u64,
     latest_serial: u64,
     pub latest: BTreeMap<String, f64>,
+    /// Time from the first shadow page pass starting to the last ending, in the
+    /// same frame as `latest`. Passes can overlap, so this is not their sum.
+    pub latest_shadow_span: Option<f64>,
 }
 impl GpuTiming {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
@@ -72,10 +75,19 @@ impl GpuTiming {
             serial: 0,
             latest_serial: 0,
             latest: BTreeMap::new(),
+            latest_shadow_span: None,
         }
     }
     pub fn supported(&self) -> bool {
         self.supported
+    }
+    /// The serial of the most recently submitted timed frame.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+    /// The serial of the frame `latest` describes.
+    pub fn latest_serial(&self) -> u64 {
+        self.latest_serial
     }
     pub fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         #[cfg(not(target_arch = "wasm32"))]
@@ -106,7 +118,14 @@ impl GpuTiming {
                     let data = slot.buffer.slice(..).get_mapped_range();
                     let values: &[u64] = bytemuck::cast_slice(&data);
                     let mut sample = BTreeMap::new();
+                    let mut span: Option<(u64, u64)> = None;
                     for (i, label) in slot.labels.iter().enumerate() {
+                        if label.starts_with("shadow page") && values[i * 2] <= values[i * 2 + 1] {
+                            let (start, end) = (values[i * 2], values[i * 2 + 1]);
+                            span = Some(
+                                span.map_or((start, end), |(s, e)| (s.min(start), e.max(end))),
+                            );
+                        }
                         // Reject invalid/disjoint counters instead of reporting a
                         // misleading zero or enormous elapsed time.
                         if let Some(ticks) = values[i * 2 + 1].checked_sub(values[i * 2]) {
@@ -119,6 +138,8 @@ impl GpuTiming {
                     if slot.serial >= self.latest_serial {
                         self.latest = sample;
                         self.latest_serial = slot.serial;
+                        self.latest_shadow_span = span
+                            .map(|(start, end)| (end - start) as f64 * self.period / 1_000_000.0);
                     }
                     drop(data);
                     slot.buffer.unmap();
@@ -135,15 +156,31 @@ impl GpuTiming {
             .then(|| self.slots.iter().position(|s| !s.pending))
             .flatten();
     }
-    pub fn pass(&mut self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+    /// Claim the next pair of timestamps for a pass of this frame.
+    fn claim(&mut self, label: &'static str) -> Option<(&wgpu::QuerySet, u32)> {
         let slot = self.active?;
         let index = self.labels.len() as u32 * 2;
         if index + 1 >= QUERIES {
             return None;
         }
         self.labels.push(label);
+        Some((self.slots[slot].queries.as_ref()?, index))
+    }
+    pub fn pass(&mut self, label: &'static str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        let (query_set, index) = self.claim(label)?;
         Some(wgpu::RenderPassTimestampWrites {
-            query_set: self.slots[slot].queries.as_ref()?,
+            query_set,
+            beginning_of_pass_write_index: Some(index),
+            end_of_pass_write_index: Some(index + 1),
+        })
+    }
+    pub fn compute_pass(
+        &mut self,
+        label: &'static str,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let (query_set, index) = self.claim(label)?;
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set,
             beginning_of_pass_write_index: Some(index),
             end_of_pass_write_index: Some(index + 1),
         })

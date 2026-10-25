@@ -95,14 +95,15 @@ struct VertexOutput {
     }
     let ambient = mix(vec3<f32>(0.045, 0.055, 0.070), vec3<f32>(0.105, 0.13, 0.155), n.y * 0.5 + 0.5);
     var lit = color * (ambient * ao + vec3<f32>(0.85, 0.88, 0.90) * max(dot(n, sun), 0.0) * visibility);
-    for (var i = 0; i < 8; i += 1) {
-        if (camera.points[i].w <= 0.0) { continue; }
-        let light = local_attenuation(i, v.position);
-        let ndotl = max(dot(n, light.xyz), 0.0);
-        if (light.w <= 0.0 || ndotl <= 0.0) { continue; }
-        lit += color * camera.point_colors[i].rgb * light.w * ndotl * fixture_visibility(i, v.position, geometric_normal);
-    }
     let view = normalize(camera.eye_time.xyz - v.position);
+    var surface: Surface;
+    surface.position = v.position;
+    surface.normal = n;
+    surface.geometric = geometric_normal;
+    surface.view = view;
+    surface.specular_power = roughness_power;
+    let local = shade_local_lights(v.clip, surface, light_params.mode.w);
+    lit += color * local.diffuse + specular * local.specular;
     let half_vec = normalize(sun + view);
     lit += specular * pow(max(dot(n, half_vec), 0.0), roughness_power) * visibility * max(dot(n, sun), 0.0);
     lit = mix(lit, color * 1.8, clamp(emission, 0.0, 1.0));

@@ -1,7 +1,10 @@
 //! Cached transparent material boundaries. Boxes stay compact in world storage;
 //! neither meshing nor culling expands them into metre cells.
 
-use super::culling::{Bounds, Frustum};
+use super::{
+    culling::{Bounds, Frustum},
+    shaders::LightLayout,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use sauerteig_core::{MaterialVolume, VolumeMaterial, World};
@@ -45,15 +48,17 @@ impl VolumeRenderer {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
+        lights_layout: &wgpu::BindGroupLayout,
+        light_buffers: LightLayout,
         sample_counts: &[u32],
     ) -> Self {
-        let shader = super::shaders::module(device, "volume");
+        let shader = super::shaders::module(device, "volume", light_buffers);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("transparent volume layout"),
-            bind_group_layouts: &[camera_layout],
+            bind_group_layouts: &[camera_layout, lights_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = |label, vertex_entry, fragment_entry, buffers, depth_compare, bias| {
+        let pipeline = |label, vs, fs, buffers, depth_compare, bias, blend| {
             sample_counts
                 .iter()
                 .map(|&sample_count| {
@@ -62,16 +67,16 @@ impl VolumeRenderer {
                         layout: Some(&layout),
                         vertex: wgpu::VertexState {
                             module: &shader,
-                            entry_point: Some(vertex_entry),
+                            entry_point: Some(vs),
                             buffers,
                             compilation_options: Default::default(),
                         },
                         fragment: Some(wgpu::FragmentState {
                             module: &shader,
-                            entry_point: Some(fragment_entry),
+                            entry_point: Some(fs),
                             targets: &[Some(wgpu::ColorTargetState {
                                 format,
-                                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                                blend: Some(blend),
                                 write_mask: wgpu::ColorWrites::ALL,
                             })],
                             compilation_options: Default::default(),
@@ -113,6 +118,9 @@ impl VolumeRenderer {
                     slope_scale: 1.0,
                     clamp: 0.0,
                 },
+                // Highlights are added after the surface is weighted by its
+                // opacity, so the shader returns premultiplied color.
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             ),
             underwater_pipeline: pipeline(
                 "underwater tint",
@@ -121,6 +129,7 @@ impl VolumeRenderer {
                 &[],
                 wgpu::CompareFunction::Always,
                 wgpu::DepthBiasState::default(),
+                wgpu::BlendState::ALPHA_BLENDING,
             ),
             vertex: None,
             index: device.create_buffer(&wgpu::BufferDescriptor {

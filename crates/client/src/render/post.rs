@@ -169,7 +169,8 @@ impl PostProcess {
             .map(|i| group(&bloom[i], &bloom[i]))
             .collect();
         let post_group = group(&scene, &bloom[0]);
-        let shader = device.create_shader_module(wgpu::include_wgsl!("../post.wgsl"));
+        let shader =
+            super::shaders::trusted(device, "post", include_str!("../post.wgsl").to_owned());
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post pipeline layout"),
             bind_group_layouts: &[&layout],

@@ -29,7 +29,8 @@ struct VertexOutput {
     let water = v.material == 0u;
     let geometric = normalize(v.normal);
     let view = normalize(camera.eye_time.xyz - v.position);
-    var n = select(-geometric, geometric, front);
+    let facing = select(-geometric, geometric, front);
+    var n = facing;
     if (water) {
         // Animate only the normal, keeping authored water edges watertight and
         // avoiding vertex tessellation proportional to the size of a lake.
@@ -66,14 +67,21 @@ struct VertexOutput {
         color *= 0.94 + 0.06 * flow;
         alpha = 0.18 + fresnel * 0.46;
     }
-    color += vec3<f32>(0.72, 0.76, 0.76) * specular * 0.65;
-    for (var i = 0; i < 8; i += 1) {
-        if (camera.points[i].w <= 0.0) { continue; }
-        let light = local_attenuation(i, v.position);
-        let highlight = pow(max(dot(n, normalize(light.xyz + view)), 0.0), 80.0);
-        color += camera.point_colors[i].rgb * highlight * light.w * 0.24;
-    }
-    return vec4<f32>(apply_fog(color, v.position), clamp(alpha, 0.0, 0.76));
+    alpha = clamp(alpha, 0.0, 0.76);
+    // Highlights come from the sun and from the nearest lights, and are added
+    // after the surface color is weighted by its opacity, so glass and water
+    // keep bright glints however clear they are.
+    var surface: Surface;
+    surface.position = v.position;
+    surface.normal = n;
+    surface.geometric = facing;
+    surface.view = view;
+    surface.specular_power = select(180.0, 100.0, water);
+    surface.specular_only = true;
+    let local = shade_local_lights(v.clip, surface, min(light_params.mode.w, TRANSPARENT_LIGHTS));
+    let glints = vec3<f32>(0.72, 0.76, 0.76) * specular * 0.65 + local.specular * 0.24;
+    let fog = fog_factor(v.position);
+    return vec4<f32>(mix(color, camera.fog.rgb, fog) * alpha + glints * (1.0 - fog), alpha);
 }
 
 struct UnderwaterOutput {

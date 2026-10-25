@@ -163,17 +163,52 @@ the backend. Local movement and remote player poses interpolate between 60 Hz
 steps; mouse look remains immediate.
 
 Lighting is dynamic. The sun shadow window follows the player in six-metre,
-texel-aligned light-space steps; eight nearby light nodes cast shadows with 512 px
-maps and light-volume culling. Static shadow geometry is cached until geometry,
-light position or the sun window changes. Actors draw over fresh copies of those
-caches each frame. Nodes have no visible model in play; their guides do not cast
-shadows. Lamp props are independent decoration, with emissive surfaces but no
-automatic local light. The current node renderer is still a fixed warm downward
-spotlight with a 12 metre range, not an omnidirectional point light. Color, radius,
-intensity, and cone settings are not editable or restored from imported maps.
-Ambient fill keeps unlit areas
-readable; there is no baked map lighting or global illumination. Guides, tracers,
-and the first-person weapon do not cast shadows.
+texel-aligned light-space steps; its static geometry cache is kept until geometry
+or the window changes, and actors draw over a fresh copy each frame. Every light
+node is a warm omnidirectional point light with a 12 metre range and static
+shadows (`light_from_object` in `lighting.rs`). Spot lights, other colors, ranges,
+and dynamic or no shadows exist in the renderer, but nothing places them until
+object properties do. Moving actors cast shadows from the eight most important
+shadowed lights, whatever their own mode.
+
+Each frame the lights in view, at most 256 by importance, are culled by a compute
+pass into a 16 × 9 × 24 grid of view clusters, and one shared WGSL function lights
+terrain, props, actors, and water and glass from the lights of the fragment's
+cluster: at most 16 per fragment, and 8 for water and glass, which take only
+highlights. Lights too faint to see are skipped, and weak ones filter their shadow
+with one tap instead of four. Light shadows come from a paged atlas of 1024² depth
+pages (fourteen by default, 60 MiB with the overlay page), each holding tiles of one
+size, 512², 256², or 128²: six per point light and one per spot light, sized by the
+light's projected radius with hysteresis, and shrunk for the least important lights
+so that more of them are covered; a full atlas of 128² tiles holds 149 point lights.
+A tile re-renders only when a chunk or object edit reaches its light's sphere, or
+the light changes: at most six faces a frame (twelve for three frames after a jump),
+and fewer where measured GPU time says a face costs more than a 1.5 ms budget
+allows. A new light stays off, then fades in, until its shadow has rendered. A light
+whose tiles are stale keeps using them; one that no tile can hold fades out rather
+than leak light through walls. The eight most important shadowed lights (a light
+that has them keeps them down to tenth place) also sample an overlay page that is
+redrawn every frame with the moving actors near them, in at most 15 tiles; the
+other lights cast only static shadows. Adapters without compute shaders or enough storage buffers
+use uniform buffers with CPU-built masks, 64 lights and four shadowed lights; the
+last resort is the nearest eight lights, four shadowed.
+
+Shaders compile without wgpu's forced loop bounding, through the one `unsafe`
+function in the workspace, `shaders::trusted` in `render/shaders.rs`. On Metal the
+forced bounding makes the compiler keep every loop by reading a volatile flag in
+each iteration, which made the clustered light loop about three times slower (stage
+1's sun filtering sped up as well). Every embedded loop has a bounded trip count,
+the clustered one at most 8 mask words of 32 bits that each lose a set bit per
+iteration, and runtime bounds checks stay on. Keep both true when changing a shader,
+as the function's `SAFETY` comment says. The WebGPU backend ignores the option and
+applies the browser's own limits.
+
+Nodes have no visible model in play; their guides do not cast shadows. Lamp props
+are independent decoration, with emissive surfaces but no automatic local light.
+Light color, radius, intensity, and cone settings are not editable or restored from
+imported maps. Ambient fill keeps unlit areas readable; there is no baked map
+lighting or global illumination. Guides, tracers, and the first-person weapon do not
+cast shadows.
 
 Terrain uses world-space texture coordinates. Materials share albedo/AO and
 normal/roughness texture arrays with linear-light color mipmaps and renormalized
@@ -202,11 +237,12 @@ cargo run --release -p sauerteig-import --example profile_ogz -- path/to/map.ogz
 These report meshing, edit, movement, and ray-query timings. The OGZ profile also
 reports original-scale storage, load time, query percentiles, and dirty remeshing.
 They exclude GPU execution and networking. F3 shows rendering counts, CPU
-edit/remesh timing, effective scene resolution/MSAA/present mode, static shadow
-updates and per-pass GPU timestamps where supported. It explicitly reports
-unavailable timestamps otherwise. The asynchronous profiler never waits for a
-sample during play. Pass spans can overlap on Metal, so do not add them to obtain
-a GPU frame time. Browser timestamps can also be quantized.
+edit/remesh timing, effective scene resolution/MSAA/present mode, shadow maps
+rendered, per-pass GPU timestamps where supported, and the lighting path with how
+many lights are drawn, shadowed (and shadowing actors), over budget or waiting. It
+explicitly reports unavailable timestamps otherwise. The asynchronous profiler
+never waits for a sample during play. Pass spans can overlap on Metal, so do not
+add them to obtain a GPU frame time. Browser timestamps can also be quantized.
 
 For fixed native renderer comparisons, source `scripts/env.sh`, then run:
 
@@ -216,13 +252,26 @@ cargo run --release --locked -p sauerteig-client --bin capture -- \
   --width 3840 --height 2160 --frames 60 --warmup 10
 ```
 
-Each pose names a world file (or `arena`/`materials` test scene), eye, look-at
-point, fixed animation time and optional guides. The supplied imported poses
-expect a **copy** of the library's `the_cube1m` at `.local/the_cube1m.json`. Supply
-your own pose manifest for other worlds. The tool refuses to replace existing
-PNGs. `--settings FILE` accepts a JSON object with `scale`, `msaa`
+Each pose names a world file (or a test scene: `arena`, `materials`, and the
+synthetic lighting scenes `lightroom`, `corridor`, `waterglass`, `lamphall`,
+`lightshow` and `shadowtest`), eye, look-at point, fixed animation time and optional guides,
+`actors` standing in the scene, `edit_storm` (invalidate every cached shadow each
+frame), or a `path` of waypoints to walk at `speed` metres a second or jump to
+and hold for `dwell` frames. Lights fade in and shadows render over many frames,
+so each pose first draws until lighting settles; the report gives the frames that
+took, the shadow faces rendered and reused per frame, the GPU time of the atlas
+passes apart from the sun's, and how many lights reach each cluster that has any.
+The render clock is fixed at 60 Hz. The supplied imported poses expect a **copy** of
+the library's `the_cube1m` at `.local/the_cube1m.json`. Supply your own pose
+manifest for other worlds. The tool refuses to replace existing PNGs.
+`--settings FILE` accepts a JSON object with `scale`, `msaa`
 (`"auto"`, `"on"` or `"off"`), `bloom`, `exposure` and `vsync`; omitted fields
-take the normal defaults. Measurements include CPU submission, completed-frame
+take the normal defaults. `--tier clustered|uniform|nearest` forces a lighting
+path, `--brute-force` evaluates every light at every fragment (for comparing with
+the clusters), `--pages N` sets the shadow atlas size, `--over-budget unshadowed`
+keeps lights that no tile can hold, `--actor-lights N` sets how many of the most
+important shadowed lights shadow actors, and `--node-shadows off|static|dynamic`
+sets what light nodes cast. Measurements include CPU submission, completed-frame
 median/p95 and individual GPU pass medians. They exclude simulation,
 presentation and PNG readback; they do not prove perceived smoothness on a
 monitor.
@@ -232,10 +281,13 @@ running browser client's timestamps and frame intervals at a verified 3840×2160
 plus a screenshot and validation errors. Use Playwright's isolated Chromium;
 `PLAYWRIGHT_MODULE` can point to a temporary installation's `index.mjs`. Restart
 the test server for each comparison so the assigned player/spawn is identical.
-The native GPU cache regression can be run explicitly with
-`cargo test -p sauerteig-client --lib gpu_cached_shadows -- --ignored` on a host
-with GPU access. Normal workspace tests leave that hardware-dependent test
-ignored.
+The native GPU regressions run explicitly with
+`cargo test -p sauerteig-client --lib gpu_ -- --ignored --test-threads=1` on a host
+with GPU access. They check that cached shadows match fresh ones after edits, that
+clusters built by the compute pass match the CPU's and give the same picture as a
+brute-force render, that the uniform-buffer path matches the clustered one, that a
+wall stops the next corridor's lights, and that spot lights and actor overlays
+draw. Normal workspace tests leave these hardware-dependent tests ignored.
 
 To compare the built-in movement profiles with a literal port of Sauerbraten's
 velocity math, run the example below. It prints top speeds, time to 90% of top

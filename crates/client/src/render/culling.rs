@@ -28,6 +28,20 @@ impl Bounds {
             .distance_squared(position)
             <= radius * radius
     }
+
+    pub fn around(center: Vec3, radius: f32) -> Self {
+        Self {
+            min: center - Vec3::splat(radius),
+            max: center + Vec3::splat(radius),
+        }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
 }
 
 pub(crate) struct Frustum {
@@ -52,6 +66,14 @@ impl Frustum {
             // This also retains boxes crossing the view with no corner inside it.
             let corner = Vec3::select(plane.truncate().cmpge(Vec3::ZERO), bounds.max, bounds.min);
             plane.truncate().dot(corner) + plane.w >= -0.0001
+        })
+    }
+
+    /// Conservative: a sphere outside two planes' shared corner region can pass.
+    pub fn intersects_sphere(&self, center: Vec3, radius: f32) -> bool {
+        self.planes.iter().all(|plane| {
+            let normal = plane.truncate();
+            normal.dot(center) + plane.w >= -radius * normal.length() - 0.0001
         })
     }
 }
@@ -117,6 +139,24 @@ mod tests {
                 min: center - Vec3::ONE,
                 max: center + Vec3::ONE
             }));
+        }
+    }
+
+    #[test]
+    fn sphere_culling_matches_box_culling_for_the_same_extent() {
+        let frustum = Frustum::new(Mat4::perspective_rh(1.0, 1.0, 0.1, 100.0));
+        for (center, radius, expected) in [
+            (Vec3::new(0.0, 0.0, -10.0), 1.0, true),
+            (Vec3::new(0.0, 0.0, 5.0), 1.0, false),
+            (Vec3::new(0.0, 0.0, 5.0), 6.0, true),
+            (Vec3::new(0.0, 0.0, -130.0), 20.0, false),
+            (Vec3::new(40.0, 0.0, -10.0), 3.0, false),
+            (Vec3::new(40.0, 0.0, -10.0), 40.0, true),
+        ] {
+            assert_eq!(frustum.intersects_sphere(center, radius), expected);
+            if expected {
+                assert!(frustum.intersects(Bounds::around(center, radius)));
+            }
         }
     }
 

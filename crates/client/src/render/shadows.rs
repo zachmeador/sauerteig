@@ -1,5 +1,9 @@
-use crate::lighting::{LocalLight, LOCAL_LIGHTS};
-use glam::{Mat4, Vec3};
+use super::{
+    atlas::PAGE_SIZE,
+    lightset::{OverlayJob, TileJob, OVERLAY_CLASS},
+    timing::GpuTiming,
+};
+use glam::Mat4;
 
 #[derive(Default)]
 pub(super) struct ShadowStamp {
@@ -15,28 +19,7 @@ impl ShadowStamp {
     }
 }
 
-/// Preserve GPU layers for retained lights as nearest-light distance ranks change.
-pub(super) fn stable_slots(
-    mut selected: [Option<LocalLight>; LOCAL_LIGHTS],
-    previous: [Option<Vec3>; LOCAL_LIGHTS],
-) -> [Option<LocalLight>; LOCAL_LIGHTS] {
-    let mut slots = [None; LOCAL_LIGHTS];
-    for (slot, previous) in slots.iter_mut().zip(previous) {
-        if let Some(position) = previous {
-            if let Some(i) = selected
-                .iter()
-                .position(|l| l.is_some_and(|l| l.position == position))
-            {
-                *slot = selected[i].take();
-            }
-        }
-    }
-    for light in selected.into_iter().flatten() {
-        *slots.iter_mut().find(|s| s.is_none()).unwrap() = Some(light);
-    }
-    slots
-}
-
+/// The sun's cached static map; actors draw over a copy of it each frame.
 pub(super) struct CachedShadow {
     pub texture: wgpu::Texture,
     pub depth: wgpu::TextureView,
@@ -95,32 +78,275 @@ pub(super) fn depth_texture(
     })
 }
 
-pub(super) const STATIC_LABELS: [&str; LOCAL_LIGHTS] = [
-    "local static 1",
-    "local static 2",
-    "local static 3",
-    "local static 4",
-    "local static 5",
-    "local static 6",
-    "local static 7",
-    "local static 8",
+const PAGE_LABELS: [&str; 15] = [
+    "shadow page 1",
+    "shadow page 2",
+    "shadow page 3",
+    "shadow page 4",
+    "shadow page 5",
+    "shadow page 6",
+    "shadow page 7",
+    "shadow page 8",
+    "shadow page 9",
+    "shadow page 10",
+    "shadow page 11",
+    "shadow page 12",
+    "shadow page 13",
+    "shadow page 14",
+    "shadow page 15",
 ];
-pub(super) const ACTOR_LABELS: [&str; LOCAL_LIGHTS] = [
-    "local actors 1",
-    "local actors 2",
-    "local actors 3",
-    "local actors 4",
-    "local actors 5",
-    "local actors 6",
-    "local actors 7",
-    "local actors 8",
-];
+/// The most atlas pages: their sizes share one 32-bit table with the overlay's.
+pub(super) const MAX_PAGES: usize = PAGE_LABELS.len() - 1;
+/// Tile cameras are bound with dynamic offsets of this stride.
+const CAMERA_STRIDE: u64 = 256;
+/// Atlas tiles and overlay tiles that can render in one frame.
+pub(super) const MAX_TILE_VIEWS: usize = 40;
+
+/// The shadow atlas: depth pages shared by the tiles of many lights, plus one
+/// overlay page that moving actors draw into afresh each frame.
+pub(super) struct ShadowAtlasGpu {
+    pub array: wgpu::TextureView,
+    pages: Vec<wgpu::TextureView>,
+    overlay_page: usize,
+    camera_buffer: wgpu::Buffer,
+    camera_group: wgpu::BindGroup,
+    clear_pipeline: wgpu::RenderPipeline,
+    tile_pipeline: wgpu::RenderPipeline,
+}
+
+impl ShadowAtlasGpu {
+    pub fn new(
+        device: &wgpu::Device,
+        pages: usize,
+        shader: &wgpu::ShaderModule,
+        buffers: &[wgpu::VertexBufferLayout<'_>],
+    ) -> Self {
+        assert!(pages <= MAX_PAGES);
+        let texture = depth_texture(device, PAGE_SIZE, pages as u32 + 1, "shadow atlas");
+        let array = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("shadow atlas"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let views = (0..=pages as u32)
+            .map(|layer| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("shadow page"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow tile cameras"),
+            size: CAMERA_STRIDE * MAX_TILE_VIEWS as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow tile camera layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(64),
+                },
+                count: None,
+            }],
+        });
+        let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow tile cameras"),
+            layout: &camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &camera_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(64),
+                }),
+            }],
+        });
+        let depth_pipeline = |label, entry, layout: &wgpu::PipelineLayout, buffers, state| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some(entry),
+                    buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(state),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let tile_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow tile layout"),
+            bind_group_layouts: &[&camera_layout],
+            push_constant_ranges: &[],
+        });
+        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow tile clear layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let tile_pipeline = depth_pipeline(
+            "shadow tile depth",
+            "vs_main",
+            &tile_layout,
+            buffers,
+            wgpu::DepthStencilState {
+                bias: wgpu::DepthBiasState {
+                    constant: 1,
+                    slope_scale: 0.0,
+                    clamp: 0.0,
+                },
+                ..super::depth_state()
+            },
+        );
+        let clear_pipeline = depth_pipeline(
+            "shadow tile clear",
+            "vs_clear",
+            &clear_layout,
+            &[],
+            wgpu::DepthStencilState {
+                depth_compare: wgpu::CompareFunction::Always,
+                ..super::depth_state()
+            },
+        );
+        Self {
+            array,
+            pages: views,
+            overlay_page: pages,
+            camera_buffer,
+            camera_group,
+            clear_pipeline,
+            tile_pipeline,
+        }
+    }
+
+    /// Render each dirty tile into its page: one pass per page, with the tile
+    /// cleared by a far-depth triangle inside its viewport, then `draw` called
+    /// for the casters.
+    pub fn render(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        timing: &mut GpuTiming,
+        jobs: &[TileJob],
+        draw: &mut dyn FnMut(&mut wgpu::RenderPass<'_>, usize),
+    ) {
+        for (i, job) in jobs.iter().enumerate() {
+            self.write_camera(queue, i, &job.matrix);
+        }
+        let mut pages: Vec<usize> = jobs.iter().map(|j| usize::from(j.tile.page)).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        for page in pages {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(PAGE_LABELS[page]),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.pages[page],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: timing.pass(PAGE_LABELS[page]),
+                occlusion_query_set: None,
+            });
+            for (i, job) in jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| usize::from(j.tile.page) == page)
+            {
+                let [x, y] = job.class.origin(job.tile.slot);
+                self.place(&mut pass, x, y, job.class.size());
+                pass.set_pipeline(&self.clear_pipeline);
+                pass.draw(0..3, 0..1);
+                pass.set_pipeline(&self.tile_pipeline);
+                pass.set_bind_group(0, &self.camera_group, &[i as u32 * CAMERA_STRIDE as u32]);
+                draw(&mut pass, i);
+            }
+        }
+    }
+
+    /// Draw moving actors into the overlay page, cleared first: one tile per
+    /// overlay job, after the cameras of the atlas jobs.
+    pub fn render_overlay(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        queue: &wgpu::Queue,
+        timing: &mut GpuTiming,
+        first_view: usize,
+        jobs: &[OverlayJob],
+        draw: &mut dyn FnMut(&mut wgpu::RenderPass<'_>),
+    ) {
+        if jobs.is_empty() {
+            return;
+        }
+        for (i, job) in jobs.iter().enumerate() {
+            self.write_camera(queue, first_view + i, &job.matrix);
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shadow overlay"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.pages[self.overlay_page],
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: timing.pass("shadow overlay"),
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.tile_pipeline);
+        for (i, job) in jobs.iter().enumerate() {
+            let [x, y] = OVERLAY_CLASS.origin(job.slot);
+            self.place(&mut pass, x, y, OVERLAY_CLASS.size());
+            let offset = (first_view + i) as u32 * CAMERA_STRIDE as u32;
+            pass.set_bind_group(0, &self.camera_group, &[offset]);
+            draw(&mut pass);
+        }
+    }
+
+    fn write_camera(&self, queue: &wgpu::Queue, index: usize, matrix: &Mat4) {
+        queue.write_buffer(
+            &self.camera_buffer,
+            index as u64 * CAMERA_STRIDE,
+            bytemuck::bytes_of(&matrix.to_cols_array_2d()),
+        );
+    }
+
+    fn place(&self, pass: &mut wgpu::RenderPass<'_>, x: u32, y: u32, size: u32) {
+        pass.set_viewport(x as f32, y as f32, size as f32, size as f32, 0.0, 1.0);
+        pass.set_scissor_rect(x, y, size, size);
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::atlas::TileClass;
+    use glam::Vec3;
+
     #[test]
-    fn cached_shadows_invalidate_on_geometry_light_or_window_change() {
+    fn cached_shadows_invalidate_on_geometry_or_window_change() {
         let mut stamp = ShadowStamp::default();
         assert!(stamp.update(Mat4::IDENTITY, 0));
         assert!(!stamp.update(Mat4::IDENTITY, 0));
@@ -128,21 +354,13 @@ mod tests {
         assert!(stamp.update(Mat4::from_translation(Vec3::X), 1));
         assert!(!stamp.update(Mat4::from_translation(Vec3::X), 1));
     }
+
     #[test]
-    fn nearest_light_reordering_does_not_invalidate_retained_layers() {
-        let light = |x| {
-            Some(LocalLight {
-                position: Vec3::X * x,
-                view_proj: Mat4::IDENTITY,
-            })
-        };
-        let mut selected = [None; LOCAL_LIGHTS];
-        selected[..3].copy_from_slice(&[light(2.0), light(1.0), light(3.0)]);
-        let mut previous = [None; LOCAL_LIGHTS];
-        previous[..3].copy_from_slice(&[Some(Vec3::X), Some(Vec3::X * 2.0), Some(Vec3::X * 4.0)]);
-        let stable = stable_slots(selected, previous);
-        assert_eq!(stable[0].unwrap().position, Vec3::X);
-        assert_eq!(stable[1].unwrap().position, Vec3::X * 2.0);
-        assert_eq!(stable[2].unwrap().position, Vec3::X * 3.0);
+    fn tile_classes_tile_the_page_exactly() {
+        for class in TileClass::ALL {
+            assert_eq!(class.per_row() * class.size(), PAGE_SIZE);
+            assert_eq!(class.per_page() as u32, class.per_row() * class.per_row());
+        }
+        assert!(OVERLAY_CLASS.per_page() > super::super::lightset::OVERLAY_SLOTS);
     }
 }
