@@ -103,8 +103,9 @@ Acceptance:
 - **Stage 3, instant edits:** apply edits locally at once and reconcile with the
   server's result, with several edits in flight. Conflicts roll back visibly.
 - **Stage 4, joining from other networks:** friends join a hosted world from
-  anywhere, browser included. The approach depends on how the group plays; options
-  include a relay, a tunnel, or a hosted server.
+  anywhere, browser included. This is required: the maintainer's group plays over
+  the internet from different homes. Options include a relay, a tunnel, a hosted
+  server, or browser-to-host transports; research comes before the decision.
 
 ## Evidence
 

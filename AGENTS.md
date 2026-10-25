@@ -1,7 +1,8 @@
 # Working on Sauerteig
 
-Use `gpt-6.1-sol` with `max` reasoning for new development sessions and subagents,
-unless the user requests a different model.
+Implementation work runs in Claude Code subagents on Sonnet 5.5 by default, or in
+Codex sessions on `gpt-6-astra` with `max` reasoning, unless the user requests a
+different model. (`gpt-6.1-sol` is not available to this account in Codex.)
 
 Read [project tracking](docs/tracking/README.md) before starting development.
 Keep its overview and the relevant work document current as scope, implementation,

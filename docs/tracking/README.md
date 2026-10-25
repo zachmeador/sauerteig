@@ -22,7 +22,7 @@ touch the same code.
 | Work | State | Next |
 | --- | --- | --- |
 | [Shared sandbox](shared-sandbox.md) | Active | Stage 1: the simulation never waits for saves, joins, or large edits. |
-| [World format](world-format.md) | Planned | World settings with movement profiles, object properties, and a material library with texture alignment. |
+| [World format](world-format.md) | Active | Stage 1: movement styles in the simulation core. Then world settings, object properties, and a material library with texture alignment. |
 | [Renderer](renderer.md) | Active | Stage 1: HDR pipeline, bloom, anti-aliasing, smooth motion, GPU timing, and cached shadows. |
 | [Large worlds and performance](large-worlds.md) | Partial | Viewing distance, streaming, and traversal, once the first three tracks lay their foundations. |
 | [Editor feel](editor-feel.md) | Planned | Sauerbraten gesture parity and small editor fixes. |
