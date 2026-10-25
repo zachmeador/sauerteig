@@ -96,16 +96,27 @@ Acceptance:
 
 ## Later stages
 
-- **Stage 2, compact streamed transfer:** separate wire types from game types
-  behind a codec boundary; a compact binary encoding with compression; world
-  transfer in independently decodable chunks with a progress display; the client
-  builds and meshes incrementally without freezing the browser.
+- **Stage 2, compact streamed transfer:**
+  - Separate wire types from game types behind a codec boundary, using a compact
+    binary encoding with compression.
+  - Put a link boundary with two lanes under it: reliable framed messages
+    (welcome, chunks, edits, patches) and an unreliable lane for input, snapshots,
+    and effects. Over WebSocket the unreliable lane is "latest wins", so a later
+    datagram transport slots in without redesign. See
+    [internet play](../../research/internet-play.md).
+  - Send the world in independently decodable chunks with a progress display.
+  - The client builds and meshes incrementally without freezing the browser.
 - **Stage 3, instant edits:** apply edits locally at once and reconcile with the
   server's result, with several edits in flight. Conflicts roll back visibly.
 - **Stage 4, joining from other networks:** friends join a hosted world from
-  anywhere, browser included. This is required: the maintainer's group plays over
-  the internet from different homes. Options include a relay, a tunnel, a hosted
-  server, or browser-to-host transports; research comes before the decision.
+  anywhere, browser included. This is required, because the maintainer's group
+  plays over the internet from different homes.
+  - **Recommended design** (from [internet play](../../research/internet-play.md)):
+    the host app dials out to a small project-run relay on a VPS. The relay serves
+    the browser page over HTTPS, hands friends a stable link, and receives each
+    snapshot once from the host, then fans it out. Today's fan-out would need
+    9.4 Mbit/s of upload from the host for 15 friends.
+  - Pending the maintainer's decision on running a small paid server.
 
 ## Evidence
 
