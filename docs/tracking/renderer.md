@@ -80,9 +80,22 @@ Acceptance:
 ## Later stages
 
 - **Stage 2, many real lights:** point and spot lights with color, intensity,
-  radius, and cone from the [world format](world-format.md); clustered light
-  culling; a shadow atlas with cached, budgeted updates; a GPU budget for
-  integrated graphics. This completes most of the [lighting](lighting.md) outcome.
+  radius, cone, and a shadow mode (off, static, or dynamic) from the
+  [world format](world-format.md). This completes most of the
+  [lighting](lighting.md) outcome. Design decided after
+  [research](../../research/many-lights.md):
+  - Clustered forward shading with compute-built 256-bit light masks per cluster,
+    and one shared lighting function for opaque geometry, props, water, and glass.
+  - Water and glass switch to premultiplied alpha.
+  - A paged shadow atlas: static caches keyed by tile and version, a small overlay
+    for moving actors, and a per-frame update budget.
+  - Three cached sun cascades.
+  - 4× MSAA stays. No deferred shading and no radiance-hints global illumination.
+  - Build order: lights and clusters, then the atlas, then cascades, then quality
+    tiers that adapt to measured GPU time.
+
+  The research file holds the budgets, fallbacks, and test plan. Until object
+  properties land, the stage can be built and measured against synthetic lights.
 - **Stage 3, sky and atmosphere:** sun, sky, and fog from world settings instead
   of constants.
 - **Stage 4, effects:** particles and decals for building and combat feedback.
