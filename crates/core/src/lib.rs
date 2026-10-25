@@ -3,6 +3,7 @@
 mod compact;
 mod fine;
 mod geometry;
+mod movement;
 mod physics;
 mod protocol;
 mod volumes;
@@ -14,6 +15,7 @@ pub use compact::{
 };
 pub use fine::*;
 pub use glam::Vec3;
+pub use movement::*;
 pub use physics::*;
 pub use protocol::*;
 pub use volumes::*;
@@ -23,6 +25,8 @@ pub const CHUNK_SIZE: i32 = 8;
 pub const WORLD_MIN: i32 = -64;
 pub const WORLD_MAX: i32 = 64;
 pub const WORLD_HEIGHT: i32 = 48;
+// Hit detection, spawning, rendering and the camera use these dimensions.
+// Movement takes its own from the `MovementProfile`; Arena's equal these.
 pub const PLAYER_RADIUS: f32 = 0.3;
 pub const PLAYER_HEIGHT: f32 = 1.75;
 pub const EYE_HEIGHT: f32 = 1.55;

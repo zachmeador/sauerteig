@@ -487,7 +487,7 @@ fn water_is_passable_slows_motion_and_allows_swimming_up_and_down() {
     player.velocity = Vec3::X * 12.0;
     simulate_player(&world, &mut player, &InputFrame::default(), FIXED_DT);
     assert!(player.velocity.x < 12.0 && player.position.x > 0.0);
-    assert!(player.velocity.y.abs() < GRAVITY * FIXED_DT);
+    assert!(player.velocity.y.abs() < MovementProfile::ARENA.gravity * FIXED_DT);
     let up = InputFrame {
         jump: true,
         ..Default::default()

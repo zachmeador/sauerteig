@@ -160,3 +160,12 @@ reports original-scale storage, load time, query percentiles, and dirty remeshin
 They exclude GPU
 execution and networking. F3 shows rendering counts and CPU edit/remesh timing,
 including GPU upload submission; it does not measure GPU completion or latency.
+
+To compare the built-in movement profiles with a literal port of Sauerbraten's
+velocity math, run the example below. It prints top speeds, time to 90% of top
+speed, jump apex and air time, and stopping distance at the fixed 60 Hz tick; the
+core tests assert that Sauerbraten agrees with the reference within 3%.
+
+```sh
+cargo run -p sauerteig-core --example movement_profiles
+```

@@ -1,6 +1,6 @@
 use crate::{
-    spawn_point, CellEdit, CellFragment, MaterialVolume, RootEdit, Vec3, VolumeEdit, WorldBounds,
-    EYE_HEIGHT,
+    spawn_point, CellEdit, CellFragment, MaterialVolume, MovementState, RootEdit, Vec3, VolumeEdit,
+    WorldBounds, EYE_HEIGHT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,10 @@ pub struct Player {
     pub health: u16,
     pub score: i32,
     pub last_input: u32,
+    /// Extra state for movement styles that need it; idle, and omitted from
+    /// snapshots, under Arena.
+    #[serde(default, skip_serializing_if = "MovementState::is_idle")]
+    pub movement: MovementState,
 }
 
 impl Player {
@@ -49,6 +53,7 @@ impl Player {
             health: 100,
             score: 0,
             last_input: 0,
+            movement: MovementState::default(),
         }
     }
 

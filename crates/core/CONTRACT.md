@@ -66,9 +66,11 @@ splitting is bounded and rejects excessive detail before mutating the world.
 Volume assignments may overlap solid terrain. Terrain takes precedence when
 querying a point's material, so a wall inside water is not swimming space. Glass
 has axis-aligned collision and blocks combat rays, rockets, and blast visibility.
-Water is non-solid. The shared movement step queries the player's torso to apply
-drag, reduced gravity, and upward swimming while jump is held. Rendering queries
-the eye separately for underwater tint. Edit-mode flight ignores both effects.
+Water is non-solid. The shared movement step queries the world at the profile's
+water probe, the torso under Arena, to apply drag, reduced gravity, and upward
+swimming while jump is held; Sauerbraten swims by view pitch instead. Rendering
+queries the eye separately for underwater tint. Edit-mode flight ignores both
+effects.
 
 ## Shared edits and history
 
@@ -103,6 +105,31 @@ Every parsed `Edit`, `EditRoots`, or `EditTransaction` receives one `EditResult`
 with the matching request ID. Changed edits broadcast their patch before the successful result;
 unchanged edits succeed without a patch. Clients finish pending edits from that
 acknowledgment, never by comparing another player's patch with their geometry.
+
+## Movement profiles
+
+`simulate_player_with` steps one player by one fixed tick under a
+`MovementProfile`: a style, its numbers (speeds, jump, gravity, easing), and the
+dimensions the player moves with. The server and every client's prediction must
+use identical profiles. `simulate_player` is the same step under the Arena
+profile, whose trajectories are pinned bit for bit by `tests/golden/`.
+
+Arena is the original model: ground friction, then acceleration along the
+requested direction up to the walking speed. Sauerbraten is a port of the
+velocity model in the original engine's `physics.cpp`: velocity eases toward
+the steering target by `1 - 1/ease` of the gap per 20 ms, gravity accumulates in a
+separate falling component, straight forward or back and airborne movement each
+speed the target up by 1.3, and a jump fires once per press. Each fixed tick runs
+the model in steps close to the original 5 ms physics frame. Both styles share
+the box collision, step-up and support queries, which take the profile's radius,
+height and step height. Hit detection, spawning, rendering and the camera still
+use `PLAYER_RADIUS`, `PLAYER_HEIGHT` and `EYE_HEIGHT`.
+
+A style that needs more than position and velocity keeps it in `Player::movement`:
+Sauerbraten's falling velocity, its jump latch, and whether the last tick ended in
+water. Arena clears it, and idle state is not serialized, so Arena snapshots are
+unchanged. Whatever resets a player's velocity, such as a respawn or a mode
+change, must reset `movement` with it.
 
 ## Simulation and transport
 
