@@ -95,7 +95,12 @@ throwaway test crates outside the repository.
 
 ## Recommendation
 
-**First version: a project relay on a small VPS.**
+**Decision:** the maintainer ruled out paid services on 2026-10-25, so stage 4
+starts with free options instead (a quick tunnel, then Tailscale). See
+[shared-sandbox](../docs/tracking/shared-sandbox.md) stage 4. The relay design
+below remains the reference if that changes.
+
+**Recommended first version: a project relay on a small VPS.**
 
 The host experience:
 - The host clicks "Host online".

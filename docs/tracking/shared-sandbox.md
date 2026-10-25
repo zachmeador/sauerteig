@@ -106,17 +106,16 @@ Acceptance:
     [internet play](../../research/internet-play.md).
   - Send the world in independently decodable chunks with a progress display.
   - The client builds and meshes incrementally without freezing the browser.
-- **Stage 3, instant edits:** apply edits locally at once and reconcile with the
-  server's result, with several edits in flight. Conflicts roll back visibly.
-- **Stage 4, joining from other networks:** friends join a hosted world from
-  anywhere, browser included. This is required, because the maintainer's group
-  plays over the internet from different homes.
-  - **Recommended design** (from [internet play](../../research/internet-play.md)):
-    the host app dials out to a small project-run relay on a VPS. The relay serves
-    the browser page over HTTPS, hands friends a stable link, and receives each
-    snapshot once from the host, then fans it out. Today's fan-out would need
-    9.4 Mbit/s of upload from the host for 15 friends.
-  - Pending the maintainer's decision on running a small paid server.
+- **Stages 3 and 4 are parked** (maintainer, 2026-10-25): internet multiplayer and
+  multiplayer playtesting aren't current priorities, so don't spend effort on them
+  until the maintainer asks.
+  - **Stage 3, instant edits:** apply edits locally at once and reconcile with the
+    server's result, with several edits in flight.
+  - **Stage 4, joining from other networks:** the group played over the internet,
+    so this is needed eventually. Paid services are ruled out. When it resumes,
+    start with a free Cloudflare quick tunnel started by the host app, with
+    Tailscale's free plan as the fallback. The constraints and options are in
+    [internet play](../../research/internet-play.md).
 
 ## Evidence
 
