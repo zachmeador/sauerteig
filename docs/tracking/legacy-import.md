@@ -25,6 +25,11 @@ material flags remain explicitly reported rather than applied.
 
 ## Remaining work
 
+Original surfaces depend on the [world format](world-format.md)'s material library
+and per-face texture alignment; original lights depend on [lighting](lighting.md).
+For private restoration, textures and models may be read from the user's own
+Sauerbraten installation without redistributing them.
+
 - [ ] Resolve texture slots and mapmodel indices from map and installation configs
   without executing arbitrary source scripts. Explain unresolved references.
 - [ ] Load images and models, preserve UV settings and entity transforms, and

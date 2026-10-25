@@ -4,19 +4,46 @@ This is the current work list, not a development diary. Sauerteig is a playable
 prototype; the entries below describe specific completed scopes and remaining
 work, not a finished game.
 
+## Direction
+
+Sauerteig is first a shared building sandbox: friends build together in one live
+world and fight in it whenever they like. Work goes first to the layers that
+everything built rests on: shared editing over the internet, the world format,
+the renderer, and large worlds. Combat networking, weapons, and game modes come
+later, because they are easier to change once the core is right. Movement,
+gravity, sky, and similar values are per-world settings in the world format, not
+code constants.
+
 ## Current work
 
-| Work | State | What remains |
+Tracks are listed in priority order. Stages run in parallel when they do not
+touch the same code.
+
+| Work | State | Next |
 | --- | --- | --- |
-| [Lighting](lighting.md) | Partial | Independent nodes are verified; configurable point/spot lights and imported properties remain incomplete. |
-| [Legacy map restoration](legacy-import.md) | Partial | Geometry recovery works; original media, light properties, several entity types, and thin surfaces are missing. |
-| [Large worlds and performance](large-worlds.md) | Partial | Compact storage works; viewing distance, traversal, and measured laptop GPU performance need work. |
-| Combat and multiplayer playtesting | Planned | Exercise real fights during collaborative editing, including internet latency and reconnects; basic FPS mechanics alone do not establish game quality. |
+| [Shared sandbox](shared-sandbox.md) | Active | Stage 1: the simulation never waits for saves, joins, or large edits. |
+| [World format](world-format.md) | Planned | World settings with movement profiles, object properties, and a material library with texture alignment. |
+| [Renderer](renderer.md) | Active | Stage 1: HDR pipeline, bloom, anti-aliasing, smooth motion, GPU timing, and cached shadows. |
+| [Large worlds and performance](large-worlds.md) | Partial | Viewing distance, streaming, and traversal, once the first three tracks lay their foundations. |
+| [Editor feel](editor-feel.md) | Planned | Sauerbraten gesture parity and small editor fixes. |
+| [Legacy map restoration](legacy-import.md) | Partial | Original textures, models, and lights once the world format and renderer support them. |
+| [Lighting](lighting.md) | Partial | Editable light properties from the world format and many real lights from renderer stage 2. |
+| [Game layer](game-layer.md) | Planned | Combat networking, weapons, items, and modes, after the sandbox core. |
 
 **Active** means work is underway. **Partial** means useful behavior exists but
 the stated outcome is unfinished. **Planned** means work has not started.
 **Complete** means the bounded outcome has been verified, with any limits stated.
 A blocker belongs in its work document with the next practical step.
+
+## How work runs
+
+The design lead sets direction and writes each stage as a work order in its
+tracking document: decisions already made, scope, parallel-work boundaries, and
+acceptance checks. An implementation session executes one stage on its own branch
+in a separate git worktree and does not commit. The lead reviews the result, runs
+the checks, plays the build natively and in the browser, then commits and merges
+it together with the tracking update. The maintainer can veto any decision or
+merge.
 
 ## Complete scopes
 

@@ -28,9 +28,12 @@ lighting or global illumination is implemented.
 - [x] Verify model-free nodes, editor picking, independent props, and illumination
   from the stored node position in native and browser rendering.
 - [ ] Define editable light properties and preserve them through multiplayer,
-  save/reopen, copy/paste, blueprints, and undo.
+  save/reopen, copy/paste, blueprints, and undo. Planned as typed object
+  properties in the [world format](world-format.md).
 - [ ] Render point and spot lights with suitable shadows and a measured GPU budget.
-- [ ] Import and apply source light properties and sun/environment settings.
+  Planned as [renderer](renderer.md) stage 2.
+- [ ] Import and apply source light properties and sun/environment settings, after
+  the two items above, as part of [legacy map restoration](legacy-import.md).
 - [ ] Compare representative indoor/outdoor lighting with original maps, noting
   deliberate renderer differences rather than claiming exact reproduction.
 

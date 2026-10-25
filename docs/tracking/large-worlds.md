@@ -22,6 +22,10 @@ distant areas. Existing profiles measure CPU work, not completed GPU frames.
 
 ## Remaining work and acceptance
 
+This work builds on [shared-sandbox](shared-sandbox.md) stage 2, which streams
+world transfer and builds the client world incrementally, and on the
+[renderer](renderer.md) stages for view distance and detail levels.
+
 - [ ] Make viewing distance and editor traversal suitable for large maps, with
   deliberate performance limits rather than simply increasing every bound.
 - [ ] Exercise rendering, collision, local edits, blueprints, and save/rejoin far
