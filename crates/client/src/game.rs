@@ -195,6 +195,111 @@ mod tests {
             &physical.indices
         );
     }
+
+    #[test]
+    fn number_keys_choose_materials_while_editing_and_weapons_while_fighting() {
+        let mut game = Game::new(String::new(), "number keys".into());
+        game.local.editing = false;
+        game.material = 3;
+        game.choose_slot(1);
+        assert_eq!((game.weapon, game.material), (1, 3));
+        game.choose_slot(5);
+        assert_eq!((game.weapon, game.material), (1, 3));
+        game.choose_slot(0);
+        assert_eq!((game.weapon, game.material), (0, 3));
+
+        game.local.editing = true;
+        for slot in 0..8 {
+            game.choose_slot(slot);
+            assert_eq!((game.weapon, game.material), (0, slot));
+        }
+        game.weapon = 1;
+        game.choose_slot(0);
+        assert_eq!((game.weapon, game.material), (1, 0));
+    }
+
+    #[test]
+    fn delete_removes_a_selected_object_unless_geometry_is_selected() {
+        let mut game = Game::new(String::new(), "delete key".into());
+        game.connected = true;
+        game.local.editing = true;
+        game.objects = vec![WorldObject {
+            id: 4,
+            kind: ObjectKind::Spawn,
+            position: Vec3::new(2.5, 1.0, 2.5),
+            rotation: 0.0,
+        }];
+        game.select_object(Some(4));
+        game.delete_key();
+        assert!(game.edit_queue.is_empty());
+        assert!(game.pending_object.is_some());
+
+        game.pending_object = None;
+        game.select_object(Some(4));
+        game.selection = Some(EditSelection {
+            min: [0, 0, 0],
+            max: [8, 8, 8],
+            axis: 1,
+            sign: 1,
+            grid: 8,
+        });
+        game.delete_key();
+        assert!(matches!(game.edit_queue.front(), Some(EditIntent::Delete)));
+        assert!(game.pending_object.is_none());
+
+        game.edit_queue.clear();
+        game.object_mode = true;
+        game.delete_key();
+        assert!(game.edit_queue.is_empty());
+        assert!(game.pending_object.is_some());
+    }
+
+    #[test]
+    fn delete_plans_every_additive_volume_and_the_aimed_cell() {
+        let mut game = Game::new(String::new(), "delete plan".into());
+        game.world = World::empty();
+        for x in [0, 4, 8, 12] {
+            game.world.set([x, 0, 0], Some(Cell::solid(0)));
+        }
+        game.connected = true;
+        game.local.editing = true;
+        game.regions = RegionSet::from_boxes([
+            RegionBox::new([0, 0, 0], [8, 8, 8]).unwrap(),
+            RegionBox::new([32, 0, 0], [40, 8, 8]).unwrap(),
+        ])
+        .unwrap();
+        game.selection = Some(EditSelection {
+            min: [64, 0, 0],
+            max: [72, 8, 8],
+            axis: 1,
+            sign: 1,
+            grid: 8,
+        });
+        let selection = game.active_selection().unwrap();
+        let plan = selection
+            .plan_delete_regions(&game.world, &game.selected_regions())
+            .unwrap();
+        let mut roots: Vec<_> = plan.roots.iter().map(|root| root.pos).collect();
+        roots.sort();
+        assert_eq!(roots, [[0, 0, 0], [4, 0, 0], [8, 0, 0]]);
+
+        game.delete_key();
+        game.process_edit_queue();
+        assert!(game.notice.is_empty(), "{}", game.notice);
+        assert!(game.edit_queue.is_empty());
+        assert_eq!(game.edit_request, 1);
+
+        game.clear_selection();
+        game.selected = game
+            .world
+            .raycast(Vec3::new(12.5, 3.0, 0.5), -Vec3::Y, 10.0);
+        let selection = game.active_selection().unwrap();
+        let plan = selection
+            .plan_delete_regions(&game.world, &game.selected_regions())
+            .unwrap();
+        assert_eq!(plan.roots.len(), 1);
+        assert_eq!(plan.roots[0].pos, [12, 0, 0]);
+    }
 }
 impl ModeState {
     fn request(&mut self, editing: bool) -> u32 {
@@ -238,6 +343,7 @@ struct LibraryUi {
 enum EditIntent {
     Extrude,
     Carve,
+    Delete,
     Deform(i8),
     Paint(u8),
     Volume(Option<VolumeMaterial>),
@@ -1022,20 +1128,14 @@ impl Game {
                         }
                         KeyCode::BracketLeft => self.change_grid(false),
                         KeyCode::BracketRight => self.change_grid(true),
-                        KeyCode::Digit1 => {
-                            self.material = 0;
-                            self.weapon = 0;
-                        }
-                        KeyCode::Digit2 => {
-                            self.material = 1;
-                            self.weapon = 1;
-                        }
-                        KeyCode::Digit3 => self.material = 2,
-                        KeyCode::Digit4 => self.material = 3,
-                        KeyCode::Digit5 => self.material = 4,
-                        KeyCode::Digit6 => self.material = 5,
-                        KeyCode::Digit7 => self.material = 6,
-                        KeyCode::Digit8 => self.material = 7,
+                        KeyCode::Digit1 => self.choose_slot(0),
+                        KeyCode::Digit2 => self.choose_slot(1),
+                        KeyCode::Digit3 => self.choose_slot(2),
+                        KeyCode::Digit4 => self.choose_slot(3),
+                        KeyCode::Digit5 => self.choose_slot(4),
+                        KeyCode::Digit6 => self.choose_slot(5),
+                        KeyCode::Digit7 => self.choose_slot(6),
+                        KeyCode::Digit8 => self.choose_slot(7),
                         KeyCode::KeyQ if self.local.editing => {
                             self.set_object_mode(!self.object_mode)
                         }
@@ -1098,7 +1198,7 @@ impl Game {
                         KeyCode::KeyL if self.local.editing => self.place(ObjectKind::Light),
                         KeyCode::KeyO if self.local.editing => self.place(ObjectKind::Spawn),
                         KeyCode::Delete | KeyCode::Backspace if self.local.editing => {
-                            self.remove_object()
+                            self.delete_key()
                         }
                         _ => {}
                     }
@@ -1342,6 +1442,24 @@ impl Game {
             Err(error) => self.notify(error.to_string()),
         }
     }
+    fn choose_slot(&mut self, slot: u8) {
+        if self.local.editing {
+            self.material = slot;
+        } else if slot < 2 {
+            self.weapon = slot;
+        }
+    }
+    fn delete_key(&mut self) {
+        // Like Sauerbraten's delcube, a selected object goes first unless the
+        // builder has selected geometry since.
+        let geometry_selected = self.selection.is_some() || self.regions.bounds().is_some();
+        if self.object_mode || (self.object_selection.is_some() && !geometry_selected) {
+            self.remove_object();
+        } else if self.edit_queue.len() < 32 {
+            self.selection_drag = None;
+            self.edit_queue.push_back(EditIntent::Delete);
+        }
+    }
     fn wheel_step(&mut self, up: bool) {
         let up = up ^ self.preferences.invert_scroll;
         if self.keys.contains(&KeyCode::KeyG) || self.keys.contains(&KeyCode::ControlLeft) {
@@ -1404,6 +1522,9 @@ impl Game {
         let plan = match intent {
             EditIntent::Extrude => selection.plan_extrude(&self.world, self.material),
             EditIntent::Carve => selection.plan_carve(&self.world),
+            EditIntent::Delete => {
+                selection.plan_delete_regions(&self.world, &self.selected_regions())
+            }
             EditIntent::Paint(material) => {
                 selection.plan_paint_regions(&self.world, &self.selected_regions(), material)
             }
@@ -2007,7 +2128,7 @@ impl Game {
                 if self.object_mode {
                     "LMB select object   ARROWS move   R rotate   INSERT duplicate   DELETE remove"
                 } else {
-                    "LMB DRAG select   WHEEL push/pull   G+WHEEL grid   SPACE clear"
+                    "LMB DRAG select   WHEEL push/pull   G+WHEEL grid   SPACE clear   DEL empty"
                 },
                 mono(11.0),
                 MUTED,
@@ -2071,12 +2192,13 @@ impl Game {
                                 "LMB drag      select region",
                                 "RMB           extend / reorient selection",
                                 "Wheel down/up pull / push geometry",
+                                "Delete/Bksp   empty selection / aimed cell",
                                 "G + wheel     grid size",
                                 "F + wheel     shape selected face",
                                 "MMB           select a face corner",
                                 "Shift + MMB   select a face edge",
                                 "Y + wheel     change selected material",
-                                "1–8           choose material",
+                                "1–8           material (1/2 weapon in play)",
                                 "U / Z         undo geometry / objects",
                                 "Shift U / Z   redo geometry / objects",
                                 "Alt + drag    add a selection volume",
@@ -2094,7 +2216,7 @@ impl Game {
                                 "R / Shift R   object rotation ±90°",
                                 "H             move object to aimed surface",
                                 "Insert        duplicate selected object",
-                                "Delete        remove selected / aimed object",
+                                "Delete        remove object (object mode)",
                                 "Ctrl/Cmd S    save",
                                 "Esc           release mouse",
                                 "F1            close controls",

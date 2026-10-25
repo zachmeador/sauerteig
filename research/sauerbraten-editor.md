@@ -230,8 +230,9 @@ Ranked by how much they would bother a Sauerbraten builder, as of 2026-10-25:
 1. **No texture alignment tools.** There is no per-face alignment, all-faces mode,
    recent-texture list, eyedropper, or replace. Sauerteig projects textures along
    the actual normal, with a tile size per material.
-2. **Delete and Backspace don't empty a selection.** They only remove aimed objects.
-3. **Extrusion uses the current material** instead of copying the faces behind.
+2. ~~Delete and Backspace don't empty a selection.~~ Fixed on 2026-10-25.
+3. ~~Extrusion uses the current material instead of copying the faces behind.~~
+   Fixed on 2026-10-25.
 4. **Selections can't be transformed in place.** They can't slide, move along
    their normal, cut-move, flip, or rotate; R and M transform only the clipboard.
 5. **Different keys, and no rebinding:**

@@ -324,7 +324,7 @@ impl EditSelection {
         if !world.bounds().fine_box().contains(bounds) {
             return Err(EditError::OutsideWorld);
         }
-        let fragments = filled(bounds, self.grid.min(8) as u8, Cell::solid(value))?;
+        let fragments = self.extrusion_fragments(world, bounds, value)?;
         let plane = if self.sign > 0 {
             bounds.max[self.axis]
         } else {
@@ -337,6 +337,80 @@ impl EditSelection {
             self.with_plane(plane)?,
             true,
         )
+    }
+    /// Each column of the new layer copies the face materials of the nearest solid
+    /// geometry in the layer one grid step behind the face, which is the layer
+    /// carving removes. Columns with nothing solid behind use `value`.
+    fn extrusion_fragments(
+        &self,
+        world: &World,
+        bounds: FineBox,
+        value: u8,
+    ) -> Result<Vec<CellFragment>, EditError> {
+        let size = self.grid.min(8) as u8;
+        if tile_count(bounds, size)? > MAX_EDIT_FRAGMENTS as u128 {
+            return Err(EditError::TooLarge);
+        }
+        let axis = self.axis;
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut behind = match self.slab(false)?.intersection(world.bounds().fine_box()) {
+            Some(layer) => capture(world, &one_region(layer)?)?,
+            None => Vec::new(),
+        };
+        // A warped cell can lie in the layer's box without reaching the layer.
+        behind.retain(|f| {
+            f.cell.is_full() || world.intersects_box(f.bounds.world_min(), f.bounds.world_max())
+        });
+        let front = |f: &CellFragment| {
+            if self.sign > 0 {
+                -f.bounds.max[axis]
+            } else {
+                f.bounds.min[axis]
+            }
+        };
+        behind.sort_by_key(|f| (front(f), f.bounds));
+        let mut columns: BTreeMap<[i32; 2], Vec<&CellFragment>> = BTreeMap::new();
+        for f in &behind {
+            columns
+                .entry([f.bounds.min[u].div_euclid(8), f.bounds.min[v].div_euclid(8)])
+                .or_default()
+                .push(f);
+        }
+        let mut out = Vec::new();
+        for cu in bounds.min[u].div_euclid(8)..=(bounds.max[u] - 1).div_euclid(8) {
+            for cv in bounds.min[v].div_euclid(8)..=(bounds.max[v] - 1).div_euclid(8) {
+                let mut column = bounds;
+                for (a, c) in [(u, cu), (v, cv)] {
+                    column.min[a] = column.min[a].max(c * 8);
+                    column.max[a] = column.max[a].min(c * 8 + 8);
+                }
+                let mut open = vec![column];
+                let mut pieces = Vec::new();
+                for source in columns.get(&[cu, cv]).into_iter().flatten() {
+                    let mut prism = source.bounds;
+                    prism.min[axis] = bounds.min[axis];
+                    prism.max[axis] = bounds.max[axis];
+                    let cell = Cell {
+                        face_materials: source.cell.face_materials,
+                        ..Cell::solid(source.cell.material)
+                    };
+                    let mut unclaimed = Vec::with_capacity(open.len());
+                    for piece in open {
+                        pieces.extend(piece.intersection(prism).map(|claimed| (claimed, cell)));
+                        unclaimed.extend(piece.subtract(prism));
+                    }
+                    open = unclaimed;
+                }
+                pieces.extend(open.into_iter().map(|piece| (piece, Cell::solid(value))));
+                for (piece, cell) in pieces {
+                    out.extend(filled(piece, size, cell)?);
+                    if out.len() > MAX_EDIT_FRAGMENTS {
+                        return Err(EditError::TooLarge);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
     pub fn plan_volume_regions(
         &self,
@@ -386,6 +460,14 @@ impl EditSelection {
             self.with_plane(plane)?,
             false,
         )
+    }
+    pub fn plan_delete_regions(
+        &self,
+        world: &World,
+        mask: &RegionSet,
+    ) -> Result<EditPlan, EditError> {
+        self.validate()?;
+        replace(world, mask, Vec::new(), self.clone(), false)
     }
     #[cfg(test)]
     pub fn plan_paint(&self, world: &World, value: u8) -> Result<EditPlan, EditError> {
@@ -569,15 +651,17 @@ impl SelectionDrag {
     }
 }
 
+fn tile_count(bounds: FineBox, size: u8) -> Result<u128, EditError> {
+    Ok(checked_dims(bounds.min, bounds.max)?
+        .into_iter()
+        .map(|n| (n as u128).div_ceil(size as u128))
+        .product())
+}
 fn filled(bounds: FineBox, size: u8, cell: Cell) -> Result<Vec<CellFragment>, EditError> {
     if ![1, 2, 4, 8].contains(&size) || bounds.is_empty() {
         return Err(EditError::InvalidSelection);
     }
-    let lengths = checked_dims(bounds.min, bounds.max)?;
-    let count: u128 = lengths
-        .into_iter()
-        .map(|n| (n as u128).div_ceil(size as u128))
-        .product();
+    let count = tile_count(bounds, size)?;
     if count > MAX_EDIT_FRAGMENTS as u128 {
         return Err(EditError::TooLarge);
     }
@@ -1191,7 +1275,9 @@ fn transform_shape(shape: Shape, transform: impl Fn([u8; 3]) -> [u8; 3]) -> Shap
 mod tests {
     use super::*;
     use sauerteig_core::ObjectKind;
+    use sauerteig_core::{ClientMessage, ServerMessage};
     use sauerteig_core::{WorldBounds, WORLD_HEIGHT, WORLD_MAX};
+    use std::time::{Duration, Instant};
 
     fn object(id: u32, kind: ObjectKind, position: [f32; 3], rotation: f32) -> WorldObject {
         WorldObject {
@@ -2293,5 +2379,665 @@ mod tests {
                 .unwrap();
             assert!((hit.point.y - x).abs() < 1e-5);
         }
+    }
+
+    fn fragment_at(world: &World, point: CellPos) -> Option<CellFragment> {
+        world
+            .root_fragments(point.map(|v| v.div_euclid(8)))
+            .into_iter()
+            .find(|f| (0..3).all(|a| f.bounds.min[a] <= point[a] && point[a] < f.bounds.max[a]))
+    }
+    fn solid_volume(world: &World, bounds: FineBox) -> i64 {
+        world
+            .roots_in(bounds)
+            .iter()
+            .flat_map(|root| &root.fragments)
+            .filter_map(|f| f.bounds.intersection(bounds))
+            .map(|b| {
+                (0..3)
+                    .map(|a| i64::from(b.max[a] - b.min[a]))
+                    .product::<i64>()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn extrusion_copies_all_six_face_materials_of_the_cell_behind() {
+        let faces = Cell {
+            face_materials: Some([0, 1, 2, 3, 4, 5]),
+            ..Cell::solid(6)
+        };
+        for axis in 0..3 {
+            for sign in [-1, 1] {
+                let mut world = World::empty();
+                world.set([4, 4, 4], Some(faces));
+                let s = EditSelection::from_hit(&hit([4, 4, 4], axis, sign), 8).unwrap();
+                let first = s.plan_extrude(&world, 7).unwrap();
+                apply(&mut world, &first);
+                let mut next = [4, 4, 4];
+                next[axis] += sign;
+                assert_eq!(world.get(next), Some(faces), "axis {axis}, sign {sign}");
+                // The selection follows the new layer, so a pillar keeps its pattern.
+                let second = first.selection_after.plan_extrude(&world, 7).unwrap();
+                apply(&mut world, &second);
+                next[axis] += sign;
+                assert_eq!(world.get(next), Some(faces), "axis {axis}, sign {sign}");
+            }
+        }
+    }
+
+    #[test]
+    fn extrusion_repeats_each_painted_patch_of_a_refined_root() {
+        let mut world = World::empty();
+        world.set([0, 0, 0], Some(Cell::solid(1)));
+        let patch = selection([0, 6, 0], [2, 8, 2], 1, 1, 2);
+        let painted = patch.plan_paint(&world, 5).unwrap();
+        apply(&mut world, &painted);
+        assert!(world.get([0, 0, 0]).is_none(), "the root is refined");
+        let patch_cell = fragment_at(&world, [1, 7, 1]).unwrap().cell;
+        assert_eq!(patch_cell.face_materials, Some([1, 1, 1, 5, 1, 1]));
+
+        let mut fine_world = world.clone();
+        let fine = patch.plan_extrude(&fine_world, 3).unwrap();
+        apply(&mut fine_world, &fine);
+        assert_eq!(
+            fragment_at(&fine_world, [1, 9, 1]).unwrap().cell,
+            patch_cell
+        );
+
+        let top = selection([0, 0, 0], [8, 8, 8], 1, 1, 8);
+        let plan = top.plan_extrude(&world, 3).unwrap();
+        apply(&mut world, &plan);
+        assert_eq!(fragment_at(&world, [1, 12, 1]).unwrap().cell, patch_cell);
+        assert_eq!(
+            fragment_at(&world, [1, 12, 5]).unwrap().cell,
+            Cell::solid(1)
+        );
+        assert_eq!(
+            fragment_at(&world, [5, 12, 1]).unwrap().cell,
+            Cell::solid(1)
+        );
+        assert_eq!(
+            fragment_at(&world, [5, 12, 5]).unwrap().cell,
+            Cell::solid(1)
+        );
+        let layer = FineBox {
+            min: [0, 8, 0],
+            max: [8, 16, 8],
+        };
+        assert_eq!(solid_volume(&world, layer), 512);
+    }
+
+    #[test]
+    fn extrusion_copies_an_imported_compact_region_and_falls_back_beyond_its_edge() {
+        let bounds = WorldBounds {
+            min: [-512, -256, -512],
+            max: [512, 256, 512],
+        };
+        let cell = Cell {
+            face_materials: Some([2, 3, 4, 5, 6, 7]),
+            ..Cell::solid(1)
+        };
+        let source = CellFragment {
+            bounds: FineBox {
+                min: [192 * 8, 0, 192 * 8],
+                max: [208 * 8, 16 * 8, 208 * 8],
+            },
+            origin: [192 * 8, 0, 192 * 8],
+            size: 128,
+            cell,
+        };
+        let mut world = World::from_compact_parts(bounds, &[source], &[], &[]).unwrap();
+        let strip = selection(
+            [207 * 8, 15 * 8, 200 * 8],
+            [209 * 8, 16 * 8, 201 * 8],
+            1,
+            1,
+            8,
+        );
+        let plan = strip.plan_extrude(&world, 4).unwrap();
+        apply(&mut world, &plan);
+        assert_eq!(world.get([207, 16, 200]), Some(cell));
+        assert_eq!(world.get([208, 16, 200]), Some(Cell::solid(4)));
+        assert_eq!(world.region_count(), 1);
+    }
+
+    #[test]
+    fn extrusion_copies_the_nearest_solid_in_each_column_and_nothing_beside_it() {
+        let near_cell = Cell {
+            face_materials: Some([2, 3, 4, 5, 6, 7]),
+            ..Cell::solid(2)
+        };
+        for sign in [1, -1] {
+            let mut world = World::empty();
+            let (near, far) = if sign > 0 {
+                ([0, 1, 0], [0, 0, 0])
+            } else {
+                ([0, 4, 0], [0, 5, 0])
+            };
+            world.set(far, Some(Cell::solid(1)));
+            world.set(near, Some(near_cell));
+            let s = EditSelection::from_hit(&hit(near, 1, sign), 16).unwrap();
+            assert_eq!(s.dims(), [16, 16, 16]);
+            let plan = s.plan_extrude(&world, 7).unwrap();
+            apply(&mut world, &plan);
+            let layer = FineBox {
+                min: [0, 16, 0],
+                max: [16, 32, 16],
+            };
+            assert_eq!(solid_volume(&world, layer), 4096, "sign {sign}");
+            for y in [2, 3] {
+                assert_eq!(world.get([0, y, 0]), Some(near_cell), "sign {sign}");
+                for beside in [[1, y, 0], [0, y, 1], [1, y, 1]] {
+                    assert_eq!(world.get(beside), Some(Cell::solid(7)), "sign {sign}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extrusion_ignores_a_warped_cell_that_does_not_reach_the_layer_behind() {
+        let mut world = World::empty();
+        let half = Cell {
+            face_materials: Some([2, 2, 2, 5, 2, 2]),
+            heights: [4; 4],
+            ..Cell::solid(2)
+        };
+        world.set([0, 0, 0], Some(half));
+        let copy = Cell {
+            face_materials: half.face_materials,
+            ..Cell::solid(2)
+        };
+        let inside = selection([0, 2, 0], [2, 4, 2], 1, 1, 2);
+        let mut grown = world.clone();
+        apply(&mut grown, &inside.plan_extrude(&world, 7).unwrap());
+        assert_eq!(fragment_at(&grown, [1, 5, 1]).unwrap().cell, copy);
+
+        let above = selection([0, 6, 0], [2, 8, 2], 1, 1, 2);
+        let mut floating = world.clone();
+        apply(&mut floating, &above.plan_extrude(&world, 7).unwrap());
+        assert_eq!(
+            fragment_at(&floating, [1, 9, 1]).unwrap().cell,
+            Cell::solid(7)
+        );
+    }
+
+    #[test]
+    fn extrusion_without_geometry_behind_fills_the_layer_with_the_current_material() {
+        for grid in [1, 2, 4, 8, 16] {
+            let mut world = World::empty();
+            let s = selection([8, 8, 8], [8 + grid; 3], 0, 1, grid);
+            let plan = s.plan_extrude(&world, 5).unwrap();
+            apply(&mut world, &plan);
+            let layer = FineBox {
+                min: [8 + grid, 8, 8],
+                max: [8 + 2 * grid, 8 + grid, 8 + grid],
+            };
+            let all = FineBox {
+                min: [0; 3],
+                max: [64; 3],
+            };
+            assert_eq!(solid_volume(&world, layer), i64::from(grid).pow(3));
+            assert_eq!(solid_volume(&world, all), i64::from(grid).pow(3));
+            assert!(world
+                .roots_in(all)
+                .iter()
+                .flat_map(|root| &root.fragments)
+                .all(|f| f.cell == Cell::solid(5)));
+        }
+    }
+
+    #[test]
+    fn extrusion_matches_a_per_unit_oracle_over_random_fine_detail() {
+        let mut seed = 0x5eed_1234_u32;
+        let mut next = move |n: u32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) % n
+        };
+        let (mut checked, mut stacked) = (0, 0);
+        for round in 0..60 {
+            let axis = next(3) as usize;
+            let sign = if next(2) == 0 { -1 } else { 1 };
+            let grid = [1, 2, 4, 4, 8][next(5) as usize];
+            let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+            let mut placed: Vec<CellFragment> = Vec::new();
+            for _ in 0..160 {
+                let size = [1, 1, 2, 2, 4][next(5) as usize];
+                let origin: CellPos =
+                    std::array::from_fn(|_| 8 + next(16 / size as u32) as i32 * size);
+                let bounds = FineBox {
+                    min: origin,
+                    max: origin.map(|c| c + size),
+                };
+                if placed
+                    .iter()
+                    .any(|f| f.bounds.intersection(bounds).is_some())
+                {
+                    continue;
+                }
+                let material = next(8) as u8;
+                placed.push(CellFragment {
+                    bounds,
+                    origin,
+                    size: size as u32,
+                    cell: Cell {
+                        face_materials: (next(2) == 0)
+                            .then(|| std::array::from_fn(|_| next(8) as u8)),
+                        ..Cell::solid(material)
+                    },
+                });
+            }
+            let mut roots: BTreeMap<CellPos, Vec<CellFragment>> = BTreeMap::new();
+            for f in &placed {
+                roots
+                    .entry(f.bounds.min.map(|c| c.div_euclid(8)))
+                    .or_default()
+                    .push(f.clone());
+            }
+            let mut world = World::empty();
+            let edits: Vec<_> = roots
+                .into_iter()
+                .map(|(pos, fragments)| RootEdit { pos, fragments })
+                .collect();
+            world.apply_root_edits(&edits).unwrap();
+
+            let plane = (8 + next(16) as i32).div_euclid(grid) * grid + grid;
+            let mut selected = EditSelection {
+                min: [0; 3],
+                max: [0; 3],
+                axis,
+                sign,
+                grid,
+            };
+            for a in [u, v] {
+                let low = (8 + next(12) as i32).div_euclid(grid) * grid;
+                selected.min[a] = low;
+                selected.max[a] = low + grid * (1 + next(2) as i32);
+            }
+            (selected.min[axis], selected.max[axis]) = if sign > 0 {
+                (plane - grid, plane)
+            } else {
+                (plane, plane + grid)
+            };
+            let value = next(8) as u8;
+            let plan = match selected.plan_extrude(&world, value) {
+                Ok(plan) => plan,
+                Err(EditError::NoChanges) => continue,
+                Err(error) => panic!("round {round}: {error}"),
+            };
+            let (slab, back) = (selected.slab(true).unwrap(), selected.slab(false).unwrap());
+            let mut after = world.clone();
+            apply(&mut after, &plan);
+            for x in slab.min[0]..slab.max[0] {
+                for y in slab.min[1]..slab.max[1] {
+                    for z in slab.min[2]..slab.max[2] {
+                        let p = [x, y, z];
+                        let behind: Vec<_> = placed
+                            .iter()
+                            .filter(|f| {
+                                [u, v]
+                                    .iter()
+                                    .all(|&a| f.bounds.min[a] <= p[a] && p[a] < f.bounds.max[a])
+                                    && f.bounds.min[axis] < back.max[axis]
+                                    && f.bounds.max[axis] > back.min[axis]
+                            })
+                            .collect();
+                        stacked += usize::from(behind.len() > 1);
+                        let nearest = behind.into_iter().max_by_key(|f| {
+                            if sign > 0 {
+                                f.bounds.max[axis].min(back.max[axis])
+                            } else {
+                                -f.bounds.min[axis].max(back.min[axis])
+                            }
+                        });
+                        let expected = nearest.map_or(Cell::solid(value), |f| Cell {
+                            face_materials: f.cell.face_materials,
+                            ..Cell::solid(f.cell.material)
+                        });
+                        assert_eq!(
+                            fragment_at(&after, p).unwrap().cell,
+                            expected,
+                            "round {round}, axis {axis}, sign {sign}, grid {grid}, {p:?}"
+                        );
+                    }
+                }
+            }
+            let all = FineBox {
+                min: [0; 3],
+                max: [64; 3],
+            };
+            assert_eq!(
+                solid_volume(&after, all) - solid_volume(&after, slab),
+                solid_volume(&world, all) - solid_volume(&world, slab),
+                "round {round}: only the new layer may change"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 50, "{checked} rounds checked");
+        assert!(
+            stacked >= 500,
+            "{stacked} points with several sources behind"
+        );
+    }
+
+    fn painted_wall() -> World {
+        let mut world = World::empty();
+        for x in 0..4 {
+            for y in 0..3 {
+                world.set(
+                    [x, y, 0],
+                    Some(Cell {
+                        face_materials: Some([1, 2, 3, 4, 5, 6]),
+                        ..Cell::solid((x + y) as u8)
+                    }),
+                );
+            }
+        }
+        for x in 10..12 {
+            world.set([x, 0, 0], Some(Cell::solid(7)));
+        }
+        let detail = selection([8, 8, 0], [10, 10, 2], 1, 1, 2);
+        let painted = detail.plan_paint(&world, 5).unwrap();
+        apply(&mut world, &painted);
+        world
+            .replace_volumes(&[material_volume([0; 3], [24, 16, 8], VolumeMaterial::Water)])
+            .unwrap();
+        world
+    }
+    fn three_volumes() -> (EditSelection, RegionSet) {
+        (
+            selection([80, 0, 0], [96, 8, 8], 1, 1, 8),
+            mask(&[
+                ([0, 0, 0], [24, 16, 8]),
+                ([80, 0, 0], [96, 8, 8]),
+                ([28, 4, 2], [36, 12, 6]),
+            ]),
+        )
+    }
+
+    #[test]
+    fn delete_empties_every_volume_of_an_additive_selection_in_one_undoable_plan() {
+        let mut world = painted_wall();
+        let (last, regions) = three_volumes();
+        let (cells, details, volumes) = (
+            world.cells(),
+            world.detailed_roots(),
+            world.volumes().to_vec(),
+        );
+        let plan = last.plan_delete_regions(&world, &regions).unwrap();
+        assert!(plan.volumes.is_empty());
+        assert_eq!(plan.selection_after, last);
+        let touched: BTreeSet<_> = plan.roots.iter().map(|r| r.pos).collect();
+        assert_eq!(touched.len(), plan.roots.len());
+        assert_eq!(plan.roots.len(), 10);
+
+        let saved: Vec<_> = plan
+            .roots
+            .iter()
+            .map(|r| RootEdit {
+                pos: r.pos,
+                fragments: world.root_fragments(r.pos),
+            })
+            .collect();
+        let everything = FineBox {
+            min: [-8; 3],
+            max: [120, 40, 24],
+        };
+        let before = solid_volume(&world, everything);
+        let removed: i64 = regions
+            .boxes()
+            .iter()
+            .map(|b| solid_volume(&world, fine(*b)))
+            .sum();
+        assert!(removed > 0 && removed < before);
+        apply(&mut world, &plan);
+        assert_eq!(solid_volume(&world, everything), before - removed);
+        for b in regions.boxes() {
+            assert_eq!(solid_volume(&world, fine(*b)), 0, "{b:?}");
+        }
+        assert_eq!(world.volumes(), volumes);
+        assert!(world.get([0, 2, 0]).is_some(), "rows above the volume stay");
+        assert!(fragment_at(&world, [26, 10, 3]).is_some());
+        assert!(fragment_at(&world, [30, 13, 3]).is_some());
+        assert!(fragment_at(&world, [30, 10, 3]).is_none());
+
+        // The server undoes an edit by restoring the roots it replaced.
+        world.apply_root_edits(&saved).unwrap();
+        assert_eq!(world.cells(), cells);
+        assert_eq!(world.detailed_roots(), details);
+        assert_eq!(world.volumes(), volumes);
+        assert_eq!(solid_volume(&world, everything), before);
+    }
+
+    #[test]
+    fn delete_cuts_an_imported_region_and_restoring_its_roots_brings_the_surface_back() {
+        let bounds = WorldBounds {
+            min: [-512, -256, -512],
+            max: [512, 256, 512],
+        };
+        let source = CellFragment {
+            bounds: FineBox {
+                min: [192 * 8, 0, 192 * 8],
+                max: [208 * 8, 16 * 8, 208 * 8],
+            },
+            origin: [192 * 8, 0, 192 * 8],
+            size: 128,
+            cell: Cell::solid(0),
+        };
+        let mut world = World::from_compact_parts(bounds, &[source], &[], &[]).unwrap();
+        let top = |world: &World, x: f32| {
+            world
+                .raycast(Vec3::new(x, 20.0, 200.5), -Vec3::Y, 30.0)
+                .unwrap()
+                .point
+                .y
+        };
+        let cut = [200 * 8, 15 * 8, 200 * 8];
+        let region = mask(&[(cut, [cut[0] + 8, cut[1] + 8, cut[2] + 8])]);
+        let s = selection(cut, [cut[0] + 8, cut[1] + 8, cut[2] + 8], 1, 1, 8);
+        let plan = s.plan_delete_regions(&world, &region).unwrap();
+        let saved: Vec<_> = plan
+            .roots
+            .iter()
+            .map(|r| RootEdit {
+                pos: r.pos,
+                fragments: world.root_fragments(r.pos),
+            })
+            .collect();
+        apply(&mut world, &plan);
+        assert!((top(&world, 200.5) - 15.0).abs() < 1e-5);
+        assert!((top(&world, 201.5) - 16.0).abs() < 1e-5);
+        assert_eq!(world.region_count(), 1);
+        world.apply_root_edits(&saved).unwrap();
+        assert!((top(&world, 200.5) - 16.0).abs() < 1e-5);
+        assert!((top(&world, 201.5) - 16.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn delete_reports_empty_space_and_ignores_the_part_of_a_volume_outside_the_world() {
+        let mut world = World::empty();
+        let s = selection([0; 3], [8; 3], 1, 1, 8);
+        assert_eq!(
+            s.plan_delete_regions(&world, &mask(&[([0; 3], [8; 3])]))
+                .unwrap_err(),
+            EditError::NoChanges
+        );
+        world.set([WORLD_MAX - 1, 0, 0], Some(Cell::solid(1)));
+        let edge = (WORLD_MAX - 1) * 8;
+        let outside = mask(&[([edge, 0, 0], [edge + 64, 8, 8])]);
+        let plan = s.plan_delete_regions(&world, &outside).unwrap();
+        apply(&mut world, &plan);
+        assert!(world.get([WORLD_MAX - 1, 0, 0]).is_none());
+    }
+
+    struct Wire {
+        sender: ewebsock::WsSender,
+        receiver: ewebsock::WsReceiver,
+        world: World,
+        revision: u64,
+        syncs: u64,
+    }
+    impl Wire {
+        fn open(host: &crate::hosting::HostedServer) -> Self {
+            let (sender, receiver) =
+                ewebsock::connect(host.endpoint(), ewebsock::Options::default()).unwrap();
+            let mut wire = Self {
+                sender,
+                receiver,
+                world: World::empty(),
+                revision: 0,
+                syncs: 0,
+            };
+            let ServerMessage::Welcome {
+                revision,
+                bounds,
+                regions,
+                cells,
+                roots,
+                volumes,
+                ..
+            } = wire.next(|message| matches!(message, ServerMessage::Welcome { .. }))
+            else {
+                unreachable!()
+            };
+            wire.world = World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap();
+            wire.world.replace_volumes(&volumes).unwrap();
+            wire.revision = revision;
+            wire
+        }
+        fn next(&mut self, wanted: impl Fn(&ServerMessage) -> bool) -> ServerMessage {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match self.receiver.try_recv() {
+                    Some(ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(text))) => {
+                        let message = serde_json::from_str(&text).unwrap();
+                        if wanted(&message) {
+                            return message;
+                        }
+                    }
+                    Some(ewebsock::WsEvent::Error(error)) => panic!("WebSocket error: {error}"),
+                    Some(ewebsock::WsEvent::Closed) => panic!("WebSocket closed"),
+                    Some(_) => {}
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
+                assert!(Instant::now() < deadline, "server response timed out");
+            }
+        }
+        fn send(&mut self, message: ClientMessage) {
+            self.sender.send(ewebsock::WsMessage::Text(
+                serde_json::to_string(&message).unwrap(),
+            ));
+        }
+        /// Applies every patch the server queued ahead of its answer to a Sync that
+        /// follows `message`, and returns the errors it reported meanwhile.
+        fn settle(&mut self, message: ClientMessage) -> Vec<String> {
+            self.send(message);
+            self.syncs += 1;
+            let request = self.syncs;
+            self.send(ClientMessage::Sync { request });
+            let mut errors = Vec::new();
+            loop {
+                match self.next(|message| !matches!(message, ServerMessage::Snapshot { .. })) {
+                    ServerMessage::RootPatch { revision, roots } => {
+                        self.world.apply_root_edits(&roots).unwrap();
+                        self.revision = revision;
+                    }
+                    ServerMessage::EditResult {
+                        error: Some(error), ..
+                    }
+                    | ServerMessage::Error { message: error } => errors.push(error),
+                    ServerMessage::Synced { request: done } if done == request => return errors,
+                    _ => {}
+                }
+            }
+        }
+        fn state(&self) -> (Vec<CellEdit>, Vec<RootEdit>, Vec<MaterialVolume>) {
+            (
+                self.world.cells(),
+                self.world.detailed_roots(),
+                self.world.volumes().to_vec(),
+            )
+        }
+    }
+
+    #[test]
+    fn the_real_server_applies_fill_and_delete_plans_and_one_undo_reverts_each() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = Directory(
+            std::env::temp_dir().join(format!("sauerteig-fill-delete-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let path = directory.0.join("world.json");
+        let wall = painted_wall();
+        let saved = serde_json::json!({
+            "revision": 0,
+            "format_version": sauerteig_core::WORLD_FORMAT_VERSION,
+            "bounds": wall.bounds(),
+            "cells": wall.cells(),
+            "roots": wall.root_overrides(),
+            "volumes": wall.volumes(),
+            "objects": [],
+        });
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut host = crate::hosting::HostedServer::start(path, false).unwrap();
+        let mut wire = Wire::open(&host);
+        let mode = ClientMessage::SetMode {
+            request: 1,
+            editing: true,
+        };
+        assert!(wire.settle(mode).is_empty());
+        let original = wire.state();
+        assert_eq!(original.0, wall.cells());
+        assert_eq!(original.1, wall.detailed_roots());
+
+        let (last, regions) = three_volumes();
+        let delete = last.plan_delete_regions(&wire.world, &regions).unwrap();
+        let mut predicted = wire.world.clone();
+        apply(&mut predicted, &delete);
+        let revision = wire.revision;
+        let errors = wire.settle(ClientMessage::EditRoots {
+            request: 2,
+            base_revision: wire.revision,
+            roots: delete.roots.clone(),
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(wire.revision, revision + 1, "a single edit");
+        assert_eq!(wire.world.cells(), predicted.cells());
+        assert_eq!(wire.world.detailed_roots(), predicted.detailed_roots());
+        assert_ne!(wire.state(), original);
+        assert_eq!(wire.world.volumes(), original.2);
+        assert!(wire.settle(ClientMessage::Undo).is_empty());
+        assert_eq!(wire.revision, revision + 2);
+        assert_eq!(wire.state(), original, "one undo restores every volume");
+
+        let top = selection([0, 16, 0], [32, 24, 8], 1, 1, 8);
+        let fill = top.plan_extrude(&wire.world, 7).unwrap();
+        let mut predicted = wire.world.clone();
+        apply(&mut predicted, &fill);
+        let revision = wire.revision;
+        let errors = wire.settle(ClientMessage::EditRoots {
+            request: 3,
+            base_revision: wire.revision,
+            roots: fill.roots.clone(),
+        });
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(wire.revision, revision + 1, "a single edit");
+        assert_eq!(wire.world.cells(), predicted.cells());
+        let copied = Cell {
+            face_materials: Some([1, 2, 3, 4, 5, 6]),
+            ..Cell::solid(5)
+        };
+        assert_eq!(wire.world.get([3, 3, 0]), Some(copied));
+        assert!(wire.settle(ClientMessage::Undo).is_empty());
+        assert_eq!(wire.revision, revision + 2);
+        assert_eq!(wire.state(), original);
+
+        drop(wire);
+        host.shutdown_blocking().unwrap();
     }
 }

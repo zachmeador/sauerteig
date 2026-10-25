@@ -20,13 +20,14 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Assign normal space, water, or glass | Esc → Selection → Volume material → Apply |
 | Clear the selection in edit mode | Space |
 | Extrude / carve the selected or aimed face | Wheel down / up |
+| Empty the selection, or the aimed cell without one | Delete / Backspace |
 | Make the grid smaller / larger | G+wheel down / up; [ / ] also work |
 | Select one corner on the active face | Middle mouse |
 | Select one edge on the active face | Shift+middle mouse |
 | Shape the selected corner | Wheel |
 | Shape all face corners without a corner/edge selection | F+wheel |
 | Cycle and apply material | Y+wheel |
-| Choose material | 1–8 |
+| Choose material in edit mode | 1–8 |
 | Browse materials and props | T, or Esc → Assets |
 | Undo your latest geometry, volume, or object edit | U or Z |
 | Redo your latest undone edit | Shift+U or Shift+Z |
@@ -36,7 +37,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Rotate the clipboard 90° around Y | R |
 | Mirror the clipboard along X / Z | M / Shift+M |
 | Place selected prop / light / spawn | P / L / O |
-| Remove an aimed object | Delete / Backspace |
+| Remove the selected or aimed object in object mode | Delete / Backspace |
 | Switch geometry / object selection | Q |
 | Show controls / performance stats | F1 / F3 |
 | Return to world picker without disconnecting | Esc → Main menu |
@@ -46,13 +47,19 @@ A selection stays active after releasing the mouse. Editing commands apply to
 that selection; without one, they apply to the face under the crosshair. Clicks
 select geometry rather than adding or deleting it. Wheel down pulls geometry
 outward; wheel up pushes it inward. Settings can invert all editor wheel controls.
+Pulling copies the six face materials of the geometry behind the face, so a wall
+painted with several materials keeps its pattern; where nothing solid is behind, it
+uses the chosen material. Delete or Backspace empties every volume of the selection,
+or the aimed cell when nothing is selected, as one undoable edit. A selected object,
+such as one just placed, is removed first unless geometry has been selected since.
 The grid ranges from 1/8 metre to 8 metres. The Escape selection panel also offers
 Replace/Add/Subtract modes and numeric X/Y/Z sizes measured in the current grid.
 Fine carving preserves the original shape of existing sloped and warped surfaces.
 
 Materials 1–8 are **Concrete**, **Gunmetal**, **Rusted Steel**, **Worn Concrete**,
-**Hazard Paint**, **Amber Light**, **Rock**, and **Earth**. Use Y+wheel to cycle and
-apply them, or T to browse thumbnails and paint a persistent selection. Painting
+**Hazard Paint**, **Amber Light**, **Rock**, and **Earth**. In edit mode the number
+keys choose them; in combat 1 and 2 choose the weapon instead. Use Y+wheel to cycle
+and apply them, or T to browse thumbnails and paint a persistent selection. Painting
 changes the selection's active face direction; other faces keep their materials.
 Floors, ceilings, and each wall direction can have independent surfaces. Texture
 scale uses world coordinates, so subdividing a surface does not shrink its pattern.
@@ -70,8 +77,10 @@ separate light node beside it.
 Press **Q** in edit mode to select objects. Click a prop, light marker, or spawn to select
 it; the object panel exposes position and yaw. Arrow keys move it by the current
 grid step, Shift+Up/Down moves vertically, R rotates 90°, H moves it to the aimed
-surface, and Insert duplicates it. Delete removes it. These actions share undo
-and redo with geometry. Release the mouse with Esc to use the numeric controls.
+surface, and Insert duplicates it. Delete or Backspace removes it, in geometry mode
+too unless geometry has been selected since. These actions share undo and redo with
+geometry.
+Release the mouse with Esc to use the numeric controls.
 
 ## Volumes and blueprints
 
@@ -85,8 +94,9 @@ Space swims upward. These are static regions, not flowing fluid simulations.
 
 Water and glass surfaces can be selected like geometry. Turn off **Select water
 and glass surfaces** in the selection panel to reach geometry behind them.
-Wheel operations still edit solid geometry; use the volume material control to
-add or remove water and glass. Surface textures and volume materials are separate.
+Wheel operations and Delete still edit solid geometry; use the volume material
+control to add or remove water and glass. Surface textures and volume materials are
+separate.
 
 Selections can contain several volumes: select the main building, then add its
 annex with Alt+drag. Overlaps count once. Subtract volumes with Alt+Shift+drag.
