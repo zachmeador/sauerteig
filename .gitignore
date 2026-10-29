@@ -2,6 +2,6 @@
 /.tools/
 /.local/
 /web/dist/
-/.DS_Store
-/_old-games-user-data/
+.DS_Store
+/AGENTS-PRIVATE.md
 
