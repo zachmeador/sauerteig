@@ -35,20 +35,9 @@ const OBJECT_REACH: f32 = 10.0;
 /// More object changes than this at once invalidate everything.
 const MAX_OBJECT_EDITS: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LightingTier {
-    /// Compute-built clusters over storage buffers: the default.
-    Clustered,
-    /// Uniform buffers with CPU-built 64-light masks.
-    Uniform,
-    /// The nearest few lights, evaluated without clusters.
-    Nearest,
-}
-
 #[derive(Clone, Copy, Debug)]
-pub struct TierConfig {
-    pub tier: LightingTier,
-    pub grid: Option<ClusterGrid>,
+pub struct LightConfig {
+    pub grid: ClusterGrid,
     pub max_lights: usize,
     /// Lights evaluated per opaque fragment; water and glass evaluate fewer.
     pub light_cap: u32,
@@ -60,42 +49,17 @@ pub struct TierConfig {
     pub actor_lights: usize,
 }
 
-impl LightingTier {
-    pub fn config(self) -> TierConfig {
-        match self {
-            Self::Clustered => TierConfig {
-                tier: self,
-                grid: Some(ClusterGrid::CLUSTERED),
-                max_lights: 256,
-                light_cap: 16,
-                pages: 14,
-                faces_per_frame: 6,
-                max_tile_class: TileClass::Large,
-                max_shadowed: usize::MAX,
-                actor_lights: ACTOR_SHADOW_LIGHTS,
-            },
-            Self::Uniform => TierConfig {
-                tier: self,
-                grid: Some(ClusterGrid::COMPACT),
-                max_lights: 64,
-                light_cap: 8,
-                pages: 2,
-                faces_per_frame: 2,
-                max_tile_class: TileClass::Medium,
-                max_shadowed: 4,
-                actor_lights: ACTOR_SHADOW_LIGHTS,
-            },
-            Self::Nearest => TierConfig {
-                tier: self,
-                grid: None,
-                max_lights: 8,
-                light_cap: 8,
-                pages: 2,
-                faces_per_frame: 2,
-                max_tile_class: TileClass::Medium,
-                max_shadowed: 4,
-                actor_lights: ACTOR_SHADOW_LIGHTS,
-            },
+impl Default for LightConfig {
+    fn default() -> Self {
+        Self {
+            grid: ClusterGrid::CLUSTERED,
+            max_lights: 256,
+            light_cap: 16,
+            pages: 14,
+            faces_per_frame: 6,
+            max_tile_class: TileClass::Large,
+            max_shadowed: usize::MAX,
+            actor_lights: ACTOR_SHADOW_LIGHTS,
         }
     }
 }
@@ -209,7 +173,7 @@ struct ObjectDigest {
 }
 
 pub struct LightSet {
-    config: TierConfig,
+    config: LightConfig,
     over_budget: OverBudget,
     /// The shadow mode of lights placed by light nodes.
     node_shadow: ShadowMode,
@@ -224,7 +188,7 @@ pub struct LightSet {
 }
 
 impl LightSet {
-    pub fn new(config: TierConfig, over_budget: OverBudget, node_shadow: ShadowMode) -> Self {
+    pub fn new(config: LightConfig, over_budget: OverBudget, node_shadow: ShadowMode) -> Self {
         Self {
             config,
             over_budget,
@@ -238,10 +202,6 @@ impl LightSet {
             last_eye: None,
             descs: Vec::new(),
         }
-    }
-
-    pub fn config(&self) -> &TierConfig {
-        &self.config
     }
 
     /// Whether any light may shadow moving actors, so their vertices are needed.
@@ -718,9 +678,13 @@ mod tests {
     }
 
     impl Scene {
-        fn new(tier: LightingTier, positions: &[Vec3]) -> Self {
+        fn new(positions: &[Vec3]) -> Self {
             Self {
-                set: LightSet::new(tier.config(), OverBudget::FadeOut, ShadowMode::Static),
+                set: LightSet::new(
+                    LightConfig::default(),
+                    OverBudget::FadeOut,
+                    ShadowMode::Static,
+                ),
                 objects: positions
                     .iter()
                     .enumerate()
@@ -775,8 +739,8 @@ mod tests {
     }
 
     #[test]
-    fn lights_are_listed_by_importance_up_to_the_tier_cap() {
-        let mut scene = Scene::new(LightingTier::Clustered, &[]);
+    fn lights_are_listed_by_importance_up_to_the_cap() {
+        let mut scene = Scene::new(&[]);
         for i in 0..300 {
             let mut light = LightDesc::point(i + 1, Vec3::new(0.0, 2.0, -3.0 - i as f32 * 0.5));
             light.shadow = ShadowMode::Off;
@@ -794,7 +758,6 @@ mod tests {
             LightDesc::point(2, Vec3::new(0.0, 0.0, -300.0)),
         ];
         assert!(scene.frame().lights.is_empty());
-        assert_eq!(LightingTier::Nearest.config().max_lights, 8);
     }
 
     #[test]
@@ -820,7 +783,7 @@ mod tests {
     #[test]
     fn a_light_fades_in_once_its_shadows_have_rendered() {
         // Twelve lights; two fit in the first frames' doubled budget of 12 faces.
-        let mut scene = Scene::new(LightingTier::Clustered, &line(12, 2.0));
+        let mut scene = Scene::new(&line(12, 2.0));
         let first = scene.frame();
         assert_eq!(first.jobs.len(), 12);
         assert_eq!(first.lights.len(), 2, "only rendered lights are drawn");
@@ -853,7 +816,7 @@ mod tests {
 
     #[test]
     fn updates_are_capped_per_frame_and_doubled_after_a_teleport() {
-        let mut scene = Scene::new(LightingTier::Clustered, &line(30, 1.0));
+        let mut scene = Scene::new(&line(30, 1.0));
         let counts: Vec<usize> = (0..6).map(|_| scene.frame().jobs.len()).collect();
         assert_eq!(counts, [12, 12, 12, 6, 6, 6]);
         scene.settle();
@@ -875,7 +838,7 @@ mod tests {
 
     #[test]
     fn measured_cost_can_lower_the_update_budget_but_never_below_one_face() {
-        let mut scene = Scene::new(LightingTier::Clustered, &line(8, 2.0));
+        let mut scene = Scene::new(&line(8, 2.0));
         scene.faces_limit = 3;
         let counts: Vec<usize> = (0..4).map(|_| scene.frame().jobs.len()).collect();
         assert_eq!(counts, [3, 3, 3, 3]);
@@ -884,7 +847,7 @@ mod tests {
         assert_eq!((plan.jobs.len(), plan.stats.budget), (1, 1));
         // Faces of one light spread over frames: it fades in only when all six
         // have rendered.
-        let mut scene = Scene::new(LightingTier::Clustered, &line(1, 2.0));
+        let mut scene = Scene::new(&line(1, 2.0));
         scene.faces_limit = 2;
         let drawn: Vec<usize> = (0..5).map(|_| scene.frame().lights.len()).collect();
         assert_eq!(drawn, [0, 0, 1, 1, 1]);
@@ -892,20 +855,20 @@ mod tests {
 
     #[test]
     fn lights_beyond_the_atlas_fade_out_instead_of_leaking() {
-        // The compact tier shadows four lights at most.
-        let mut scene = Scene::new(LightingTier::Uniform, &line(10, 1.0));
+        let limited = LightConfig {
+            max_shadowed: 4,
+            ..LightConfig::default()
+        };
+        let mut scene = Scene::new(&line(10, 1.0));
+        scene.set = LightSet::new(limited, OverBudget::FadeOut, ShadowMode::Static);
         scene.settle();
         let plan = scene.frame();
         assert_eq!(plan.stats.shadowed, 4);
         assert_eq!(plan.lights.len(), 4);
         assert_eq!(plan.stats.over_budget, 6);
         // For comparison captures they can stay, unshadowed.
-        let mut scene = Scene::new(LightingTier::Uniform, &line(10, 1.0));
-        scene.set = LightSet::new(
-            LightingTier::Uniform.config(),
-            OverBudget::Unshadowed,
-            ShadowMode::Static,
-        );
+        let mut scene = Scene::new(&line(10, 1.0));
+        scene.set = LightSet::new(limited, OverBudget::Unshadowed, ShadowMode::Static);
         scene.settle();
         let plan = scene.frame();
         assert_eq!(plan.lights.len(), 10);
@@ -920,7 +883,7 @@ mod tests {
     #[test]
     fn only_lights_near_an_edit_rerender_and_stale_tiles_keep_lighting() {
         let positions = [Vec3::new(0.0, 2.0, -8.0), Vec3::new(0.0, 2.0, -60.0)];
-        let mut scene = Scene::new(LightingTier::Clustered, &positions);
+        let mut scene = Scene::new(&positions);
         scene.settle();
         assert!(scene.frame().jobs.is_empty());
         scene
@@ -946,7 +909,7 @@ mod tests {
 
     #[test]
     fn a_moved_light_renders_first_and_stays_bright() {
-        let mut scene = Scene::new(LightingTier::Clustered, &line(4, 3.0));
+        let mut scene = Scene::new(&line(4, 3.0));
         scene.settle();
         scene.objects[1].position.x += 1.0;
         let plan = scene.frame();
@@ -977,7 +940,7 @@ mod tests {
 
     #[test]
     fn a_light_that_changes_kind_gets_the_right_number_of_tiles() {
-        let mut scene = Scene::new(LightingTier::Clustered, &[]);
+        let mut scene = Scene::new(&[]);
         scene
             .extra
             .push(LightDesc::point(1, Vec3::new(0.0, 2.0, -8.0)));
@@ -995,7 +958,7 @@ mod tests {
 
     #[test]
     fn deleted_lights_free_their_tiles_and_edited_objects_invalidate_nearby_tiles() {
-        let mut scene = Scene::new(LightingTier::Clustered, &line(2, 40.0));
+        let mut scene = Scene::new(&line(2, 40.0));
         scene.settle();
         assert_eq!(scene.frame().stats.tiles_resident, 12);
         // A tree appears beside light 1 only.
@@ -1035,7 +998,7 @@ mod tests {
         let positions: Vec<Vec3> = (0..340)
             .map(|_| Vec3::new(next() * 130.0 - 60.0, next() * 100.0, next() * 160.0 - 75.0))
             .collect();
-        let mut scene = Scene::new(LightingTier::Clustered, &positions);
+        let mut scene = Scene::new(&positions);
         let mut total = 0;
         let mut worst = 0;
         let mut shadowed = 0;
@@ -1060,7 +1023,7 @@ mod tests {
 
     #[test]
     fn dynamic_lights_give_actors_overlay_tiles_only_where_they_are() {
-        let mut scene = Scene::new(LightingTier::Clustered, &[]);
+        let mut scene = Scene::new(&[]);
         scene.set.config.actor_lights = 0;
         let mut light = LightDesc::point(1, Vec3::new(0.0, 3.0, -8.0));
         light.shadow = ShadowMode::Dynamic;
@@ -1105,7 +1068,7 @@ mod tests {
 
     #[test]
     fn the_most_important_shadowed_lights_shadow_actors() {
-        let mut scene = Scene::new(LightingTier::Clustered, &[]);
+        let mut scene = Scene::new(&[]);
         ranked_lights(&mut scene);
         let plan = scene.frame();
         assert_eq!(plan.stats.shadowed, 12);
@@ -1143,7 +1106,7 @@ mod tests {
 
     #[test]
     fn actor_shadows_stay_until_a_light_falls_past_the_margin() {
-        let mut scene = Scene::new(LightingTier::Clustered, &[]);
+        let mut scene = Scene::new(&[]);
         ranked_lights(&mut scene);
         let limit = ACTOR_SHADOW_LIGHTS as u32;
         assert_eq!(mode_of(&scene.frame(), limit + 1), 1);
@@ -1168,7 +1131,7 @@ mod tests {
         let positions: Vec<Vec3> = (0..4)
             .map(|i| Vec3::new(i as f32 * 3.0 - 4.5, 4.0, -6.0))
             .collect();
-        let mut scene = Scene::new(LightingTier::Clustered, &positions);
+        let mut scene = Scene::new(&positions);
         scene.settle();
         scene.actors = vec![Vec3::new(-4.5, 1.0, -6.0)];
         assert!(scene.set.shadows_actors());
@@ -1186,7 +1149,7 @@ mod tests {
 
     #[test]
     fn many_actors_never_use_more_overlay_tiles_than_exist() {
-        let mut scene = Scene::new(LightingTier::Clustered, &[]);
+        let mut scene = Scene::new(&[]);
         for i in 0..8 {
             let mut light = LightDesc::point(i + 1, Vec3::new(i as f32 * 3.0 - 10.0, 5.0, -8.0));
             light.shadow = ShadowMode::Dynamic;

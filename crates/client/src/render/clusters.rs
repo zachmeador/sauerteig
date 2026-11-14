@@ -1,5 +1,6 @@
 //! View-cluster grid math shared by the culling shader, the CPU mask builder
-//! used by the uniform-buffer tier, and the tests that compare the two.
+//! behind the capture report's lights-per-cluster counts, and the tests that
+//! compare the two.
 use glam::{Vec2, Vec3, Vec4};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -21,13 +22,6 @@ impl ClusterGrid {
         split: 4.0,
         far: 180.0,
         words: 8,
-    };
-    pub const COMPACT: Self = Self {
-        dims: [12, 7, 16],
-        near: 0.06,
-        split: 4.0,
-        far: 180.0,
-        words: 2,
     };
 
     pub fn count(&self) -> usize {
@@ -137,7 +131,7 @@ mod tests {
 
     #[test]
     fn slices_tile_the_depth_range_without_gaps() {
-        for grid in [ClusterGrid::CLUSTERED, ClusterGrid::COMPACT] {
+        for grid in [ClusterGrid::CLUSTERED] {
             let mut previous = grid.near;
             for slice in 0..grid.dims[2] {
                 let (near, far) = grid.slice_depths(slice);
@@ -150,7 +144,6 @@ mod tests {
         }
         assert_eq!(ClusterGrid::CLUSTERED.count(), 3456);
         assert_eq!(ClusterGrid::CLUSTERED.max_lights(), 256);
-        assert_eq!(ClusterGrid::COMPACT.max_lights(), 64);
     }
 
     #[test]
@@ -176,7 +169,7 @@ mod tests {
         let projection = Mat4::perspective_rh(78.0_f32.to_radians(), 16.0 / 9.0, 0.06, 180.0);
         let scale = scale_of(projection);
         let screen = Vec2::new(1920.0, 1080.0);
-        for grid in [ClusterGrid::CLUSTERED, ClusterGrid::COMPACT] {
+        for grid in [ClusterGrid::CLUSTERED] {
             for px in (0..1920).step_by(37) {
                 for py in (0..1080).step_by(41) {
                     for depth in [0.07, 0.5, 3.9, 4.1, 17.3, 90.0, 179.0] {
@@ -213,7 +206,7 @@ mod tests {
             state ^= state << 5;
             state as f32 / u32::MAX as f32
         };
-        for grid in [ClusterGrid::CLUSTERED, ClusterGrid::COMPACT] {
+        for grid in [ClusterGrid::CLUSTERED] {
             let lights: Vec<Vec4> = (0..grid.max_lights())
                 .map(|_| {
                     Vec4::new(

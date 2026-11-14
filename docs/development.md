@@ -163,14 +163,17 @@ faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
 
 The scene renders in linear HDR, with a filmic exposure/tonemapping pass before
 egui. Settings include bloom (zero disables it), anti-aliasing, render scale
-(50–100%), exposure, and vsync. Anti-aliasing defaults to Auto: 4× MSAA where
-supported while the scene has at most 2560×1440 pixels, and none above that,
-because 4× MSAA on a 4K HDR scene measured over a 144 Hz frame budget on an
-M3 Pro. On and Off override it. Render scale affects only the scene; egui
-stays at output resolution. Vsync off selects Mailbox, then Immediate if
-available, otherwise Fifo. The surface requests one frame of latency, clamped by
-the backend. Local movement and remote player poses interpolate between 60 Hz
-steps; mouse look remains immediate.
+(50–100%), exposure, and vsync. Anti-aliasing offers Off, 2×, 4× and 8× MSAA,
+each only where the adapter supports that count for both `Rgba16Float` (with
+resolve) and `Depth32Float`, and Auto, the default. Auto takes 4× while the
+scene has at most 2560×1440 pixels, 2× up to 3840×2160, and none above that, and
+never 8×; it follows from throughput measurements at 4K
+(see [renderer](tracking/renderer.md)). A saved choice the adapter can't run
+uses the next lower count it can, and saved settings that say `on` mean 4×.
+Render scale affects only the scene; egui stays at output resolution. Vsync off
+selects Mailbox, then Immediate if available, otherwise Fifo. The surface
+requests one frame of latency, clamped by the backend. Local movement and remote
+player poses interpolate between 60 Hz steps; mouse look remains immediate.
 
 Lighting is dynamic. The sun shadow window follows the player in six-metre,
 texel-aligned light-space steps; its static geometry cache is kept until geometry
@@ -202,11 +205,15 @@ light that has them keeps them down to tenth place) also sample an overlay page
 that is redrawn every frame with the moving actors near them, in at most 15
 tiles; the other lights cast only static shadows.
 
-The code still holds a uniform-buffer lighting path (CPU-built masks, 64
-lights, four shadowed) and a nearest-eight path (four shadowed), written for
-adapters without compute shaders or enough storage buffers. The device request
-(`Limits::default()` in `Renderer::create`) already turns such adapters away,
-so only the capture tool's `--tier` flag reaches these paths.
+The renderer asks the adapter for what it uses and no more (`render/device.rs`):
+the Vulkan, DirectX 12 and Metal backends only (`WGPU_BACKEND` and
+`WGPU_DX12_COMPILER` still override them, for testing), compute shaders,
+anisotropic filtering, two storage buffers per shader stage, three bind groups,
+64 array layers, 8192-pixel textures (more for a bigger window), and a
+64-invocation compute workgroup. It also takes `TIMESTAMP_QUERY` for the GPU
+timings and `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` for 2× and 8× MSAA, each
+only where the adapter has it. An adapter that lacks a required limit or
+ability is refused with a message that names it and the minimum specification.
 
 Shaders compile without wgpu's forced loop bounding, through `shaders::trusted`
 in `render/shaders.rs`. On Metal the
@@ -260,13 +267,14 @@ cargo run --release -p sauerteig-import --example profile_ogz -- path/to/map.ogz
 
 These report meshing, edit, movement, and ray-query timings. The OGZ profile also
 reports original-scale storage, load time, query percentiles, and dirty remeshing.
-They exclude GPU execution and networking. F3 shows rendering counts, CPU
-edit/remesh timing, effective scene resolution/MSAA/present mode, shadow maps
-rendered, per-pass GPU timestamps where supported, and the lighting path with how
-many lights are drawn, shadowed (and shadowing actors), over budget or waiting. It
-explicitly reports unavailable timestamps otherwise. The asynchronous profiler
-never waits for a sample during play. Pass spans can overlap on Metal, so do not
-add them to obtain a GPU frame time.
+They exclude GPU execution and networking. F3 shows the adapter's name with its
+graphics API and driver, rendering counts, CPU edit/remesh timing, effective
+scene resolution/MSAA/present mode, shadow maps rendered, per-pass GPU
+timestamps where supported, and how many lights are drawn, shadowed (and
+shadowing actors), over budget or waiting. It explicitly reports unavailable
+timestamps otherwise. The asynchronous profiler never waits for a sample during
+play. Pass spans can overlap on Metal, so do not add them to obtain a GPU frame
+time.
 
 For fixed native renderer comparisons, source `scripts/env.sh`, then run:
 
@@ -288,25 +296,45 @@ passes apart from the sun's, and how many lights reach each cluster that has any
 The render clock is fixed at 60 Hz. The supplied imported poses expect a **copy** of
 the library's `the_cube1m` at `.local/the_cube1m.json`. Supply your own pose
 manifest for other worlds. The tool refuses to replace existing PNGs.
-`--settings FILE` accepts a JSON object with `scale`, `msaa`
-(`"auto"`, `"on"` or `"off"`), `bloom`, `exposure` and `vsync`; omitted fields
-take the normal defaults. `--tier clustered|uniform|nearest` forces a lighting
-path, `--brute-force` evaluates every light at every fragment (for comparing with
-the clusters), `--pages N` sets the shadow atlas size, `--over-budget unshadowed`
-keeps lights that no tile can hold, `--actor-lights N` sets how many of the most
-important shadowed lights shadow actors, and `--node-shadows off|static|dynamic`
-sets what light nodes cast. Measurements include CPU submission, completed-frame
-median/p95 and individual GPU pass medians. They exclude simulation,
-presentation and PNG readback; they do not prove perceived smoothness on a
-monitor.
+`--settings FILE` accepts a JSON object with `scale`, `msaa` (`"auto"`, `"off"`,
+`"x2"`, `"x4"` or `"x8"`; `"on"` means 4×), `bloom`, `exposure` and `vsync`;
+omitted fields take the normal defaults. `--brute-force` evaluates every light
+at every fragment (for comparing with the clusters), `--pages N` sets the shadow
+atlas size, `--over-budget unshadowed` keeps lights that no tile can hold,
+`--actor-lights N` sets how many of the most important shadowed lights shadow
+actors, and `--node-shadows off|static|dynamic` sets what light nodes cast.
+Measurements include CPU submission, completed-frame median/p95 and individual
+GPU pass medians. They exclude simulation, presentation and PNG readback; they
+do not prove perceived smoothness on a monitor.
+
+Serial frame times include a fence wait after every frame, which on Metal sleeps
+a millisecond per poll, so they overstate GPU time. To compare settings, add
+`--throughput N --runs R`: after each pose settles, the tool submits N frames
+back to back, waits once, and repeats that R times (five by default), and the
+report gives each run's milliseconds a frame as `throughput_ms_per_frame`. Use
+`--frames 1` to keep the serial loop short. Compare settings by running the
+tool alternately for each setting, several rounds, and note what else the
+machine was doing; for example, at 4K:
+
+```sh
+for round in 1 2 3 4 5; do
+  for setting in off x2 x4 x8; do
+    echo "{\"msaa\":\"$setting\"}" > .local/aa.json
+    target/release/capture --poses scripts/capture-poses.json \
+      --output ".local/captures/aa-$round-$setting" --width 3840 --height 2160 \
+      --frames 1 --warmup 10 --throughput 120 --runs 5 --settings .local/aa.json
+  done
+done
+```
 
 The native GPU regressions run explicitly with
 `cargo test -p sauerteig-client --lib gpu_ -- --ignored --test-threads=1` on a host
 with GPU access. They check that cached shadows match fresh ones after edits, that
 clusters built by the compute pass match the CPU's and give the same picture as a
-brute-force render, that the uniform-buffer path matches the clustered one, that a
-wall stops the next corridor's lights, and that spot lights and actor overlays
-draw. Normal workspace tests leave these hardware-dependent tests ignored.
+brute-force render, that every sample count the adapter offers draws the same
+scene, that a wall stops the next corridor's lights, and that spot lights and
+actor overlays draw. Normal workspace tests leave these hardware-dependent
+tests ignored.
 
 To compare the built-in movement profiles with a literal port of Sauerbraten's
 velocity math, run the example below. It prints top speeds, time to 90% of top

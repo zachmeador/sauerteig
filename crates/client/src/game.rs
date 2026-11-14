@@ -1921,7 +1921,7 @@ impl Game {
             painter.text(
                 egui::pos2(screen.right() - 24.0, 60.0),
                 egui::Align2::RIGHT_TOP,
-                &renderer.adapter_name,
+                &renderer.adapter_description,
                 mono(10.0),
                 MUTED,
             );
@@ -2211,6 +2211,6 @@ impl Game {
                 });
         }
         self.asset_panel(ctx, renderer, window);
-        self.local_panels(ctx, window);
+        self.local_panels(ctx, window, renderer.sample_counts());
     }
 }

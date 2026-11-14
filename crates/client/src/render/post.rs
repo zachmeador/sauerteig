@@ -44,6 +44,25 @@ fn texture(
         .create_view(&Default::default())
 }
 
+/// Bytes the scene's render targets take at this size and sample count: the
+/// single-sample HDR image, the multisampled color and depth targets, and the
+/// five bloom levels. The surface's own images are not counted.
+#[cfg(test)]
+fn target_bytes(size: [u32; 2], samples: u32) -> u64 {
+    let pixels = u64::from(size[0]) * u64::from(size[1]);
+    let hdr = 8; // Rgba16Float
+    let depth = 4; // Depth32Float
+    let bloom: u64 = (1..=5)
+        .map(|level| u64::from((size[0] >> level).max(1)) * u64::from((size[1] >> level).max(1)))
+        .sum();
+    let multisampled = if samples > 1 {
+        pixels * hdr * u64::from(samples)
+    } else {
+        0
+    };
+    pixels * hdr + multisampled + pixels * depth * u64::from(samples) + bloom * hdr
+}
+
 impl PostProcess {
     pub fn new(
         device: &wgpu::Device,
@@ -51,7 +70,7 @@ impl PostProcess {
         height: u32,
         output: wgpu::TextureFormat,
         settings: RenderSettings,
-        msaa_supported: bool,
+        sample_counts: &[u32],
     ) -> Self {
         let size = [
             (width as f32 * settings.scale).round().max(1.0) as u32,
@@ -59,7 +78,7 @@ impl PostProcess {
         ];
         let samples = settings
             .msaa
-            .samples(u64::from(size[0]) * u64::from(size[1]), msaa_supported);
+            .samples(u64::from(size[0]) * u64::from(size[1]), sample_counts);
         let scene = texture(device, size, 1, HDR_FORMAT, "resolved linear scene");
         let multisampled =
             (samples > 1).then(|| texture(device, size, samples, HDR_FORMAT, "MSAA linear scene"));
@@ -303,5 +322,23 @@ impl PostProcess {
             &self.post_group,
             wgpu::LoadOp::Clear(wgpu::Color::BLACK),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_memory_grows_with_the_sample_count() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        let mib = |size, samples| target_bytes(size, samples) as f64 / MIB;
+        // 4K without multisampling: 63 MiB of HDR scene, 32 of depth and 21 of
+        // bloom levels. Multisampling adds 12 bytes a pixel for each sample,
+        // 8 of color and 4 of depth.
+        assert!((mib([3840, 2160], 1) - 116.0).abs() < 0.1);
+        assert!((mib([3840, 2160], 4) - 464.0).abs() < 0.1);
+        assert!((mib([3840, 2160], 8) - 843.7).abs() < 0.1);
+        assert!(mib([1920, 1080], 8) < mib([3840, 2160], 2));
     }
 }

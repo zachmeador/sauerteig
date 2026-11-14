@@ -141,9 +141,9 @@ once the rest of the game stops changing.
    included), gravity, and sky. Give each light its own color and range, and give
    other objects settings of their own. Add a material library that lets you
    shift, rotate, and scale each face's texture.
-5. **Renderer:** shadow every light, offer 2× and 8× anti-aliasing where the GPU
-   supports it, use less memory for world meshes, make sun shadows reach
-   farther, and lower the quality automatically on GPUs that can't keep up.
+5. **Renderer:** shadow every light, use less memory for world meshes, make sun
+   shadows reach farther, and lower the quality automatically on GPUs that can't
+   keep up.
 6. **Large worlds:** see farther, reach distant parts of big maps quickly while
    editing, and run well on ordinary laptops.
 7. **Editor feel:** move, flip, and rotate selections in place. Match

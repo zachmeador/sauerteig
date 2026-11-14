@@ -1,8 +1,7 @@
 //! GPU resources for clustered lighting: the light and mask buffers, the
 //! culling pass that fills the masks, and the bind group the scene shaders read.
 use super::{
-    clusters::ClusterGrid,
-    lightset::{FramePlan, LightingTier, TierConfig},
+    lightset::{FramePlan, LightConfig},
     shaders::{self, LightLayout},
     timing::GpuTiming,
 };
@@ -32,21 +31,20 @@ pub struct ClusterView {
 
 impl LightParams {
     pub fn new(
-        config: &TierConfig,
+        config: &LightConfig,
         view: ClusterView,
         count: usize,
         page_classes: u32,
         brute_force: bool,
     ) -> Self {
-        let grid = config.grid.unwrap_or(ClusterGrid::COMPACT);
-        let clustered = config.grid.is_some() && !brute_force;
+        let grid = config.grid;
         Self {
             grid: [grid.dims[0], grid.dims[1], grid.dims[2], count as u32],
             depth: [grid.near, grid.split, grid.ratio(), grid.inv_log_ratio()],
             screen: [view.size.x, view.size.y, view.scale.x, view.scale.y],
             range: [grid.far, 0.0, 0.0, 0.0],
             mode: [
-                u32::from(clustered),
+                u32::from(!brute_force),
                 page_classes,
                 config.pages as u32,
                 config.light_cap,
@@ -60,18 +58,18 @@ struct Cull {
     group: wgpu::BindGroup,
     light_view: wgpu::Buffer,
     workgroups: u32,
+    #[cfg(test)]
+    masks: wgpu::Buffer,
 }
 
 pub(super) struct LightGpu {
-    config: TierConfig,
+    config: LightConfig,
     layout: LightLayout,
     pub bind_layout: wgpu::BindGroupLayout,
     pub group: wgpu::BindGroup,
     lights: wgpu::Buffer,
-    masks: wgpu::Buffer,
     params: wgpu::Buffer,
-    cull: Option<Cull>,
-    cpu_masks: Vec<u32>,
+    cull: Cull,
     pub count: usize,
     /// View-space spheres and projection scale of the last upload.
     pub last_views: Vec<[f32; 4]>,
@@ -81,17 +79,13 @@ pub(super) struct LightGpu {
 impl LightGpu {
     pub fn new(
         device: &wgpu::Device,
-        config: TierConfig,
+        config: LightConfig,
         sun: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
         atlas: &wgpu::TextureView,
     ) -> Self {
-        let layout = LightLayout::for_tier(&config);
-        let buffer_type = if layout.storage {
-            wgpu::BufferBindingType::Storage { read_only: true }
-        } else {
-            wgpu::BufferBindingType::Uniform
-        };
+        let layout = LightLayout::new(&config);
+        let buffer_type = wgpu::BufferBindingType::Storage { read_only: true };
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -132,21 +126,9 @@ impl LightGpu {
             ],
         });
         let light_bytes = (layout.max_lights as usize * std::mem::size_of::<GpuLight>()) as u64;
-        let mask_bytes = if layout.storage {
-            let grid = config.grid.expect("clustered tiers have a grid");
-            (grid.count() * grid.words as usize * 4) as u64
-        } else {
-            u64::from(layout.mask_vectors) * 16
-        };
-        let usage = |extra| {
-            extra
-                | wgpu::BufferUsages::COPY_DST
-                | if layout.storage {
-                    wgpu::BufferUsages::STORAGE
-                } else {
-                    wgpu::BufferUsages::UNIFORM
-                }
-        };
+        let grid = config.grid;
+        let mask_bytes = (grid.count() * grid.words as usize * 4) as u64;
+        let usage = |extra| extra | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE;
         let make = |label, size, usage| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -196,26 +178,22 @@ impl LightGpu {
                 },
             ],
         });
-        let cull = (config.tier == LightingTier::Clustered)
-            .then(|| Cull::new(device, config, layout, &params, &masks));
+        let cull = Cull::new(device, config, layout, &params, &masks);
         Self {
             config,
             layout,
             bind_layout,
             group,
             lights,
-            masks,
             params,
             cull,
-            cpu_masks: Vec::new(),
             count: 0,
             last_views: Vec::new(),
             last_scale: Vec2::ONE,
         }
     }
 
-    /// Write this frame's lights and parameters. Without a culling pass the
-    /// masks are built here.
+    /// Write this frame's lights and parameters.
     pub fn upload(
         &mut self,
         queue: &wgpu::Queue,
@@ -232,16 +210,8 @@ impl LightGpu {
         let params = LightParams::new(&self.config, view, count, plan.page_classes, brute_force);
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let views: Vec<[f32; 4]> = plan.lights[..count].iter().map(|l| l.view).collect();
-        if let Some(cull) = &self.cull {
-            if count > 0 {
-                queue.write_buffer(&cull.light_view, 0, bytemuck::cast_slice(&views));
-            }
-        } else if let (Some(grid), true) = (self.config.grid, count > 0) {
-            let spheres: Vec<_> = views.iter().map(|&v| glam::Vec4::from_array(v)).collect();
-            self.cpu_masks = grid.build_masks(view.scale, &spheres);
-            self.cpu_masks
-                .resize(self.layout.mask_vectors as usize * 4, 0);
-            queue.write_buffer(&self.masks, 0, bytemuck::cast_slice(&self.cpu_masks));
+        if count > 0 {
+            queue.write_buffer(&self.cull.light_view, 0, bytemuck::cast_slice(&views));
         }
         self.last_views = views;
         self.last_scale = view.scale;
@@ -249,9 +219,7 @@ impl LightGpu {
 
     /// How many of the last frame's lights reach each cluster.
     pub fn cluster_counts(&self) -> Vec<u32> {
-        let Some(grid) = self.config.grid else {
-            return Vec::new();
-        };
+        let grid = self.config.grid;
         let spheres: Vec<_> = self
             .last_views
             .iter()
@@ -265,7 +233,7 @@ impl LightGpu {
 
     /// Fill the cluster masks on the GPU.
     pub fn cull(&self, encoder: &mut wgpu::CommandEncoder, timing: &mut GpuTiming) {
-        let Some(cull) = &self.cull else { return };
+        let cull = &self.cull;
         if self.count == 0 {
             return;
         }
@@ -280,19 +248,19 @@ impl LightGpu {
 
     #[cfg(test)]
     pub fn mask_buffer(&self) -> &wgpu::Buffer {
-        &self.masks
+        &self.cull.masks
     }
 }
 
 impl Cull {
     fn new(
         device: &wgpu::Device,
-        config: TierConfig,
+        config: LightConfig,
         layout: LightLayout,
         params: &wgpu::Buffer,
         masks: &wgpu::Buffer,
     ) -> Self {
-        let grid = config.grid.expect("clustered tiers have a grid");
+        let grid = config.grid;
         let light_view = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("light view spheres"),
             size: (layout.max_lights as usize * 16) as u64,
@@ -362,6 +330,8 @@ impl Cull {
             group,
             light_view,
             workgroups: (grid.count() as u32).div_ceil(64),
+            #[cfg(test)]
+            masks: masks.clone(),
         }
     }
 }

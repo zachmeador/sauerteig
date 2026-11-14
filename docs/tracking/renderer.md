@@ -12,20 +12,20 @@ measured on named hardware, not assumed.
 
 ## Current behavior
 
-- **Stages 1 and 2 are in place.** The scene renders in linear HDR with bloom,
-  filmic tonemapping, Auto 4× MSAA, render scaling, motion interpolation, and
-  per-pass GPU timings in F3.
+- **Stages 1 and 2 and N1 are in place.** The scene renders in linear HDR with
+  bloom, filmic tonemapping, MSAA (Off, 2×, 4×, 8× where the adapter supports
+  them, and Auto), render scaling, motion interpolation, and per-pass GPU
+  timings in F3.
 - **Lights.** Every light node in view is a clustered point light, up to 256
   ranked by range over distance. A cached atlas shadows up to 149 point lights,
   and lights it can't hold fade out rather than leak through walls, so
   the_cube1m draws 149 of its 339. A fragment shades at most 16 of the lights
   that reach it, 8 on water and glass, most important first. Players cast
   shadows under the eight most important lamps.
-- **GPU requests.** The renderer asks wgpu for WebGPU's default limits and only
-  the timestamp feature (`Renderer::create`), so 4× is the only MSAA sample
-  count. The Uniform and Nearest lighting paths, written for browser and
-  compatibility-class limits, are still in the code, although that request
-  already turns away the adapters they were written for.
+- **GPU requests.** `Renderer::create` asks Vulkan, DirectX 12 and Metal
+  adapters for the features and limits the renderer uses (`render/device.rs`;
+  see N1 below), and refuses an adapter that lacks a required one with a
+  message that names it and the minimum specification.
 - **World meshes** use a 52-byte vertex and an index buffer that only counts
   up: 576 MiB for the_cube1m and 824 MiB for nub1, about 2 KB per piece
   (measured on the M5 Pro, 2026-11-12; Metal allocates 619 and 894 MiB). On
@@ -53,8 +53,8 @@ look on the 144 Hz 4K monitor.
     draws at output resolution.
 - **Anti-aliasing defaults to Auto.**
   - 4× MSAA while the scene has at most 2560×1440 pixels, none above. This was
-    added at merge after the 4K measurements below.
-  - On and Off override it.
+    added at merge after the 4K measurements below. N1 changed the rule and the
+    choices: Off, 2×, 4× and 8× override Auto.
 - **Shared shader code.** One WGSL module is assembled into each shader, and all
   five validate with Naga.
 - **Cached shadows.**
@@ -114,17 +114,15 @@ running app.
   - Filling the atlas after a join takes about 2.5 seconds, nearest lights
     first.
   - At least one face renders each frame.
-- **Fallbacks.** A uniform-buffer path and today's nearest-eight path are
-  settings of the same shaders.
 - **One `unsafe` block.**
   - `render/shaders.rs::trusted` compiles our shaders without wgpu's forced
     loop bounding; bounds checks stay on.
   - The reason: on Metal that bounding made the clustered loop about three times
     slower.
   - Its `SAFETY` comment explains why every shader loop is bounded.
-- **Tooling.** F3 shows the lighting path and the light and shadow counts. The
-  capture tool gained synthetic scenes (light room, corridor, water and glass,
-  lamp hall) and flags for comparing paths.
+- **Tooling.** F3 shows the light and shadow counts. The capture tool gained
+  synthetic scenes (light room, corridor, water and glass, lamp hall) and flags
+  for comparing paths.
 
 Gaps:
 
@@ -146,10 +144,8 @@ Gaps:
 - **The actor overlay's 15 tiles run out** with four or more actors in a
   crowded, lit room. The lowest-ranked of the eight lights then drop actor
   shadows on some faces. N2 replaces the overlay.
-- **Not exercised:**
-  - the uniform and nearest paths, except when forced on the M3 Pro (N1
-    deletes them);
-  - the research's full sweeps of light counts, MSAA, and render scale.
+- **Not exercised:** the research's full sweeps of light counts, MSAA, and
+  render scale.
 
 ## Next stages
 
@@ -215,7 +211,8 @@ The maintainer approved these on 2026-11-13 with the native-first plan for
 
 ### N1: native GPU features
 
-State: ready. Wave 1, small. It needs no other work order merged first.
+State: merged on 2026-11-14. The maintainer hasn't yet checked the Settings menu
+and F3 in the app, and nobody has run it on Vulkan or DirectX 12 hardware.
 
 - **Decided** (maintainer, 2026-11-13):
   - Request what the renderer's designs need, per adapter. Requesting
@@ -285,19 +282,31 @@ State: ready. Wave 1, small. It needs no other work order merged first.
 - **Acceptance:**
   - [ ] On the M5 Pro, Settings offers Off, 2×, 4×, 8× and Auto, and F3's
     sample count follows the choice. A unit test shows that an adapter without
-    8× isn't offered it.
+    8× isn't offered it. *Not observed in the app.* The unit tests
+    (`settings_offer_only_the_sample_counts_the_adapter_supports`,
+    `sample_counts_need_both_targets_and_a_resolve`) pass, and the GPU test
+    `gpu_every_offered_sample_count_renders_the_same_scene` rendered
+    1, 2, 4 and 8 samples on the M5 Pro and checked the sample count in the
+    effective-settings text that F3 prints.
   - [ ] F3 shows the backend and driver after the adapter's name, and its
-    lighting line no longer names a lighting path.
-  - [ ] A unit test gives the adapter check limits and features without one
+    lighting line no longer names a lighting path. *Not observed in the app.*
+    The code and a unit test for the text
+    (`the_adapter_description_names_backend_and_driver`) are in place; the
+    capture tool's first output line and report show the same text, `Apple M5
+    Pro (Metal)`.
+  - [x] A unit test gives the adapter check limits and features without one
     that the renderer needs, and the message names it and the minimum
-    specification.
-  - [ ] 4K GPU throughput on the M5 Pro for imported-spawn and arena-yard at
+    specification (`a_missing_limit_is_named_with_the_minimum_specification`,
+    `a_missing_downlevel_ability_is_named`).
+  - [x] 4K GPU throughput on the M5 Pro for imported-spawn and arena-yard at
     Off, 2×, 4× and 8×, against 6.06 ms, from alternating runs. Auto's rule
-    follows from these numbers.
-  - [ ] On the M5 Pro, the `gpu_` tests pass when run with `--ignored`,
+    follows from these numbers. See the table below.
+  - [x] On the M5 Pro, the `gpu_` tests pass when run with `--ignored`,
     including the brute-force and CPU-mask comparisons, and the capture tool
-    renders its built-in scenes.
-  - [ ] Settings saved before N1 load, and every shader validates.
+    renders its built-in scenes (all 30 poses of `scripts/capture-poses.json`
+    at 1920×1080).
+  - [x] Settings saved before N1 load, and every shader validates
+    (`saved_antialiasing_choices_load`, `every_assembled_shader_validates`).
   - [ ] **Needs a tester:** the game starts and draws correctly on a real
     Vulkan GPU and a real DirectX 12 GPU, offering the sample counts that
     adapter supports.
@@ -308,6 +317,128 @@ State: ready. Wave 1, small. It needs no other work order merged first.
   buffers). Shared-sandbox's estimate assumes a fixed 0.6 GiB, from a capture
   at 4K, and 8× MSAA doubles the multisampled targets of 4×, so 2d needs these
   figures to set the fixed term per resolution and setting.
+
+#### N1 results
+
+Measured and written on 2026-11-14 on the maintainer's M5 Pro (Apple M5 Pro,
+Metal).
+
+- **Features and limits requested** (`render/device.rs`). Everything not
+  named keeps wgpu's downlevel default, which Vulkan, DirectX 12 and Metal all
+  guarantee, so the request is smaller than the `Limits::default()` it replaces.
+
+  | Request | Value | Needed by |
+  | --- | --- | --- |
+  | Backends | Vulkan, DirectX 12, Metal | the minimum specification; OpenGL is gone, and `WGPU_BACKEND` still overrides |
+  | `TIMESTAMP_QUERY` (optional) | where present | the per-pass GPU timings in F3 and the capture tool |
+  | `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` (optional) | where present | 2× and 8× MSAA; without it wgpu allows only 1 and 4 samples |
+  | Compute shaders (required) | | the light culling pass |
+  | Anisotropic filtering (required) | | the material sampler (`anisotropy_clamp: 4`) |
+  | 32-bit indices over their whole range (required) | | world meshes use `u32` indices |
+  | `max_texture_dimension_1d/2d` | 8192, or the window's longer side if larger | scene targets and the surface |
+  | `max_texture_array_layers` | 64 | the material arrays (`MAX_MATERIALS`); the shadow atlas needs 15 |
+  | `max_bind_groups` | 3 | camera, lights and shadows, materials |
+  | `max_storage_buffers_per_shader_stage` | 2 | the light list and cluster masks; the culling pass's light spheres and masks |
+  | Compute workgroup | 64 × 1 × 1, 64 invocations | `clusters.wgsl` |
+
+  The shader test `entry_points_stay_within_the_requested_limits` checks every
+  entry point's storage buffers, uniform buffers, sampled textures, samplers
+  and workgroup size against these limits, and
+  `the_light_buffers_fit_the_requested_binding_sizes` checks the binding
+  sizes. Choices where the order was open: the minimum 8192 texture size keeps
+  an 8K display working on every adapter; the downlevel defaults stay for the
+  limits the renderer doesn't push (for example 16 KiB uniform bindings, 128 MiB
+  storage bindings, 256 MiB buffers). The five limits lowered below the
+  downlevel defaults (array layers, bind groups, storage buffers and the
+  workgroup) are the ones a shader test can check, so the request names what the
+  renderer uses.
+- **Sample counts offered on the M5 Pro:** 1 (Off), 2, 4 and 8, so Settings
+  lists Auto, Off, 2×, 4× MSAA and 8×. The check requires both `Rgba16Float`
+  (with resolve) and `Depth32Float` to allow the count.
+- **4K throughput** (3840×2160, release build, `--throughput 120 --runs 5`,
+  `--frames 1 --warmup 10`; milliseconds a frame, median over five alternating
+  rounds of Off, 2×, 4×, 8×, with the range of the rounds' medians in
+  brackets). The budget is 6.06 ms.
+
+  | Pose | Off | 2× | 4× | 8× |
+  | --- | ---: | ---: | ---: | ---: |
+  | arena-yard | 2.43 (2.40–2.63) | 2.46 (2.45–2.67) | 2.53 (2.48–2.70) | 2.65 (2.63–2.69) |
+  | imported-spawn | 5.99 (5.79–6.13) | 5.92 (5.89–6.34) | 6.11 (6.05–6.23) | 6.52 (6.35–8.15) |
+
+  Other sessions were compiling throughout: the one-minute load average ran
+  from 6 to 15 across the 20 invocations, and the first round was the slowest
+  in every column. So differences under about 0.15 ms are noise. Read against
+  Off, 2× costs nothing measurable, 4× about 0.1 ms, and 8× 0.2 ms on
+  arena-yard and 0.5 ms on imported-spawn, which also puts 8× over the budget.
+  Metal's tile memory makes multisampling cheap here; the earlier M3 Pro
+  serial measurement (4× at 4K 11 ms against 5 ms without) and every
+  immediate-mode GPU would pay more.
+- **Auto's rule** (`Antialiasing::wanted`): 4× while the scene has at most
+  2560×1440 pixels, 2× up to 3840×2160, none above, and never 8×, falling to the
+  highest supported count at or below. 4× stays the choice up to 1440p, where
+  it's cheap on every GPU measured; the measured 4K costs don't justify
+  stretching it to 4K for hardware nobody has measured, so 4K gets 2×, which
+  was free here and costs less than 4× on any GPU; 8× is a choice for GPUs that
+  have time to spare. A later stage can replace the rule with one that reacts to
+  measured frame times. The rule is from this table and the M3 Pro's old
+  numbers only; nobody has run it on a reference machine.
+- **Fixed GPU memory** (MiB, computed from the formats, not read back from the
+  driver, so Metal's padding is not included). Scene targets are the
+  single-sample HDR image, the multisampled HDR and depth targets, and the five
+  bloom levels (`post::target_bytes`, with a unit test):
+
+  | Scene size | Off | 2× | 4× | 8× |
+  | --- | ---: | ---: | ---: | ---: |
+  | 1280×800 | 14.3 | 33.9 | 57.3 | 104.2 |
+  | 1920×1080 | 29.0 | 68.5 | 116.0 | 210.9 |
+  | 3840×2160 | 116.0 | 274.2 | 464.0 | 843.7 |
+
+  Besides the targets: the shadow atlas, 15 layers of 1024² `Depth32Float`,
+  60 MiB; the sun's working shadow map and its cache, 2048² each, 32 MiB; the
+  material arrays, 40.0 MiB (`texture_bytes`, with mips); and the light, mask,
+  camera and timestamp buffers, under 0.2 MiB together. That is 132 MiB that
+  doesn't depend on the scene size, so 4K with 4× is about 596 MiB, close to
+  shared-sandbox's 0.6 GiB, and 4K with 8× is about 976 MiB. World meshes and
+  egui are not included.
+- **Deleted:** `LightingTier` (Clustered, Uniform, Nearest) and its
+  `config()`, replaced by one `LightConfig` with a `Default`; `lighting_tier`
+  (the function and `Renderer::lighting_tier`); `UNIFORM_BINDINGS`, the
+  `//LIGHT_STORAGE` placeholder and `STORAGE_BINDINGS` (the storage bindings now
+  sit in `common.wgsl`), `LightLayout::storage`, `mask_vectors` and `MASK_VECS`;
+  the uniform branch of `LightGpu` and its CPU mask upload (`cpu_masks`);
+  `ClusterGrid::COMPACT`; `RendererOptions::tier`; the capture tool's `--tier`
+  flag and the report's `lighting_tier` (it reports `sample_counts` instead);
+  `fallback_buffers_fit_the_smallest_guaranteed_uniform_binding`,
+  `gpu_uniform_tier_matches_the_clustered_tier_without_shadows`, and the
+  compact cases in the cluster and light-set tests (the over-budget test now
+  sets `max_shadowed: 4`). `entry_points_stay_within_compatibility_limits`
+  became `entry_points_stay_within_the_requested_limits`.
+  `ClusterGrid::build_masks` stays. F3's lighting line no longer starts with a
+  path name.
+- **Also changed:** the capture tool's `--throughput N` and `--runs R`
+  (documented in the development guide); `Antialiasing::On` is now `X4`, saved
+  as `x4` with `on` still read; the capture report adds `adapter_description`,
+  `material_texture_bytes` and each pose's `throughput_ms_per_frame`, and its
+  first line shows how long the renderer took to create (145–185 ms at
+  1920×1080, with pipelines for all four sample counts built up front).
+- **Checks run** from `/Users/zach/gits/sauerteig-worktrees/renderer-n1`, after
+  `. ./scripts/env.sh`:
+  - `cargo fmt --all`;
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  - `cargo test --workspace --locked`;
+  - `cargo test -p sauerteig-client --lib gpu_ -- --ignored --test-threads=1`
+    (six tests, including the new sample-count test) on the M5 Pro;
+  - `target/release/capture --poses scripts/capture-poses.json --output ...
+    --width 1920 --height 1080 --frames 5 --warmup 5 --throughput 30 --runs 2`,
+    which rendered all 30 poses.
+- **Not observed:**
+  - the Settings menu and F3 in a running window (no one could see one);
+  - a saved `8×` setting loaded on an adapter without 8×, beyond the unit
+    test of the fallback;
+  - any adapter other than the M5 Pro, so Vulkan and DirectX 12 behavior,
+    their sample counts, and the error text on a real failing adapter are only
+    unit-tested;
+  - the memory table against Metal's own allocation.
 
 ### N1b: GPU tests on software drivers
 

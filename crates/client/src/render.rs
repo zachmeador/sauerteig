@@ -1,6 +1,7 @@
 pub(crate) mod atlas;
 pub(crate) mod clusters;
 pub(crate) mod culling;
+mod device;
 mod lights;
 pub(crate) mod lightset;
 mod post;
@@ -14,11 +15,11 @@ use post::{PostProcess, HDR_FORMAT};
 use settings::RenderSettings;
 use shadows::{CachedShadow, ShadowAtlasGpu};
 
-pub use self::lightset::{LightingTier, OverBudget};
+pub use self::lightset::OverBudget;
 use self::{
     culling::{Bounds, Frustum},
     lights::{ClusterView, LightGpu},
-    lightset::{FrameInput, LightSet, LightingStats, TileJob, View},
+    lightset::{FrameInput, LightConfig, LightSet, LightingStats, TileJob, View},
     props::{instance_layout, PropRenderer, ShadowTarget, TileView},
     shaders::LightLayout,
     volumes::VolumeRenderer,
@@ -40,8 +41,6 @@ const SHADOW_BUDGET_MS: f64 = 1.5;
 /// Choices a test or comparison capture can make that the game does not.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RendererOptions {
-    /// Use this lighting path instead of the best one the adapter supports.
-    pub tier: Option<LightingTier>,
     /// Evaluate every light at every fragment instead of reading cluster masks.
     pub brute_force: bool,
     pub over_budget: OverBudget,
@@ -197,7 +196,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     post: PostProcess,
     settings: RenderSettings,
-    msaa_supported: bool,
+    sample_counts: Vec<u32>,
     present_modes: Vec<wgpu::PresentMode>,
     shadow: wgpu::TextureView,
     shadow_texture: wgpu::Texture,
@@ -233,6 +232,8 @@ pub struct Renderer {
     pub triangles: usize,
     visible_world_triangles: usize,
     pub adapter_name: String,
+    /// The adapter's name with its graphics API and driver.
+    pub adapter_description: String,
 }
 
 /// Shadow faces can be cheap or very costly, depending on the geometry around
@@ -318,10 +319,15 @@ impl Renderer {
         height: u32,
         options: RendererOptions,
     ) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+        // `WGPU_BACKEND` and `WGPU_DX12_COMPILER` still choose the graphics API
+        // and the DirectX 12 shader compiler, for testing.
+        let instance = wgpu::Instance::new(
+            &wgpu::InstanceDescriptor {
+                backends: device::BACKENDS,
+                ..Default::default()
+            }
+            .with_env(),
+        );
         let surface = window
             .as_ref()
             .map(|window| instance.create_surface(window.clone()))
@@ -334,22 +340,33 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or("No compatible GPU was found.")?;
-        let adapter_name = adapter.get_info().name;
+            .ok_or_else(device::no_adapter_message)?;
+        let info = adapter.get_info();
+        let adapter_name = info.name.clone();
+        let adapter_description = device::describe_adapter(&info);
+        let request = device::plan_request(
+            &info,
+            adapter.features(),
+            &adapter.limits(),
+            adapter.get_downlevel_capabilities().flags,
+            window.as_ref().map_or(width.max(height), |window| {
+                let size = window.inner_size();
+                size.width.max(size.height)
+            }),
+        )?;
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("Sauerteig"),
-                    required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
-                    required_limits: wgpu::Limits::default(),
+                    required_features: request.features,
+                    required_limits: request.limits,
                     memory_hints: wgpu::MemoryHints::MemoryUsage,
                 },
                 None,
             )
             .await
-            .map_err(|e| e.to_string())?;
-        let tier = options.tier.unwrap_or_else(|| lighting_tier(&adapter));
-        log::info!("{adapter_name}: {tier:?} lighting");
+            .map_err(|e| format!("{adapter_description} refused the device request: {e}"))?;
+        log::info!("{adapter_description}");
         // The window size can change while adapter and device creation awaits.
         let [width, height] = window.as_ref().map_or([width, height], |window| {
             let size = window.inner_size();
@@ -400,22 +417,10 @@ impl Renderer {
             })
         });
         let timing = timing::GpuTiming::new(&device, &queue);
-        let msaa_supported = [HDR_FORMAT, wgpu::TextureFormat::Depth32Float]
-            .into_iter()
-            .all(|format| {
-                adapter
-                    .get_texture_format_features(format)
-                    .flags
-                    .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_X4)
-            })
-            && adapter
-                .get_texture_format_features(HDR_FORMAT)
-                .flags
-                .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
+        let sample_counts = device::adapter_sample_counts(&adapter, request.features);
         let settings = RenderSettings::default();
-        let post = PostProcess::new(&device, width, height, format, settings, msaa_supported);
+        let post = PostProcess::new(&device, width, height, format, settings, &sample_counts);
         let present_modes = caps.map_or_else(|| vec![wgpu::PresentMode::Fifo], |c| c.present_modes);
-        let sample_counts: &[u32] = if msaa_supported { &[1, 4] } else { &[1] };
         let shadow_texture = shadows::depth_texture(&device, 2048, 1, "sun working shadows");
         let shadow = shadow_texture.create_view(&Default::default());
         let sun_cache = CachedShadow::new(&device, 2048);
@@ -446,14 +451,14 @@ impl Renderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-        let mut tier_config = tier.config();
+        let mut light_config = LightConfig::default();
         if let Some(pages) = options.atlas_pages {
-            tier_config.pages = pages.clamp(1, shadows::MAX_PAGES);
+            light_config.pages = pages.clamp(1, shadows::MAX_PAGES);
         }
         if let Some(lights) = options.actor_lights {
-            tier_config.actor_lights = lights;
+            light_config.actor_lights = lights;
         }
-        let light_layout = LightLayout::for_tier(&tier_config);
+        let light_layout = LightLayout::new(&light_config);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison"),
             compare: Some(wgpu::CompareFunction::LessEqual),
@@ -468,11 +473,11 @@ impl Renderer {
         });
         let atlas = ShadowAtlasGpu::new(
             &device,
-            tier_config.pages,
+            light_config.pages,
             &shaders::module(&device, "shadow", light_layout),
             &[GpuVertex::layout(), instance_layout()],
         );
-        let light_gpu = LightGpu::new(&device, tier_config, &shadow, &sampler, &atlas.array);
+        let light_gpu = LightGpu::new(&device, light_config, &shadow, &sampler, &atlas.array);
         let materials = crate::materials::Materials::new(&device, &queue)?;
         let props = PropRenderer::new(&device)?;
         let volumes = VolumeRenderer::new(
@@ -481,7 +486,7 @@ impl Renderer {
             &camera_layout,
             &light_gpu.bind_layout,
             light_layout,
-            sample_counts,
+            &sample_counts,
         );
         let shader = shaders::module(&device, "world", light_layout);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -610,7 +615,7 @@ impl Renderer {
             config,
             post,
             settings,
-            msaa_supported,
+            sample_counts,
             present_modes,
             shadow,
             shadow_texture,
@@ -628,7 +633,7 @@ impl Renderer {
                 last: None,
                 fixed: options.fixed_frame_time,
             },
-            lights: LightSet::new(tier_config, options.over_budget, options.node_shadows),
+            lights: LightSet::new(light_config, options.over_budget, options.node_shadows),
             light_gpu,
             atlas,
             extra_lights: Vec::new(),
@@ -648,6 +653,7 @@ impl Renderer {
             triangles: 0,
             visible_world_triangles: 0,
             adapter_name,
+            adapter_description,
         })
     }
     pub fn apply_settings(&mut self, settings: RenderSettings) {
@@ -659,7 +665,7 @@ impl Renderer {
                 self.config.height,
                 self.config.format,
                 settings,
-                self.msaa_supported,
+                &self.sample_counts,
             );
         }
         let mode = settings::present_mode(settings.vsync, &self.present_modes);
@@ -681,8 +687,7 @@ impl Renderer {
     pub fn lighting_description(&self) -> String {
         let l = &self.lighting;
         format!(
-            "{:?} lights: {} drawn / {} in view / {} total, {} shadowed ({} with actors), {} over budget, {} waiting; shadow faces {} new / {} resident",
-            self.lights.config().tier,
+            "lights: {} drawn / {} in view / {} total, {} shadowed ({} with actors), {} over budget, {} waiting; shadow faces {} new / {} resident",
             l.drawn,
             l.visible,
             l.world_lights,
@@ -705,8 +710,9 @@ impl Renderer {
     pub fn lighting_plan_ms(&self) -> f64 {
         self.lighting_plan_ms
     }
-    pub fn lighting_tier(&self) -> LightingTier {
-        self.lights.config().tier
+    /// The anti-aliasing sample counts this adapter can run, 1 first.
+    pub fn sample_counts(&self) -> &[u32] {
+        &self.sample_counts
     }
     /// How many of the last frame's lights reach each view cluster.
     pub fn cluster_counts(&self) -> Vec<u32> {
@@ -800,7 +806,7 @@ impl Renderer {
             height,
             self.config.format,
             self.settings,
-            self.msaa_supported,
+            &self.sample_counts,
         );
     }
     pub fn rebuild_all(&mut self, world: &World) {
@@ -1110,7 +1116,11 @@ impl Renderer {
         }
         self.light_gpu.cull(&mut encoder, &mut self.timing);
         {
-            let sample_index = usize::from(self.post.samples == 4);
+            let sample_index = self
+                .sample_counts
+                .iter()
+                .position(|&count| count == self.post.samples)
+                .expect("the scene targets use a supported sample count");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1230,27 +1240,6 @@ impl Renderer {
             self.egui.free_texture(id);
         }
         Ok(())
-    }
-}
-
-/// The best lighting path the adapter can run: compute-built clusters over
-/// storage buffers where it has them, else uniform buffers with CPU masks.
-fn lighting_tier(adapter: &wgpu::Adapter) -> LightingTier {
-    let limits = adapter.limits();
-    let compute = adapter
-        .get_downlevel_capabilities()
-        .flags
-        .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
-    if compute
-        && limits.max_storage_buffers_per_shader_stage >= 3
-        && limits.max_compute_invocations_per_workgroup >= 64
-        && limits.max_compute_workgroup_size_x >= 64
-    {
-        LightingTier::Clustered
-    } else if limits.max_uniform_buffer_binding_size >= 16384 {
-        LightingTier::Uniform
-    } else {
-        LightingTier::Nearest
     }
 }
 

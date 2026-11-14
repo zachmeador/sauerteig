@@ -3,7 +3,7 @@ mod scenes;
 
 use crate::{
     lighting::ShadowMode,
-    render::{settings::RenderSettings, LightingTier, OverBudget, Renderer, RendererOptions},
+    render::{settings::RenderSettings, OverBudget, Renderer, RendererOptions},
     scene::Geometry,
 };
 use glam::Vec3;
@@ -209,6 +209,7 @@ pub fn run() -> Result<(), String> {
     let mut frames = 60usize;
     let mut warmup = 10usize;
     let mut settings = RenderSettings::default();
+    let mut throughput = Throughput { frames: 0, runs: 5 };
     let mut options = RendererOptions {
         fixed_frame_time: Some(1.0 / 60.0),
         ..Default::default()
@@ -220,14 +221,6 @@ pub fn run() -> Result<(), String> {
         }
         let value = args.next().ok_or("Expected a value after each flag")?;
         match arg.as_str() {
-            "--tier" => {
-                options.tier = Some(match value.as_str() {
-                    "clustered" => LightingTier::Clustered,
-                    "uniform" => LightingTier::Uniform,
-                    "nearest" => LightingTier::Nearest,
-                    _ => return Err("Use --tier clustered, uniform or nearest".into()),
-                })
-            }
             "--node-shadows" => {
                 options.node_shadows = match value.as_str() {
                     "off" => ShadowMode::Off,
@@ -255,6 +248,12 @@ pub fn run() -> Result<(), String> {
             "--height" => height = value.parse().map_err(|_| "Invalid height")?,
             "--frames" => frames = value.parse().map_err(|_| "Invalid frame count")?,
             "--warmup" => warmup = value.parse().map_err(|_| "Invalid warmup count")?,
+            "--throughput" => {
+                throughput.frames = value
+                    .parse()
+                    .map_err(|_| "Invalid throughput frame count")?
+            }
+            "--runs" => throughput.runs = value.parse().map_err(|_| "Invalid run count")?,
             "--settings" => {
                 settings = serde_json::from_slice(&std::fs::read(value).map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?
@@ -264,6 +263,9 @@ pub fn run() -> Result<(), String> {
     }
     if width == 0 || height == 0 || width > 8192 || height > 8192 || frames == 0 {
         return Err("Use dimensions 1..8192 and at least one measured frame".into());
+    }
+    if throughput.runs == 0 {
+        return Err("Use at least one throughput run".into());
     }
     let poses = poses.ok_or("Usage: capture --poses poses.json --output directory [--width 3840 --height 2160 --frames 60 --warmup 10]")?;
     let output = output.ok_or("Missing --output")?;
@@ -295,11 +297,33 @@ pub fn run() -> Result<(), String> {
         &poses,
         &output,
         [width, height],
-        frames,
-        warmup,
+        Frames {
+            measured: frames,
+            warmup,
+            throughput,
+        },
         settings.normalized(),
         options,
     ))
+}
+
+/// Throughput mode: draw `frames` frames back to back, wait once, and repeat
+/// for `runs` runs (five unless `--runs` says otherwise). Zero frames leaves it
+/// off.
+#[derive(Clone, Copy)]
+struct Throughput {
+    frames: usize,
+    runs: usize,
+}
+
+/// How many frames each pose draws.
+#[derive(Clone, Copy)]
+struct Frames {
+    /// Serially timed frames, each waited for.
+    measured: usize,
+    /// Frames drawn first, before settling.
+    warmup: usize,
+    throughput: Throughput,
 }
 
 /// What one captured pose draws each frame.
@@ -324,6 +348,22 @@ impl Shot<'_> {
         eye: Vec3,
         look_at: Vec3,
     ) -> Result<(f64, f64), String> {
+        let start = Instant::now();
+        let submitted = self.submit_from(renderer, eye, look_at)?;
+        let completed = renderer.wait_for_capture();
+        Ok((
+            submitted,
+            completed.duration_since(start).as_secs_f64() * 1000.0,
+        ))
+    }
+
+    /// Submit one frame without waiting for it. Returns CPU submission ms.
+    fn submit_from(
+        &self,
+        renderer: &mut Renderer,
+        eye: Vec3,
+        look_at: Vec3,
+    ) -> Result<f64, String> {
         let ui = self.context.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -353,33 +393,62 @@ impl Shot<'_> {
                 self.context,
             )
             .map_err(|e| e.to_string())?;
-        let submitted = start.elapsed().as_secs_f64() * 1000.0;
-        let completed = renderer.wait_for_capture();
-        Ok((
-            submitted,
-            completed.duration_since(start).as_secs_f64() * 1000.0,
-        ))
+        Ok(start.elapsed().as_secs_f64() * 1000.0)
     }
+}
+
+/// GPU throughput: milliseconds a frame over `frames` frames submitted back to
+/// back and waited for once, for each run. Serial frame times add a fence wait
+/// to every frame, which on Metal sleeps a millisecond a poll.
+fn measure_throughput(
+    shot: &Shot,
+    renderer: &mut Renderer,
+    cameras: &[(Vec3, Vec3)],
+    throughput: Throughput,
+) -> Result<serde_json::Value, String> {
+    let mut runs = Vec::new();
+    for _ in 0..throughput.runs {
+        let start = Instant::now();
+        for frame in 0..throughput.frames {
+            let (eye, look_at) = cameras[frame % cameras.len()];
+            shot.submit_from(renderer, eye, look_at)?;
+        }
+        let completed = renderer.wait_for_capture();
+        runs.push(
+            completed.duration_since(start).as_secs_f64() * 1000.0 / throughput.frames as f64,
+        );
+    }
+    let mut sorted = runs.clone();
+    Ok(serde_json::json!({
+        "frames_per_run": throughput.frames, "runs": runs,
+        "median": percentile(&mut sorted, 0.5), "min": percentile(&mut sorted, 0.0),
+        "max": percentile(&mut sorted, 1.0),
+    }))
 }
 
 async fn capture(
     poses: &[Pose],
     output: &Path,
     [width, height]: [u32; 2],
-    frames: usize,
-    warmup: usize,
+    Frames {
+        measured: frames,
+        warmup,
+        throughput,
+    }: Frames,
     settings: RenderSettings,
     options: RendererOptions,
 ) -> Result<(), String> {
+    let created = Instant::now();
     let mut renderer = Renderer::headless_with(width, height, options).await?;
+    let created_ms = created.elapsed().as_secs_f64() * 1000.0;
     renderer.apply_settings(settings);
     println!(
-        "GPU: {} | {}x{} | timestamps: {} | lighting: {:?}",
-        renderer.adapter_name,
+        "GPU: {} | created in {created_ms:.0} ms | {}x{} | timestamps: {} | {}",
+        renderer.adapter_description,
         width,
         height,
         renderer.gpu_times().is_some(),
-        renderer.lighting_tier(),
+        renderer.render_description(),
     );
     let context = egui::Context::default();
     let mut reports = Vec::new();
@@ -479,6 +548,16 @@ async fn capture(
                 }
             }
         }
+        let throughput_ms = if throughput.frames > 0 {
+            Some(measure_throughput(
+                &shot,
+                &mut renderer,
+                &cameras,
+                throughput,
+            )?)
+        } else {
+            None
+        };
         renderer.save_capture(&output.join(format!("{}.png", pose.name)))?;
         let lit_clusters: Vec<f64> = renderer
             .cluster_counts()
@@ -517,13 +596,16 @@ async fn capture(
             "cache_hit_rate": (used_total > 0.0).then(|| 1.0 - rendered_total / used_total),
             "lighting_plan_cpu_ms": summary(&plan_ms),
             "lights_per_lit_cluster": summary(&lit_clusters), "lit_clusters": lit_clusters.len(),
+            "throughput_ms_per_frame": throughput_ms,
         });
         println!("{}", serde_json::to_string(&report).unwrap());
         reports.push(report);
     }
-    let report = serde_json::json!({"adapter": renderer.adapter_name, "width": width, "height": height,
+    let report = serde_json::json!({"adapter": renderer.adapter_name,
+        "adapter_description": renderer.adapter_description,
+        "material_texture_bytes": renderer.materials.texture_bytes, "width": width, "height": height,
         "frames": frames, "warmup": warmup, "settings": settings, "effective": renderer.render_description(),
-        "lighting_tier": format!("{:?}", renderer.lighting_tier()), "brute_force": options.brute_force,
+        "sample_counts": renderer.sample_counts(), "brute_force": options.brute_force,
         "over_budget": format!("{:?}", options.over_budget),
         "timing": "headless serial submit + GPU completion; excludes PNG readback, UI generation, simulation and presentation",
         "poses": reports});
@@ -781,48 +863,54 @@ mod tests {
 
     #[test]
     #[ignore = "requires a native GPU; run explicitly with --ignored"]
-    fn gpu_uniform_tier_matches_the_clustered_tier_without_shadows() {
-        let eye = Vec3::new(0.3, 2.6, 0.3);
-        let look_at = Vec3::new(-14.0, 4.0, -16.0);
-        let lights: Vec<LightDesc> = (0..30)
-            .map(|i| {
-                let mut light = LightDesc::point(
-                    2000 + i,
-                    Vec3::new(
-                        -20.0 + (i % 6) as f32 * 8.0,
-                        4.0 + (i % 3) as f32,
-                        -20.0 + (i / 6) as f32 * 9.0,
-                    ),
-                );
-                light.shadow = ShadowMode::Off;
-                light.range = 7.0;
-                light
-            })
-            .collect();
+    fn gpu_every_offered_sample_count_renders_the_same_scene() {
+        use crate::render::settings::Antialiasing;
+        let eye = Vec3::new(0.0, 3.0, 7.0);
+        let look_at = Vec3::new(0.0, 2.0, -2.0);
+        let mut renderer = headless(RendererOptions::default());
+        let counts = renderer.sample_counts().to_vec();
+        println!("sample counts: {counts:?}");
+        assert_eq!(counts[0], 1);
+        assert!(counts.contains(&4), "{counts:?}");
+        let scene = load(&mut renderer, "materials");
         let mut images = Vec::new();
-        for tier in [
-            LightingTier::Clustered,
-            LightingTier::Uniform,
-            LightingTier::Nearest,
-        ] {
-            let mut renderer = headless(RendererOptions {
-                tier: Some(tier),
+        for choice in Antialiasing::choices(&counts) {
+            renderer.apply_settings(RenderSettings {
+                msaa: choice,
                 ..Default::default()
             });
-            let scene = load(&mut renderer, "lightroom");
-            renderer.objects(&[], &[]);
-            renderer.set_extra_lights(lights.clone());
-            let no_lights: Vec<WorldObject> = Vec::new();
-            let pixels = settled(&mut renderer, &scene.world, &no_lights, None, eye, look_at);
-            assert_eq!(renderer.lighting_tier(), tier);
-            assert!(renderer.lighting_stats().drawn > 0);
-            images.push(pixels);
+            let pixels = settled(
+                &mut renderer,
+                &scene.world,
+                &scene.objects,
+                None,
+                eye,
+                look_at,
+            );
+            let expected = choice.samples(u64::from(SIZE[0] * SIZE[1]), &counts);
+            assert!(
+                renderer
+                    .render_description()
+                    .contains(&format!("{expected}x MSAA")),
+                "{choice:?}: {}",
+                renderer.render_description()
+            );
+            assert!(
+                mean_brightness(&pixels) > 5.0,
+                "{choice:?} drew a dark frame"
+            );
+            images.push((choice, pixels));
         }
-        assert_eq!(differing(&images[0], &images[1]), 0, "uniform vs clustered");
-        assert!(
-            differing(&images[0], &images[2]) > 0,
-            "nearest sees fewer lights"
-        );
+        // Multisampling changes edges only: every count agrees on most pixels.
+        let (_, reference) = &images[0];
+        for (choice, pixels) in &images {
+            let differing = differing(reference, pixels);
+            assert!(
+                differing < reference.len() / 10,
+                "{choice:?}: {differing} of {} bytes differ",
+                reference.len()
+            );
+        }
     }
 
     fn mean_brightness(pixels: &[u8]) -> f64 {

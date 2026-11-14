@@ -39,7 +39,11 @@ struct LightParams {
 @group(1) @binding(1) var shadow_sampler: sampler_comparison;
 @group(1) @binding(2) var atlas: texture_depth_2d_array;
 @group(1) @binding(5) var<uniform> light_params: LightParams;
-//LIGHT_STORAGE
+@group(1) @binding(3) var<storage, read> lights: array<Light>;
+@group(1) @binding(4) var<storage, read> cluster_masks: array<u32>;
+fn light_at(i: u32) -> Light { return lights[i]; }
+fn light_sphere(i: u32) -> vec4<f32> { return lights[i].position_range; }
+fn mask_word(cluster: u32, word: u32) -> u32 { return cluster_masks[cluster * MASK_WORDS + word]; }
 
 // Depth changes across a sloping receiver. Comparing every PCF tap against
 // the center depth stripes the surface; project its tangent plane instead.
@@ -60,7 +64,7 @@ fn depth_gradient(matrix: mat4x4<f32>, clip: vec4<f32>, normal: vec3<f32>) -> ve
 }
 
 // ATLAS_SIZE, SHADOW_NEAR, TILE_GUARD_SCALE, NO_TILE, OVERLAY_NONE, MASK_WORDS and
-// the light buffer sizes are defined ahead of this module by the assembler.
+// MAX_LIGHTS are defined ahead of this module by the assembler.
 // Receiver offset along the normal, and depth bias, in tile texels.
 const NORMAL_OFFSET: f32 = 1.5;
 const DEPTH_BIAS: f32 = 1.0;

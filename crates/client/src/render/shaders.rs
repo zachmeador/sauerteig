@@ -1,58 +1,30 @@
-use super::{atlas::PAGE_SIZE, lightset::TierConfig};
+use super::{atlas::PAGE_SIZE, lightset::LightConfig};
 use crate::lighting::{NO_TILE, OVERLAY_NONE, SHADOW_NEAR, TILE_GUARD_SCALE};
 
 const COMMON: &str = include_str!("../common.wgsl");
-const STORAGE_BINDINGS: &str = "\
-@group(1) @binding(3) var<storage, read> lights: array<Light>;
-@group(1) @binding(4) var<storage, read> cluster_masks: array<u32>;
-fn light_at(i: u32) -> Light { return lights[i]; }
-fn light_sphere(i: u32) -> vec4<f32> { return lights[i].position_range; }
-fn mask_word(cluster: u32, word: u32) -> u32 { return cluster_masks[cluster * MASK_WORDS + word]; }
-";
-// Where storage buffers or compute shaders are missing, lights and CPU-built
-// masks come from uniform buffers.
-const UNIFORM_BINDINGS: &str = "\
-@group(1) @binding(3) var<uniform> lights: array<Light, MAX_LIGHTS>;
-@group(1) @binding(4) var<uniform> cluster_masks: array<vec4<u32>, MASK_VECS>;
-fn light_at(i: u32) -> Light { return lights[min(i, MAX_LIGHTS - 1u)]; }
-fn light_sphere(i: u32) -> vec4<f32> { return lights[min(i, MAX_LIGHTS - 1u)].position_range; }
-fn mask_word(cluster: u32, word: u32) -> u32 {
-    let index = cluster * MASK_WORDS + word;
-    return cluster_masks[index / 4u][index % 4u];
-}
-";
 
-/// How the light buffers are declared, and how large they are.
+/// The sizes of the light buffers, which the shaders get as constants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LightLayout {
-    pub storage: bool,
     pub mask_words: u32,
     pub max_lights: u32,
-    pub mask_vectors: u32,
 }
 
 impl LightLayout {
-    pub fn for_tier(config: &TierConfig) -> Self {
-        let storage = config.grid.is_some_and(|g| g.words > 2);
-        let (mask_words, mask_clusters) = config
-            .grid
-            .map_or((2, 2), |g| (g.words, g.count() as u32 * g.words));
+    pub fn new(config: &LightConfig) -> Self {
         Self {
-            storage,
-            mask_words,
+            mask_words: config.grid.words,
             max_lights: config.max_lights as u32,
-            mask_vectors: mask_clusters.div_ceil(4).max(1),
         }
     }
 
     fn header(&self) -> String {
         format!(
-            "const MASK_WORDS: u32 = {}u;\nconst MAX_LIGHTS: u32 = {}u;\nconst MASK_VECS: u32 = {}u;\n\
+            "const MASK_WORDS: u32 = {}u;\nconst MAX_LIGHTS: u32 = {}u;\n\
              const ATLAS_SIZE: f32 = {:?};\nconst SHADOW_NEAR: f32 = {:?};\n\
              const TILE_GUARD_SCALE: f32 = {:?};\nconst NO_TILE: u32 = {}u;\nconst OVERLAY_NONE: u32 = {}u;\n",
             self.mask_words,
             self.max_lights,
-            self.mask_vectors,
             PAGE_SIZE as f32,
             SHADOW_NEAR,
             TILE_GUARD_SCALE,
@@ -74,12 +46,6 @@ pub(super) fn source(name: &str, layout: LightLayout) -> String {
         "post" => return include_str!("../post.wgsl").to_owned(),
         _ => unreachable!("unknown embedded shader"),
     };
-    let bindings = if layout.storage {
-        STORAGE_BINDINGS
-    } else {
-        UNIFORM_BINDINGS
-    };
-    let common = common.replace("//LIGHT_STORAGE", bindings);
     format!("{}\n{common}\n{body}", layout.header())
 }
 
@@ -126,16 +92,15 @@ pub(super) fn trusted(device: &wgpu::Device, label: &str, source: String) -> wgp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{lighting::GpuLight, render::lightset::LightingTier};
+    use crate::{
+        lighting::GpuLight,
+        render::{device::requested_limits, lightset::LightConfig},
+    };
 
-    fn layouts() -> Vec<LightLayout> {
-        [
-            LightingTier::Clustered,
-            LightingTier::Uniform,
-            LightingTier::Nearest,
-        ]
-        .map(|tier| LightLayout::for_tier(&tier.config()))
-        .to_vec()
+    const SHADERS: [&str; 6] = ["world", "sky", "volume", "shadow", "clusters", "post"];
+
+    fn layout() -> LightLayout {
+        LightLayout::new(&LightConfig::default())
     }
 
     fn validate(name: &str, layout: LightLayout) -> (naga::Module, naga::valid::ModuleInfo) {
@@ -153,57 +118,86 @@ mod tests {
 
     #[test]
     fn every_assembled_shader_validates() {
-        for layout in layouts() {
-            for name in ["world", "sky", "volume", "shadow", "clusters", "post"] {
-                validate(name, layout);
-            }
+        for name in SHADERS {
+            validate(name, layout());
         }
     }
 
     #[test]
-    fn entry_points_stay_within_compatibility_limits() {
-        for layout in layouts() {
-            for name in ["world", "sky", "volume", "shadow", "clusters", "post"] {
-                let (module, info) = validate(name, layout);
-                for (index, entry) in module.entry_points.iter().enumerate() {
-                    let usage = info.get_entry_point(index);
-                    let storage = module
+    fn entry_points_stay_within_the_requested_limits() {
+        let limits = requested_limits(1920);
+        for name in SHADERS {
+            let (module, info) = validate(name, layout());
+            for (index, entry) in module.entry_points.iter().enumerate() {
+                let usage = info.get_entry_point(index);
+                let used = |wanted: &dyn Fn(&naga::GlobalVariable) -> bool| {
+                    module
                         .global_variables
                         .iter()
-                        .filter(|(handle, var)| {
-                            matches!(var.space, naga::AddressSpace::Storage { .. })
-                                && !usage[*handle].is_empty()
-                        })
-                        .count();
+                        .filter(|(handle, var)| wanted(var) && !usage[*handle].is_empty())
+                        .count() as u32
+                };
+                let storage = used(&|var| matches!(var.space, naga::AddressSpace::Storage { .. }));
+                let uniform = used(&|var| var.space == naga::AddressSpace::Uniform);
+                let textures = used(&|var| {
+                    matches!(
+                        module.types[var.ty].inner,
+                        naga::TypeInner::Image {
+                            class: naga::ImageClass::Sampled { .. }
+                                | naga::ImageClass::Depth { .. },
+                            ..
+                        }
+                    )
+                });
+                let samplers = used(&|var| {
+                    matches!(module.types[var.ty].inner, naga::TypeInner::Sampler { .. })
+                });
+                let label = format!("{name} {}", entry.name);
+                assert!(
+                    storage <= limits.max_storage_buffers_per_shader_stage,
+                    "{label}: {storage} storage buffers"
+                );
+                assert!(
+                    uniform <= limits.max_uniform_buffers_per_shader_stage,
+                    "{label}: {uniform} uniform buffers"
+                );
+                assert!(
+                    textures <= limits.max_sampled_textures_per_shader_stage,
+                    "{label}: {textures} sampled textures"
+                );
+                assert!(
+                    samplers <= limits.max_samplers_per_shader_stage,
+                    "{label}: {samplers} samplers"
+                );
+                if entry.stage == naga::ShaderStage::Compute {
+                    let [x, y, z] = entry.workgroup_size;
+                    assert!(x <= limits.max_compute_workgroup_size_x, "{label}");
+                    assert!(y <= limits.max_compute_workgroup_size_y, "{label}");
+                    assert!(z <= limits.max_compute_workgroup_size_z, "{label}");
                     assert!(
-                        storage <= 4,
-                        "{name} {}: {storage} storage buffers",
-                        entry.name
+                        x * y * z <= limits.max_compute_invocations_per_workgroup,
+                        "{label}"
                     );
-                    if entry.stage == naga::ShaderStage::Compute {
-                        let invocations: u32 = entry.workgroup_size.iter().product();
-                        assert!(invocations <= 64, "{name} {}", entry.name);
-                    }
                 }
             }
         }
     }
 
     #[test]
-    fn fallback_buffers_fit_the_smallest_guaranteed_uniform_binding() {
-        for tier in [LightingTier::Uniform, LightingTier::Nearest] {
-            let layout = LightLayout::for_tier(&tier.config());
-            assert!(!layout.storage);
-            assert!(layout.max_lights as usize * std::mem::size_of::<GpuLight>() <= 16384);
-            assert!(layout.mask_vectors as usize * 16 <= 16384);
-        }
-        let layout = LightLayout::for_tier(&LightingTier::Clustered.config());
-        assert!(layout.storage && layout.mask_words == 8 && layout.max_lights == 256);
+    fn the_light_buffers_fit_the_requested_binding_sizes() {
+        let layout = layout();
+        let config = LightConfig::default();
+        assert_eq!(layout.mask_words, 8);
+        assert_eq!(layout.max_lights, 256);
+        let limits = requested_limits(1920);
+        let masks = config.grid.count() as u64 * u64::from(config.grid.words) * 4;
+        let lights = u64::from(layout.max_lights) * std::mem::size_of::<GpuLight>() as u64;
+        assert!(masks.max(lights) <= u64::from(limits.max_storage_buffer_binding_size));
     }
 
     #[test]
     fn shader_structs_match_the_rust_records() {
-        let (module, _) = validate("world", layouts()[0]);
+        let (module, _) = validate("world", layout());
         let mut layouter = naga::proc::Layouter::default();
         layouter.update(module.to_ctx()).unwrap();
         let size_of = |name: &str| {

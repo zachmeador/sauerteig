@@ -134,7 +134,12 @@ impl Game {
             self.library_ui.confirm_delete = false;
         }
     }
-    pub(super) fn local_panels(&mut self, ctx: &egui::Context, window: &Window) {
+    pub(super) fn local_panels(
+        &mut self,
+        ctx: &egui::Context,
+        window: &Window,
+        sample_counts: &[u32],
+    ) {
         if self.show_settings {
             let mut open = true;
             egui::Window::new("Settings")
@@ -165,20 +170,18 @@ impl Game {
                         ui.separator();
                         let before = self.preferences.render;
                         let render = &mut self.preferences.render;
+                        let choices = Antialiasing::choices(sample_counts);
+                        let unsupported = !choices.contains(&render.msaa);
                         egui::ComboBox::from_label("Anti-aliasing")
-                            .selected_text(match render.msaa {
-                                Antialiasing::Auto => "Auto",
-                                Antialiasing::On => "4× MSAA",
-                                Antialiasing::Off => "Off",
+                            .selected_text(if unsupported {
+                                format!("{} (not supported here)", render.msaa.label())
+                            } else {
+                                render.msaa.label().to_owned()
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut render.msaa,
-                                    Antialiasing::Auto,
-                                    "Auto (off above 1440p)",
-                                );
-                                ui.selectable_value(&mut render.msaa, Antialiasing::On, "4× MSAA");
-                                ui.selectable_value(&mut render.msaa, Antialiasing::Off, "Off");
+                                for choice in choices {
+                                    ui.selectable_value(&mut render.msaa, choice, choice.label());
+                                }
                             });
                         ui.checkbox(&mut render.vsync, "Vsync");
                         ui.add(
