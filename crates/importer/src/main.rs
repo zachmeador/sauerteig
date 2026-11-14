@@ -171,7 +171,8 @@ Shared options:
   --report FILE          Detailed reference/loss report; default WORLD.import.json
   --cfg FILE             Inspect literal references only; never execute scripts
 
-Only OCTA versions 29–33 are supported. Originals and existing outputs are never overwritten.
+Supported: OCTA versions 27 and 29–33 (28 is refused). Entities with no usable
+position are left out and listed in the report. Originals and existing outputs are never overwritten.
 Without --crop, the complete original-scale world is retained in compact regions.
 World bounds and authored-size limits are validated. Missing textures use neutral material 0.
 Models, gameplay entities, volumes and baked rendering need separate adapters.

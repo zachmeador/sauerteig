@@ -1,16 +1,22 @@
-//! Non-executing, bounded reader for Cube 2 OCTA map versions 29 through 33.
+//! Non-executing, bounded reader for Cube 2 OCTA map versions 27 and 29 through 33.
 //! Source format references are recorded in README.md; no engine code is linked.
 mod convert;
 mod transform;
-pub use convert::{convert, GeometryIssue, ImportOptions, ImportReport, ImportedWorld};
+pub use convert::{
+    convert, GeometryIssue, ImportOptions, ImportReport, ImportedWorld, OmittedEntity,
+};
 
-use flate2::read::GzDecoder;
+use flate2::{bufread::DeflateDecoder, read::GzDecoder, Crc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read};
 
 pub const MAX_COMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_NODES: usize = 2_000_000;
+/// Size of the fixed header that OCTA version 27 maps carry.
+const V27_HEADER_BYTES: usize = 196;
+/// Version 27 files store a gzip CRC-32 over the inflated data after this byte.
+const V27_CRC_START: usize = 205;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Header {
@@ -23,6 +29,28 @@ pub struct Header {
     pub variables: u32,
     pub vslots: u32,
     pub game: String,
+    /// Lighting fields and title of the fixed version 27 header, which has no
+    /// map variables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy: Option<LegacyHeader>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct LegacyHeader {
+    pub light_precision: i32,
+    pub light_error: i32,
+    pub light_leaks: i32,
+    pub ambient: u8,
+    pub water_colour: [u8; 3],
+    /// Stored but never loaded: version 27 has no blend map.
+    pub blendmap: u8,
+    pub lerp_angle: u8,
+    pub lerp_subdiv: u8,
+    pub lerp_subdiv_size: u8,
+    pub bump_error: u8,
+    pub sky_light: [u8; 3],
+    pub lava_colour: [u8; 3],
+    pub waterfall_colour: [u8; 3],
+    pub title: String,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Entity {
@@ -79,10 +107,13 @@ pub struct Map {
     pub decompressed_bytes: usize,
     pub octree_end_offset: usize,
     pub nodes: usize,
+    /// Accepted file defects, such as the version 27 checksum.
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Inventory {
     pub header: Header,
+    pub notes: Vec<String>,
     pub decompressed_bytes: usize,
     pub octree_end_offset: usize,
     pub render_data_bytes_not_imported: usize,
@@ -104,6 +135,7 @@ impl Map {
     pub fn inventory(&self) -> Inventory {
         let mut result = Inventory {
             header: self.header.clone(),
+            notes: self.notes.clone(),
             decompressed_bytes: self.decompressed_bytes,
             octree_end_offset: self.octree_end_offset,
             render_data_bytes_not_imported: self.decompressed_bytes - self.octree_end_offset,
@@ -191,6 +223,11 @@ impl<'a> Reader<'a> {
         }
         Ok(v)
     }
+    /// An entity position may be any float; the importer reports and leaves out
+    /// entities it cannot place.
+    fn raw_float(&mut self) -> Result<f32, String> {
+        Ok(f32::from_bits(self.u32()?))
+    }
     fn string(&mut self) -> Result<String, String> {
         let n = self.u16()? as usize;
         Ok(String::from_utf8_lossy(self.bytes(n)?).into_owned())
@@ -204,14 +241,72 @@ pub fn read_ogz(compressed: &[u8]) -> Result<Map, String> {
     let mut data = Vec::new();
     // Reading through EOF verifies gzip CRC and size. Corrupt archives are never
     // salvaged implicitly; original files remain available for a separate recovery.
-    GzDecoder::new(compressed)
+    let outcome = GzDecoder::new(compressed)
         .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
-        .read_to_end(&mut data)
-        .map_err(|e| format!("invalid gzip stream (including checksum): {e}"))?;
+        .read_to_end(&mut data);
+    let mut notes = Vec::new();
+    if let Err(error) = outcome {
+        // The one accepted defect: version 27 maps store a CRC-32 over the data
+        // after byte 205 only. Everything else stays an error.
+        match read_v27_defective_gzip(compressed) {
+            Some(inflated) => {
+                data = inflated;
+                notes.push(format!(
+                    "The gzip checksum covers only the data after byte {V27_CRC_START}, as in \
+                     other OCTA version 27 maps. It matches that data, and the stored length \
+                     and the deflate stream are complete. The standard check failed: {error}."
+                ));
+            }
+            None => return Err(format!("invalid gzip stream (including checksum): {error}")),
+        }
+    }
     if data.len() > MAX_DECOMPRESSED_BYTES {
         return Err("decompressed map exceeds 256 MiB limit".into());
     }
-    read_octa(&data)
+    let mut map = read_octa(&data)?;
+    map.notes.extend(notes);
+    Ok(map)
+}
+
+/// Returns the inflated data only when the file is exactly the documented
+/// version 27 defect: a complete deflate stream, a single 8-byte trailer with
+/// the right length, and a CRC-32 equal to that of the data after byte 205.
+fn read_v27_defective_gzip(compressed: &[u8]) -> Option<Vec<u8>> {
+    let flags = *compressed.get(3)?;
+    if compressed.get(..3)? != [0x1f, 0x8b, 8] || flags & 0xe0 != 0 {
+        return None;
+    }
+    let mut pos = 10usize;
+    if flags & 4 != 0 {
+        let extra = u16::from_le_bytes(compressed.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pos = pos.checked_add(2 + extra)?;
+    }
+    for flag in [8, 16] {
+        if flags & flag != 0 {
+            pos += compressed.get(pos..)?.iter().position(|b| *b == 0)? + 1;
+        }
+    }
+    if flags & 2 != 0 {
+        pos = pos.checked_add(2)?;
+    }
+    let mut rest = compressed.get(pos..)?;
+    let mut data = Vec::new();
+    DeflateDecoder::new(&mut rest)
+        .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() > MAX_DECOMPRESSED_BYTES
+        || rest.len() != 8
+        || data.get(..4)? != b"OCTA"
+        || u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) != 27
+    {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes(rest[..4].try_into().ok()?);
+    let stored_len = u32::from_le_bytes(rest[4..].try_into().ok()?);
+    let mut crc = Crc::new();
+    crc.update(data.get(V27_CRC_START..)?);
+    (stored_len as usize == data.len() && stored_crc == crc.sum()).then_some(data)
 }
 
 pub fn read_octa(data: &[u8]) -> Result<Map, String> {
@@ -223,28 +318,74 @@ pub fn read_octa(data: &[u8]) -> Result<Map, String> {
         return Err("not a Cube 2 OCTA map (Tesseract MAPZ is not supported yet)".into());
     }
     let version = r.u32()?;
-    if !(29..=33).contains(&version) {
+    if version != 27 && !(29..=33).contains(&version) {
         return Err(format!(
-            "unsupported OCTA version {version}; supported versions are 29 through 33"
+            "unsupported OCTA version {version}; supported versions are 27 and 29 through 33"
         ));
     }
     let header_size = r.u32()?;
-    let expected_header = if version == 29 { 36 } else { 40 };
+    let expected_header = match version {
+        27 => V27_HEADER_BYTES as u32,
+        29 => 36,
+        _ => 40,
+    };
     if header_size != expected_header {
         return Err(format!(
             "unexpected header size {header_size} for version {version}"
         ));
     }
-    let mut header = Header {
-        version,
-        world_size: r.u32()?,
-        entities: r.u32()?,
-        pvs_cells: r.u32()?,
-        lightmaps: r.u32()?,
-        blendmap: r.u32()?,
-        variables: r.u32()?,
-        vslots: if version >= 30 { r.u32()? } else { 0 },
-        game: String::new(),
+    let mut header = if version == 27 {
+        // Fixed header: no map variables, no vslots, and no blend map is loaded.
+        let world_size = r.u32()?;
+        let entities = r.u32()?;
+        let pvs_cells = r.u32()?;
+        let lightmaps = r.u32()?;
+        let legacy = LegacyHeader {
+            light_precision: r.i32()?,
+            light_error: r.i32()?,
+            light_leaks: r.i32()?,
+            ambient: r.byte()?,
+            water_colour: r.bytes(3)?.try_into().unwrap(),
+            blendmap: r.byte()?,
+            lerp_angle: r.byte()?,
+            lerp_subdiv: r.byte()?,
+            lerp_subdiv_size: r.byte()?,
+            bump_error: r.byte()?,
+            sky_light: r.bytes(3)?.try_into().unwrap(),
+            lava_colour: r.bytes(3)?.try_into().unwrap(),
+            waterfall_colour: r.bytes(3)?.try_into().unwrap(),
+            title: {
+                r.skip(10)?; // reserved
+                let title = r.bytes(V27_HEADER_BYTES - r.pos)?;
+                let end = title.iter().position(|b| *b == 0).unwrap_or(title.len());
+                String::from_utf8_lossy(&title[..end]).into_owned()
+            },
+        };
+        Header {
+            version,
+            world_size,
+            entities,
+            pvs_cells,
+            lightmaps,
+            blendmap: 0,
+            variables: 0,
+            vslots: 0,
+            game: String::new(),
+            legacy: Some(legacy),
+        }
+    } else {
+        Header {
+            version,
+            world_size: r.u32()?,
+            entities: r.u32()?,
+            pvs_cells: r.u32()?,
+            lightmaps: r.u32()?,
+            blendmap: r.u32()?,
+            variables: r.u32()?,
+            vslots: if version >= 30 { r.u32()? } else { 0 },
+            game: String::new(),
+            legacy: None,
+        }
     };
     if !header.world_size.is_power_of_two() || !(2..=1_048_576).contains(&header.world_size) {
         return Err("world size must be a power of two between 2 and 1048576".into());
@@ -277,7 +418,7 @@ pub fn read_octa(data: &[u8]) -> Result<Map, String> {
     r.skip(mru_count * 2)?;
     let mut entities = Vec::with_capacity(header.entities as usize);
     for _ in 0..header.entities {
-        let position = [r.float()?, r.float()?, r.float()?];
+        let position = [r.raw_float()?, r.raw_float()?, r.raw_float()?];
         let mut attributes = [r.i16()?, r.i16()?, r.i16()?, r.i16()?, r.i16()?];
         let kind = r.byte()?;
         r.skip(1)?; // entity struct's final reserved byte
@@ -372,6 +513,7 @@ pub fn read_octa(data: &[u8]) -> Result<Map, String> {
         decompressed_bytes: data.len(),
         octree_end_offset: r.pos,
         nodes,
+        notes: Vec::new(),
     })
 }
 fn read_children(
@@ -602,6 +744,164 @@ mod tests {
     use super::*;
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
+    fn fixture_27(title: &str) -> Vec<u8> {
+        let mut data = b"OCTA".to_vec();
+        for n in [27u32, 196, 16, 0, 0, 0, 5, 6, 7] {
+            data.extend(n.to_le_bytes());
+        }
+        data.extend([
+            40, 1, 2, 3, 9, 10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 50, 51, 52,
+        ]);
+        data.extend([0; 10]);
+        let mut title_field = [0u8; 128];
+        title_field[..title.len()].copy_from_slice(title.as_bytes());
+        data.extend(title_field);
+        assert_eq!(data.len(), 196);
+        data.extend(&fixture(29)[36..]);
+        data
+    }
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+    fn set_crc(gzip: &mut [u8], crc: u32) {
+        let n = gzip.len();
+        gzip[n - 8..n - 4].copy_from_slice(&crc.to_le_bytes());
+    }
+    fn crc_of(data: &[u8]) -> u32 {
+        let mut crc = Crc::new();
+        crc.update(data);
+        crc.sum()
+    }
+    #[test]
+    fn reads_the_version_27_header_and_octree() {
+        let data = fixture_27("A test map");
+        let map = read_octa(&data).unwrap();
+        assert_eq!(map.header.version, 27);
+        assert_eq!(map.header.world_size, 16);
+        assert_eq!((map.header.variables, map.header.vslots), (0, 0));
+        assert_eq!(map.header.game, "fps");
+        let legacy = map.header.legacy.as_ref().unwrap();
+        assert_eq!(
+            (
+                legacy.light_precision,
+                legacy.light_error,
+                legacy.light_leaks
+            ),
+            (5, 6, 7)
+        );
+        assert_eq!(legacy.ambient, 40);
+        assert_eq!(legacy.water_colour, [1, 2, 3]);
+        assert_eq!(legacy.blendmap, 9);
+        assert_eq!(
+            [
+                legacy.lerp_angle,
+                legacy.lerp_subdiv,
+                legacy.lerp_subdiv_size,
+                legacy.bump_error
+            ],
+            [10, 11, 12, 13]
+        );
+        assert_eq!(legacy.sky_light, [20, 21, 22]);
+        assert_eq!(legacy.lava_colour, [30, 31, 32]);
+        assert_eq!(legacy.waterfall_colour, [50, 51, 52]);
+        assert_eq!(legacy.title, "A test map");
+        assert_eq!(map.cubes.len(), 8);
+        assert_eq!(map.octree_end_offset, data.len());
+        let report = serde_json::to_value(map.inventory()).unwrap();
+        assert_eq!(report["header"]["legacy"]["title"], "A test map");
+        assert_eq!(report["header"]["legacy"]["ambient"], 40);
+        for i in 0..data.len() {
+            assert!(read_octa(&data[..i]).is_err(), "prefix {i}");
+        }
+    }
+    #[test]
+    fn version_28_and_a_wrong_version_27_header_size_are_refused() {
+        let mut data = fixture_27("");
+        data[8..12].copy_from_slice(&40u32.to_le_bytes());
+        assert!(read_octa(&data).unwrap_err().contains("header size"));
+        let mut data = fixture_27("");
+        data[4..8].copy_from_slice(&28u32.to_le_bytes());
+        assert!(read_octa(&data)
+            .unwrap_err()
+            .contains("unsupported OCTA version 28"));
+    }
+    #[test]
+    fn version_27_checksum_over_the_data_after_byte_205_is_accepted_and_noted() {
+        let data = fixture_27("t");
+        let mut file = gzip(&data);
+        set_crc(&mut file, crc_of(&data[205..]));
+        let map = read_ogz(&file).unwrap();
+        assert_eq!(map.header.version, 27);
+        assert_eq!(map.notes.len(), 1);
+        assert!(map.notes[0].contains("after byte 205"));
+        assert_eq!(
+            serde_json::to_value(map.inventory()).unwrap()["notes"][0],
+            map.notes[0]
+        );
+        // An ordinary checksum needs no note.
+        let map = read_ogz(&gzip(&data)).unwrap();
+        assert!(map.notes.is_empty());
+    }
+    #[test]
+    fn every_other_version_27_checksum_problem_is_refused() {
+        let data = fixture_27("t");
+        let good = {
+            let mut file = gzip(&data);
+            set_crc(&mut file, crc_of(&data[205..]));
+            file
+        };
+        let n = good.len();
+        let mut wrong_crc = good.clone();
+        wrong_crc[n - 8] ^= 1;
+        let mut wrong_len = good.clone();
+        wrong_len[n - 4] ^= 1;
+        let mut whole_data_wrong = gzip(&data);
+        whole_data_wrong[n - 8] ^= 1;
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let truncated = good[..n - 12].to_vec();
+        let mut other_data = data.clone();
+        other_data[206] ^= 1;
+        let mut other_crc = gzip(&other_data);
+        set_crc(&mut other_crc, crc_of(&data[205..]));
+        for (name, file) in [
+            ("crc", wrong_crc),
+            ("length", wrong_len),
+            ("whole-data crc off by one", whole_data_wrong),
+            ("trailing byte", trailing),
+            ("truncated", truncated),
+            ("different data", other_crc),
+        ] {
+            assert!(read_ogz(&file).is_err(), "{name}");
+        }
+        // The same defect in a version 29 map is not accepted.
+        let v29 = fixture(29);
+        let mut file = gzip(&v29);
+        set_crc(&mut file, crc_of(&v29[v29.len() - 20..]));
+        assert!(read_ogz(&file).unwrap_err().contains("checksum"));
+    }
+    #[test]
+    fn non_finite_and_far_entity_positions_are_read_not_rejected() {
+        let mut data = fixture_27("");
+        data[16..20].copy_from_slice(&2u32.to_le_bytes());
+        let mut entities = Vec::new();
+        for position in [[f32::NAN, 1.0, 2.0], [0.0, 0.0, -134_217_728.0]] {
+            for c in position {
+                entities.extend(c.to_bits().to_le_bytes());
+            }
+            entities.extend([0u8; 10]);
+            entities.extend([3, 0]);
+        }
+        data.splice(207..207, entities);
+        let map = read_octa(&data).unwrap();
+        assert_eq!(map.entities.len(), 2);
+        assert!(map.entities[0].position[0].is_nan());
+        assert_eq!(map.entities[1].position[2], -134_217_728.0);
+        assert_eq!(map.entities[1].kind, 3);
+        assert_eq!(map.octree_end_offset, data.len());
+    }
     fn fixture(version: u32) -> Vec<u8> {
         let mut data = b"OCTA".to_vec();
         let mut fields = vec![

@@ -1,6 +1,6 @@
 # Legacy OGZ import
 
-`sauerteig-import` reads Cube 2 **OCTA versions 29–33**, including older Tesseract maps saved in that format. **Import is partial, not a faithful map restoration.** It converts supported solid geometry, water/glass volumes, and light/spawn positions into an editable Sauerteig world, plus a report of source data and omissions. Original textures, models, lighting properties, and gameplay entities are not restored. This is a command-line import path; it is not yet an in-game OGZ file picker. Newer Tesseract `MAPZ` files and earlier Cube formats are rejected explicitly.
+`sauerteig-import` reads Cube 2 **OCTA versions 27 and 29–33**, including older Tesseract maps saved in that format. **Import is partial, not a faithful map restoration.** It converts supported solid geometry, water/glass volumes, and light/spawn positions into an editable Sauerteig world, plus a report of source data and omissions. Original textures, models, lighting properties, and gameplay entities are not restored. This is a command-line import path; it is not yet an in-game OGZ file picker. Version 28, newer Tesseract `MAPZ` files and earlier Cube formats are rejected explicitly.
 
 ```sh
 . ./scripts/env.sh
@@ -13,6 +13,16 @@ cargo run -p sauerteig-server -- --bind 127.0.0.1:3002 --world .local/imported/m
 Input maps and existing output files are never overwritten. A companion `my-map.cfg`, or an explicit `--cfg FILE`, is inspected for literal asset references only. Scripts, aliases, includes, filesystem paths and shader commands are never executed or followed.
 
 To keep the converted map in the native app's **Saved worlds**, open **Import an existing world**, enter the generated JSON path and a world name, then choose **Import copy**. This creates a separate editable save; the OGZ and converted JSON remain unchanged.
+
+## Version 27 maps
+
+Version 27 has a fixed 196-byte header instead of map variables, and no virtual slots or blend map. The importer keeps the header's lighting fields (light precision, error and leaks, ambient, sky, water, lava and waterfall colours, lerp and bump settings) and the map title in the report under `header.legacy`, and reads the rest as version 29. Version 28 shares that header but can carry a blend map, so it stays refused until a version 28 map is available to test.
+
+Version 27 files written by the original game store a gzip CRC-32 that covers only the data after byte 205, not the whole file. The importer accepts exactly that: the stored checksum matches the data after byte 205, the stored length is right and the deflate stream is complete. The report notes it (`source.notes` and `notes`). Any other checksum mismatch, in any version, is still an error.
+
+## Entities without a position
+
+An entity whose position is not a finite number, or lies beyond 1,048,576 metres after conversion, is left out of the world and of its bounds. The report lists it in `entities_omitted_out_of_range` with its index, kind and source position (a position that is not a number appears as null). Some old maps hold such entities, for example an orphan teleport destination far below the map. Other entities still extend the world bounds.
 
 ## Geometry and scale
 

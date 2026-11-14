@@ -42,8 +42,9 @@ edit the same map at once and can switch to fighting in it at any time.
 - **Lighting.** Lights cast shadows, and up to about 150 in view can shine at
   once. Past that, the farthest ones fade out.
 - **Cube 2 map import.** A command-line [importer](crates/importer/README.md)
-  turns `.ogz` maps (map format versions 29–33) into editable worlds. It keeps
-  the geometry, water, glass, and the positions of lights and spawn points.
+  turns `.ogz` maps (map format versions 27 and 29–33) into editable worlds. It
+  keeps the geometry, water, glass, and the positions of lights and spawn
+  points.
 
 <p align="center">
   <img src="docs/images/lightroom.jpg" width="32%" alt="A hall of wooden pillars lit by many shadow-casting point lights">
@@ -148,8 +149,8 @@ once the rest of the game stops changing.
 7. **Editor feel:** move, flip, and rotate selections in place. Match
    Sauerbraten's key bindings. Add a heightmap brush for raising and lowering
    terrain.
-8. **Old-map restoration:** import older maps (format version 27), then original
-   textures, models, and light settings.
+8. **Old-map restoration:** bring back original textures, models, and light
+   settings.
 9. **Game layer:** combat networking, weapons, items, and game modes.
 
 Current status and work orders live in [docs/tracking](docs/tracking/README.md).

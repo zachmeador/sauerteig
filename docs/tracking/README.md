@@ -52,7 +52,7 @@ Later waves wait for the orders they build on.
 | [Renderer](renderer.md) | Active | Stages 1 (HDR, anti-aliasing, smooth motion) and 2 (clustered lights with a cached shadow atlas) are merged and await the maintainer's look. Next, one at a time: N1 (native GPU features, wave 1), then stage 2b (sun cascades and quality levels that vary detail only, with a lowest level that runs smoothly on the minimum specification; wave 1, after N1), N2 (every light shadowed, wave 2) and N3 (lighter world meshes, wave 4). N1b adds GPU tests on software drivers once platforms stage 1 merges. Octree O1a leaves hidden faces out of world meshes, at least 61% of an imported map's triangles. All of it must run on Vulkan and DirectX 12 as well as Metal. |
 | [Large worlds and performance](large-worlds.md) | Partial | Next: stage 1, a generated benchmark world at nub1's scale for numbers anyone can reproduce (wave 1, after octree O1a). Then viewing distance, streaming, and traversal on top of the octree, shared-sandbox stage 2 and the renderer stages. |
 | [Editor feel](editor-feel.md) | Active | Stage 1 (fill copies the faces behind; Delete empties the selection) is merged; play-testing is pending. Next, after octree O2 changes how the editor plans edits: in-place selection transforms, keymap parity, heightmap brush. |
-| [Legacy map restoration](legacy-import.md) | Partial | Next: I1, reading OCTA version 27 maps directly (wave 1). Octree O3 then imports maps straight into the tree and fixes mirrored imports. Then original textures, models, and lights once the world format and renderer support them. |
+| [Legacy map restoration](legacy-import.md) | Partial | I1 (reading OCTA version 27 maps directly) merged on 2026-11-14 and awaits the maintainer's look in the app. Next: octree O3 imports maps straight into the tree and fixes mirrored imports. Then original textures, models, and lights once the world format and renderer support them. |
 | [Lighting](lighting.md) | Partial | Light nodes in view are shadowed point lights, up to what the shadow atlas holds; the rest fade out, so the_cube1m draws 149 of its 339 (renderer stage 2, awaiting the maintainer's look). Next: renderer N2 lights and shadows every light, then editable light properties from the world format. |
 | [Game layer](game-layer.md) | Planned | Combat networking, weapons, items, and modes, after the sandbox core. |
 
@@ -107,8 +107,9 @@ updates its own stage section; the lead updates this overview when merging.
   [Storage and hosting](../development.md#hosting-and-saves).
 - Loading the maintainer's private OGZ archive into the saved-world library, on
   the M3 Pro: 15 conversions without solid-geometry omissions and four
-  explicitly recovered copies. The importer refuses four OCTA version 27 maps;
-  three have been in the library through a hand-made shim since 2026-11-11
+  explicitly recovered copies. Three OCTA version 27 maps have been in the
+  library through a hand-made shim since 2026-11-11; since 2026-11-14 the stock
+  importer reads them and produces byte-identical worlds
   ([legacy import](legacy-import.md) I1). On 2026-10-24 all 19 untouched library
   copies were refreshed with backups; 17 contain restored water/glass
   assignments. All 19 passed two server open/save cycles with unchanged terrain

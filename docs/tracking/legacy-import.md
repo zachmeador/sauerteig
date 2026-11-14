@@ -10,16 +10,17 @@ server load alone does not satisfy this outcome.
 
 ## Working now
 
-The converter reads OCTA versions 29–33, retains solid geometry and water/glass
+The converter reads OCTA versions 27 and 29–33, retains solid geometry and water/glass
 assignments at original scale, and imports light/spawn positions. It produces
 editable Sauerteig JSON and an import report, never overwriting the source. The
 maintainer's private archive has 23 maps, and the library holds 22 of them: 18
 without solid-geometry omissions and four recovery copies that each omit 23
 zero-thickness sheets. Four maps, nub1, ralith, ralith1 and ralith2, are OCTA
-version 27, which the importer doesn't read, and they fail its gzip checksum
-check. Since 2026-11-11 the three ralith maps are in the library through a
-hand-made shim ([I1](#i1-the-importer-reads-octa-version-27) below). nub1, the
-one archive map not in the library, also exceeds the 400,000-region cap.
+version 27. The importer now reads them directly
+([I1](#i1-the-importer-reads-octa-version-27) below); the three ralith maps in
+the library came through a hand-made shim on 2026-11-11 and convert identically.
+nub1, the one archive map not in the library, still exceeds the 400,000-region
+cap.
 
 The archive copies use fallback material. Source texture/model references are not
 loaded assets. Original light properties and spawn facing are not applied. These
@@ -52,7 +53,8 @@ Sauerbraten installation without redistributing them.
 
 ## I1: the importer reads OCTA version 27
 
-State: ready. Wave 1, small.
+State: merged on 2026-11-14. The maintainer has not yet looked at an imported
+version 27 map in the app.
 
 - **Why.** The importer reads versions 29–33, so the library's ralith copies
   came through a shim (`target/old-worlds/scripts/prepare.py`) that lives in the
@@ -134,6 +136,90 @@ State: ready. Wave 1, small.
     or the archive changes.
 - **Record:** the digests, how the reports differ from the shim's, and nub1's
   result.
+
+### I1 results (session on branch `import-octa27`, 2026-11-14)
+
+What changed:
+
+- `read_octa` reads version 27: the 196-byte header's lighting fields and title
+  go to `header.legacy` in the report; the rest is read as version 29 with no
+  map variables and no vslots. Version 28 is still refused, and a version 27
+  header size other than 196 is refused.
+- `read_ogz` falls back, only when the standard gzip check fails, to a second
+  decode that accepts exactly: a version 27 file, a complete deflate stream, a
+  trailer of exactly 8 bytes, a stored length equal to the inflated length, and
+  a stored CRC-32 equal to the CRC of the inflated data from byte 205 on. The
+  report notes it in `source.notes` and in the conversion `notes`. Everything
+  else (wrong CRC, wrong length, truncated stream, extra bytes, the same defect
+  in a version 29 file) fails as before.
+- Entity positions are read without the finite check. `convert` leaves out
+  entities whose converted position is not finite or beyond 1,048,576 and lists
+  them in `entities_omitted_out_of_range` (index, kind, source position; a NaN
+  appears as null). They no longer extend the bounds, and the rule also applies
+  with `--crop` and to versions 29–33.
+- Tests: `reads_the_version_27_header_and_octree`,
+  `version_28_and_a_wrong_version_27_header_size_are_refused`,
+  `version_27_checksum_over_the_data_after_byte_205_is_accepted_and_noted`,
+  `every_other_version_27_checksum_problem_is_refused`,
+  `non_finite_and_far_entity_positions_are_read_not_rejected` (reader) and
+  `entities_without_a_usable_position_are_left_out_and_listed` (convert).
+- Docs: importer README (new "Version 27 maps" and "Entities without a
+  position" sections), `main.rs` help text, top-level README import line. I
+  also reworded roadmap item 8 there, which listed version 27 as future work.
+
+Checks (all in the worktree, after `. ./scripts/env.sh`):
+`cargo fmt --all`; `cargo clippy --workspace --all-targets --locked -- -D
+warnings` (clean); `cargo test --workspace --locked` (all pass; importer 27
+unit tests).
+
+Acceptance, with copies of the originals in the worktree's ignored `.local/`
+(SHA-256 of copies equal the originals) and a release build of the importer:
+
+- `sauerteig-import convert .local/ogz/NAME.ogz --output .local/out/NAME.json`
+  gives world files byte-identical to the shim's in `target/old-worlds/fresh/`
+  and to `published.json`: ralith `efb173129f50...2184c`, ralith1
+  `a2b74f11a9db...3caf1`, ralith2 `ae4563e28fac...c05b` (full values in
+  `published.json`; the three match).
+- Against the library copies (read only), bounds, regions, volumes, objects,
+  cells, roots, format version and revision are equal for all three. ralith1's
+  `next_object` differs, the server's object counter, as expected.
+- Reports against the shim's: the new ones have `header.version` 27 (the
+  shim's said 29), `header.legacy` (ambient 25, light precision 32, error 8,
+  lerp angle 50, subdiv 2, size 4, title "Untitled Map by Unknown", other
+  colours 0), `source.notes` and a first entry in `notes` for the checksum, and
+  `entities_omitted_out_of_range`: ralith index 17 and ralith1 index 7, both
+  kind 20 at source position [3600.875, 3660.0, -134217728.0]; ralith2 has an
+  empty list. `header.entities` for ralith and ralith1 is 33 and 31 (the shim's
+  32 and 30, since it dropped the entity from the file), and the entity list
+  keeps the omitted one. `decompressed_bytes` and `octree_end_offset` are 160
+  bytes larger (the 196-byte header against 36), and 24 more for ralith and
+  ralith1, which keep the omitted entity's record. Nothing else differs.
+- nub1: gets past header and checksum (inspect reports version 27, title
+  "sup", 247 entities, the checksum note) and `convert` stops with "imported
+  geometry validation failed: Too many authored regions." Peak memory about
+  118 MB. No world is written.
+- A copy of ralith2 with one bit of the stored CRC flipped, and another with
+  the stored length changed, are each refused ("invalid gzip stream (including
+  checksum)"), exit 1.
+- Hosting: the converted ralith2 copied to `.local/scratch-lib/world.json` and
+  hosted headless with `SAUERTEIG_DATA_DIR` pointing at that folder: `/health`
+  returned ok, and a graceful stop saved it with the same regions, cells,
+  volumes, objects and bounds.
+- Nothing under `_old-games-user-data/`, `target/old-worlds/`, the main
+  checkout's `.local/`, or the application-data folder was written.
+
+Not observed: the in-app check (import into a scratch library through the
+app's menu, fly around, compare with the library copy) needs the app window;
+the maintainer should do it. The library import is only in the app, so the
+headless check used the server's `--world` flag. The shim dropped entities
+beyond 4 times the world size; the new rule uses 1,048,576 m, so another map
+with an entity between those limits would behave differently from the shim, but
+none of the three does. The `--center spawn` option still takes the first
+playerstart even if that entity were out of range.
+
+Choices: the checksum fallback is limited to version 27 and to the fixed offset
+205, both from the work order; the legacy header is stored in the existing
+inventory so `inspect` shows it too.
 
 ## Acceptance and evidence
 

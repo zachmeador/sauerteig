@@ -75,6 +75,16 @@ pub struct GeometryIssue {
     pub reason: String,
 }
 
+/// An entity left out because its position is not finite or lies beyond the
+/// importer's coordinate limit. The position is in source units; a position
+/// that is not a number is written as null.
+#[derive(Clone, Debug, Serialize)]
+pub struct OmittedEntity {
+    pub index: usize,
+    pub kind: u8,
+    pub position: [f32; 3],
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ImportReport {
     pub source: Inventory,
@@ -109,6 +119,8 @@ pub struct ImportReport {
     pub imported_spawns: usize,
     pub entity_kinds_not_imported: BTreeMap<u8, usize>,
     pub entities_outside_region: usize,
+    /// Entities with no usable position, left out of the world and its bounds.
+    pub entities_omitted_out_of_range: Vec<OmittedEntity>,
     pub notes: Vec<String>,
 }
 
@@ -143,7 +155,12 @@ impl ImportReport {
             imported_spawns: 0,
             entity_kinds_not_imported: BTreeMap::new(),
             entities_outside_region: 0,
-            notes: vec![
+            entities_omitted_out_of_range: Vec::new(),
+            notes: map
+                .notes
+                .iter()
+                .cloned()
+                .chain([
                 "Original source files are untouched. No CubeScript is executed, and no referenced asset or include is loaded automatically.".into(),
                 "Imported geometry uses dynamic lighting. Baked lightmaps, merged render surfaces, PVS, blend maps and sky rendering are not imported.".into(),
                 "Texture slot references and virtual-slot metadata are retained in this report. Unmapped slots use neutral material 0; texture imagery is not inside OGZ.".into(),
@@ -151,7 +168,8 @@ impl ImportReport {
                 "Water and glass retain exact leaf bounds in a separate material-volume layer, including empty leaves. Adjacent matching boxes are merged without resampling; textured terrain remains independent.".into(),
                 "Water/glass use current appearance and behavior. Original styles, lava, independent clip/noclip/gameclip, death and alpha flags are counted explicitly when not reproduced; raw and normalized source values remain in the inventory.".into(),
                 "Lights retain placement only: radius, color and spotlight attributes remain in the entity report. Mapmodels, pickups, triggers and sounds need later adapters.".into(),
-            ],
+            ])
+            .collect(),
         }
     }
 
@@ -212,15 +230,34 @@ pub fn convert(
         return Err("material mapping contains an invalid Sauerteig material ID".into());
     }
     let mut bounds = transform.bounds;
+    let mut omitted = Vec::new();
+    let placed: Vec<&crate::Entity> = map
+        .entities
+        .iter()
+        .enumerate()
+        .filter(|(index, entity)| {
+            let usable = transform
+                .position(entity.position)
+                .to_array()
+                .into_iter()
+                .all(|coordinate| coordinate.is_finite() && coordinate.abs() <= 1_048_576.0);
+            if !usable {
+                omitted.push(OmittedEntity {
+                    index: *index,
+                    kind: entity.kind,
+                    position: entity.position,
+                });
+            }
+            usable
+        })
+        .map(|(_, entity)| entity)
+        .collect();
     // An entity outside the nominal legacy cube is still part of a full import.
     // Include it in the explicit bounds instead of silently discarding it.
     if !options.crop {
-        for entity in &map.entities {
+        for entity in &placed {
             let position = transform.position(entity.position).to_array();
             for (axis, coordinate) in position.into_iter().enumerate() {
-                if !coordinate.is_finite() || coordinate.abs() > 1_048_576.0 {
-                    return Err("entity position exceeds supported import coordinates".into());
-                }
                 bounds.min[axis] = bounds.min[axis].min(coordinate.floor() as i32);
                 bounds.max[axis] = bounds.max[axis].max(coordinate.floor() as i32 + 1);
             }
@@ -231,6 +268,7 @@ pub fn convert(
     }
     let world_bounds = bounds.fine_box();
     let mut report = ImportReport::new(map, options, &transform);
+    report.entities_omitted_out_of_range = omitted;
     let mut regions = Vec::new();
     let mut volumes = Vec::new();
     for cube in &map.cubes {
@@ -330,7 +368,7 @@ pub fn convert(
         return Err("the chosen region contains no importable geometry or material volumes".into());
     }
     let mut objects = Vec::new();
-    for entity in &map.entities {
+    for entity in placed {
         let position = transform.position(entity.position);
         if (0..3).any(|axis| {
             position[axis] < bounds.min[axis] as f32 || position[axis] >= bounds.max[axis] as f32
@@ -481,6 +519,7 @@ mod tests {
                 variables: 0,
                 vslots: 0,
                 game: "fps".into(),
+                legacy: None,
             },
             variables: BTreeMap::new(),
             entities: Vec::new(),
@@ -489,6 +528,7 @@ mod tests {
             decompressed_bytes: 0,
             octree_end_offset: 0,
             nodes: 1,
+            notes: Vec::new(),
         }
     }
     fn options() -> ImportOptions {
@@ -799,6 +839,43 @@ mod tests {
         assert_eq!(report.entities_outside_region, 0);
         assert_eq!(save.objects.len(), 1);
         assert_eq!(save.bounds.max, [66, 76, 2]);
+    }
+    #[test]
+    fn entities_without_a_usable_position_are_left_out_and_listed() {
+        let mut map = map(vec![ramp()]);
+        for (kind, position) in [
+            (3, [520.0, -8.0, 600.0]),
+            (3, [0.0, 0.0, -134_217_728.0]),
+            (1, [f32::NAN, 0.0, 0.0]),
+            (2, [f32::INFINITY, 0.0, 0.0]),
+        ] {
+            map.entities.push(crate::Entity {
+                position,
+                attributes: [0; 5],
+                kind,
+                extra: Vec::new(),
+            });
+        }
+        for crop in [false, true] {
+            let mut opts = options();
+            opts.crop = crop;
+            let (save, report) = convert(&map, &opts).unwrap();
+            let omitted: Vec<_> = report
+                .entities_omitted_out_of_range
+                .iter()
+                .map(|e| (e.index, e.kind))
+                .collect();
+            assert_eq!(omitted, [(1, 3), (2, 1), (3, 2)]);
+            assert_eq!(
+                report.entities_omitted_out_of_range[0].position[2],
+                -134_217_728.0
+            );
+            assert_eq!(report.imported_spawns, usize::from(!crop));
+            assert_eq!(save.objects.len(), usize::from(!crop));
+            if !crop {
+                assert_eq!(save.bounds.max, [66, 76, 2]);
+            }
+        }
     }
     #[test]
     fn unsupported_shape_and_subgrid_scale_never_silently_disappear() {
