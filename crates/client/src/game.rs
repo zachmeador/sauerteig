@@ -5,6 +5,7 @@ mod panels;
 use crate::audio::{Audio, Cue};
 use crate::blueprints::BlueprintLibrary;
 use crate::editor::{Clipboard, EditError, EditPlan, EditSelection, SelectionDrag};
+use crate::network::{Connection, Event, Welcome};
 use crate::regions::{RegionBox, RegionSet};
 use crate::user_data::{Document, Preferences, Storage, StorageEvent};
 use crate::{render::Renderer, scene::Geometry};
@@ -366,7 +367,7 @@ pub struct Game {
     local_motion: crate::motion::Motion,
     remote_positions: BTreeMap<u64, crate::motion::Motion>,
     effects: Vec<(ShotEffect, f32)>,
-    socket: Option<(ewebsock::WsSender, ewebsock::WsReceiver)>,
+    socket: Option<Connection>,
     pub connected: bool,
     pub captured: bool,
     editing_allowed: bool,
@@ -538,8 +539,8 @@ impl Game {
             return;
         };
         self.invalidate_sync_for(&message);
-        if let Some((sender, _)) = &mut self.socket {
-            sender.send(ewebsock::WsMessage::Text(text));
+        if let Some(connection) = &self.socket {
+            connection.send(text);
         }
     }
     pub(crate) fn edits_pending(&self) -> bool {
@@ -616,7 +617,7 @@ impl Game {
     fn connect(&mut self) {
         self.status = "Connecting…".into();
         self.reconnect_at = self.time + 3.0;
-        match ewebsock::connect(&self.endpoint, ewebsock::Options::default()) {
+        match Connection::open(&self.endpoint) {
             Ok(socket) => self.socket = Some(socket),
             Err(error) => {
                 self.status = format!("Server unavailable: {error}");
@@ -634,37 +635,25 @@ impl Game {
         if self.socket.is_none() && self.time >= self.reconnect_at {
             self.connect();
         }
-        let mut events = vec![];
-        if let Some((_, receiver)) = &self.socket {
-            for _ in 0..256 {
-                if let Some(event) = receiver.try_recv() {
-                    events.push(event);
-                } else {
-                    break;
-                }
-            }
-        }
+        let events = self
+            .socket
+            .as_ref()
+            .map(Connection::drain)
+            .unwrap_or_default();
         for event in events {
             match event {
-                ewebsock::WsEvent::Opened => self.send(ClientMessage::Hello {
+                Event::Opened => self.send(ClientMessage::Hello {
                     name: self.name.clone(),
                 }),
-                ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(text)) => {
-                    match serde_json::from_str::<ServerMessage>(&text) {
-                        Ok(message) => self.receive(message, renderer),
-                        Err(error) => log::warn!("Invalid server message: {error}"),
-                    }
-                }
-                event @ (ewebsock::WsEvent::Closed | ewebsock::WsEvent::Error(_)) => {
-                    match &event {
-                        ewebsock::WsEvent::Error(error) => {
-                            log::warn!("World connection failed: {error}")
-                        }
-                        _ => log::info!("World connection closed; scheduling reconnect"),
+                Event::Welcome(welcome) => self.receive_welcome(*welcome, renderer),
+                Event::Message(message) => self.receive(message, renderer),
+                Event::Closed { error } => {
+                    match error {
+                        Some(error) => log::warn!("World connection failed: {error}"),
+                        None => log::info!("World connection closed; scheduling reconnect"),
                     }
                     self.connection_lost();
                 }
-                _ => {}
             }
         }
         self.local_motion.correct(self.local.position);
@@ -715,72 +704,73 @@ impl Game {
         self.damage_flash = (self.damage_flash - dt).max(0.0);
     }
 
+    fn receive_welcome(&mut self, welcome: Welcome, renderer: &mut Renderer) {
+        let Welcome {
+            id,
+            revision,
+            cells,
+            roots,
+            bounds,
+            regions,
+            format_version,
+            objects,
+            players,
+            editing_allowed,
+            volumes,
+        } = welcome;
+        if format_version > WORLD_FORMAT_VERSION {
+            self.notify("This server uses a newer world format. Update the client to join.");
+            self.socket = None;
+            self.connected = false;
+            return;
+        }
+        let Ok(mut world) = World::from_compact_parts(bounds, &regions, &cells, &roots) else {
+            self.notify("Server sent invalid world geometry.");
+            self.socket = None;
+            self.connected = false;
+            return;
+        };
+        if world.replace_volumes(&volumes).is_err() {
+            self.notify("Server sent invalid material volumes.");
+            self.socket = None;
+            self.connected = false;
+            return;
+        }
+        self.world = world;
+        self.objects = objects;
+        self.players = players;
+        self.revision = revision;
+        self.editing_allowed = editing_allowed;
+        self.local = self
+            .players
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .unwrap_or_else(|| Player::new(id, self.name.clone()));
+        self.mode = ModeState {
+            request: self.local.mode_request,
+            pending: None,
+        };
+        // Face the arena from the actual spawn, including authored spawns.
+        self.local.yaw = (-self.local.position.x).atan2(self.local.position.z);
+        self.local.pitch = -0.08;
+        self.seq = self.local.last_input;
+        self.pending.clear();
+        self.camera_offset = Vec3::ZERO;
+        self.connected = true;
+        self.sync = None;
+        self.status = "Connected".into();
+        renderer.rebuild_all(&self.world);
+        self.rebuild_objects(renderer);
+        self.clear_selection();
+        self.pending_edit = None;
+        self.pending_object = None;
+    }
+
     fn receive(&mut self, message: ServerMessage, renderer: &mut Renderer) {
         match message {
-            ServerMessage::Welcome {
-                id,
-                revision,
-                cells,
-                roots,
-                bounds,
-                regions,
-                format_version,
-                objects,
-                players,
-                editing_allowed,
-                volumes,
-            } => {
-                if format_version > WORLD_FORMAT_VERSION {
-                    self.notify(
-                        "This server uses a newer world format. Update the client to join.",
-                    );
-                    self.socket = None;
-                    self.connected = false;
-                    return;
-                }
-                let Ok(mut world) = World::from_compact_parts(bounds, &regions, &cells, &roots)
-                else {
-                    self.notify("Server sent invalid world geometry.");
-                    self.socket = None;
-                    self.connected = false;
-                    return;
-                };
-                if world.replace_volumes(&volumes).is_err() {
-                    self.notify("Server sent invalid material volumes.");
-                    self.socket = None;
-                    self.connected = false;
-                    return;
-                }
-                self.world = world;
-                self.objects = objects;
-                self.players = players;
-                self.revision = revision;
-                self.editing_allowed = editing_allowed;
-                self.local = self
-                    .players
-                    .iter()
-                    .find(|p| p.id == id)
-                    .cloned()
-                    .unwrap_or_else(|| Player::new(id, self.name.clone()));
-                self.mode = ModeState {
-                    request: self.local.mode_request,
-                    pending: None,
-                };
-                // Face the arena from the actual spawn, including authored spawns.
-                self.local.yaw = (-self.local.position.x).atan2(self.local.position.z);
-                self.local.pitch = -0.08;
-                self.seq = self.local.last_input;
-                self.pending.clear();
-                self.camera_offset = Vec3::ZERO;
-                self.connected = true;
-                self.sync = None;
-                self.status = "Connected".into();
-                renderer.rebuild_all(&self.world);
-                self.rebuild_objects(renderer);
-                self.clear_selection();
-                self.pending_edit = None;
-                self.pending_object = None;
-            }
+            // The network thread turns every Welcome into a `Welcome`.
+            ServerMessage::Welcome { .. } => {}
             ServerMessage::Snapshot {
                 revision,
                 players,
@@ -1472,10 +1462,10 @@ impl Game {
                         return;
                     }
                 };
-                let Some((sender, _)) = &mut self.socket else {
+                let Some(connection) = &self.socket else {
                     return;
                 };
-                sender.send(ewebsock::WsMessage::Text(text));
+                connection.send(text);
                 self.sync = None;
                 self.pending_edit = Some(PendingEdit {
                     request: self.edit_request,

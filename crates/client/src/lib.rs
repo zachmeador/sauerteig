@@ -9,6 +9,7 @@ mod launcher;
 mod lighting;
 mod materials;
 mod motion;
+mod network;
 mod props;
 mod regions;
 mod render;

@@ -127,6 +127,7 @@ impl Drop for HostedServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::testing::Client;
     use std::{
         fs,
         io::{Read, Write},
@@ -189,28 +190,6 @@ mod tests {
         socket
     }
 
-    fn receive(
-        receiver: &ewebsock::WsReceiver,
-        matches: impl Fn(&sauerteig_core::ServerMessage) -> bool,
-    ) -> sauerteig_core::ServerMessage {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match receiver.try_recv() {
-                Some(ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(text))) => {
-                    let message = serde_json::from_str(&text).unwrap();
-                    if matches(&message) {
-                        return message;
-                    }
-                }
-                Some(ewebsock::WsEvent::Error(error)) => panic!("WebSocket error: {error}"),
-                Some(ewebsock::WsEvent::Closed) => panic!("WebSocket closed before response"),
-                _ => {}
-            }
-            assert!(Instant::now() < deadline, "server response timed out");
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     #[test]
     fn repeated_host_sessions_save_and_release_the_listener() {
         let directory = TestDirectory::new();
@@ -271,25 +250,15 @@ mod tests {
     }
 
     /// Connects as a player, turns editing on and places a light, returning
-    /// once the server has applied it. Dropping the sender leaves.
-    fn place_light(
-        host: &HostedServer,
-        position: sauerteig_core::Vec3,
-    ) -> (ewebsock::WsSender, ewebsock::WsReceiver) {
+    /// once the server has applied it. Dropping the client leaves.
+    fn place_light(host: &HostedServer, position: sauerteig_core::Vec3) -> Client {
         use sauerteig_core::{ClientMessage, ObjectKind, ServerMessage};
-        let (mut sender, receiver) =
-            ewebsock::connect(host.endpoint(), ewebsock::Options::default()).unwrap();
-        receive(&receiver, |message| {
-            matches!(message, ServerMessage::Welcome { .. })
+        let (mut client, _) = Client::join(&host.endpoint());
+        client.send(ClientMessage::SetMode {
+            request: 1,
+            editing: true,
         });
-        sender.send(ewebsock::WsMessage::Text(
-            serde_json::to_string(&ClientMessage::SetMode {
-                request: 1,
-                editing: true,
-            })
-            .unwrap(),
-        ));
-        receive(&receiver, |message| {
+        client.message(|message| {
             matches!(
                 message,
                 ServerMessage::ModeChanged {
@@ -298,19 +267,15 @@ mod tests {
                 }
             )
         });
-        sender.send(ewebsock::WsMessage::Text(
-            serde_json::to_string(&ClientMessage::PlaceObject {
-                kind: ObjectKind::Light,
-                position,
-                rotation: 0.0,
-            })
-            .unwrap(),
-        ));
-        receive(
-            &receiver,
+        client.send(ClientMessage::PlaceObject {
+            kind: ObjectKind::Light,
+            position,
+            rotation: 0.0,
+        });
+        client.message(
             |message| matches!(message, ServerMessage::Objects { objects, .. } if objects.iter().any(|object| object.position == position)),
         );
-        (sender, receiver)
+        client
     }
 
     fn wait_for_file(path: &std::path::Path) {
@@ -323,28 +288,22 @@ mod tests {
 
     #[test]
     fn an_edit_survives_stopping_and_reopening_the_host() {
-        use sauerteig_core::{ObjectKind, ServerMessage, Vec3};
+        use sauerteig_core::{ObjectKind, Vec3};
         let directory = TestDirectory::new();
         let mut host = HostedServer::start(directory.world(), false).unwrap();
         let position = Vec3::new(0.0, 40.0, 0.0);
-        let (sender, _receiver) = place_light(&host, position);
+        let client = place_light(&host, position);
         // Stop immediately after the edit is acknowledged, before waiting for
         // autosave. Reopening through the public protocol proves final-save use.
-        drop(sender);
+        drop(client);
         host.shutdown_blocking().unwrap();
         let mut reopened = HostedServer::start(directory.world(), false).unwrap();
-        let (sender, receiver) =
-            ewebsock::connect(reopened.endpoint(), ewebsock::Options::default()).unwrap();
-        let welcome = receive(&receiver, |message| {
-            matches!(message, ServerMessage::Welcome { .. })
-        });
-        let ServerMessage::Welcome { objects, .. } = welcome else {
-            unreachable!()
-        };
+        let (client, welcome) = Client::join(&reopened.endpoint());
+        let objects = welcome.objects;
         assert!(objects
             .iter()
             .any(|object| object.position == position && object.kind == ObjectKind::Light));
-        drop(sender);
+        drop(client);
         reopened.shutdown_blocking().unwrap();
     }
 
@@ -366,14 +325,14 @@ mod tests {
         // A new world is saved when the server starts. After that, only a
         // change makes the final save write again.
         wait_for_file(&directory.world());
-        let (sender, _receiver) = place_light(&host, Vec3::new(0.0, 40.0, 0.0));
+        let client = place_light(&host, Vec3::new(0.0, 40.0, 0.0));
         // The running server has loaded a world, then its save destination
         // becomes a directory, so the final atomic replacement must fail.
         fs::remove_file(directory.world()).unwrap();
         fs::create_dir(directory.world()).unwrap();
         host.stop();
         assert!(wait_for_completion(&mut host).is_err());
-        drop(sender);
+        drop(client);
     }
 
     #[test]

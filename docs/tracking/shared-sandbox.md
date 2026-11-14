@@ -37,10 +37,9 @@ Nobody's game hitches when someone else pastes, saves, or joins.
   boundary.
 - **Each editor action still waits** for the server's acknowledgment before the
   next is sent.
-- **Secure addresses hang.** The home screen accepts `wss://` and `https://`
-  addresses, but the client's TLS library is built without a crypto provider.
-  The connection thread panics, and the client stays at "Connecting…"
-  (reproduced 2026-11-13). 2b's first session fixes it.
+- **Secure addresses connect** since 2b's first session (2026-11-14), but only
+  to servers whose certificate a public authority signed: the client trusts the
+  bundled web roots alone.
 
 ## Stage 1: the simulation never waits
 
@@ -491,9 +490,10 @@ Choices and gaps:
 
 #### 2b. Joining without freezing
 
-State: waits for the save and quit fixes. Two sessions, each merged on its own:
-the network thread, then building on worker threads. Client only; the protocol
-doesn't change.
+State: session 1 (the network thread) merged on 2026-11-14; its in-app checks
+wait for the maintainer. Session 2 waits for octree O1b and large-worlds stage
+1. Two sessions, each merged on its own: the network thread, then building on
+worker threads. Client only; the protocol doesn't change.
 
 - **Decided:** the client half of decision 1, and decision 2's worker-thread
   build, still fed by today's JSON Welcome.
@@ -562,19 +562,128 @@ doesn't change.
     Record whether macOS asks for Local Network access and whether a firewall
     prompts. Needs a second computer.
 - **Tests:**
-  - [ ] Network-thread tests against a local server, in the style of
+  - [x] Network-thread tests against a local server, in the style of
     `crates/server/src/bots.rs`: connect, Welcome, patches in order, sending
     without waiting on reads, and reconnecting after a close and after 5 s of
     silence, while a slow upgrade doesn't count as silence.
-  - [ ] A `wss://` handshake against a local rustls server with a test root
+  - [x] A `wss://` handshake against a local rustls server with a test root
     certificate.
-  - [ ] TCP_NODELAY is on for the client's socket and the server's accepted
+  - [x] TCP_NODELAY is on for the client's socket and the server's accepted
     socket.
-  - [ ] Existing client tests pass, including the moved ones.
+  - [x] Existing client tests pass, including the moved ones.
 - **Record:** the peak memory of a the_cube1m join before and after (the
   capture tool measured about 0.23 GiB less with the plain decode), how long
   other clients took to notice a frozen host, and the Local Network and
   firewall prompts.
+
+##### Result (session 1)
+
+What changed:
+
+- **Network module.** `crates/client/src/network.rs` holds `Connection`. Each
+  connection runs one thread with a current-thread tokio runtime and a
+  tokio-tungstenite 0.29 socket; `Game::connect`, `Game::send`, the edit
+  send in `process_edit_queue` and the event loop in `Game::update` use it.
+  ewebsock is gone from `Cargo.toml` and `Cargo.lock`. The thread sends each
+  message as soon as the frame thread hands it over (an unbounded channel;
+  the 5 s silence limit ends a connection whose server stopped reading and
+  talking). A byte counter wraps the TCP stream under the encryption.
+  `max_message_size` and `max_frame_size` are 64 MiB.
+- **Welcome.** The thread decodes it into `network::Welcome`, a plain
+  structure, after a check of the message's first bytes; any other message,
+  and a Welcome whose keys come in another order, goes through
+  `ServerMessage` (a Welcome found that way is converted). `Game` gets the
+  new `receive_welcome`; `ServerMessage::Welcome` in `Game::receive` is
+  ignored.
+- **Queue.** Up to 64 messages wait in order. Only the newest snapshot is
+  kept, in its place in the order. When 64 messages wait, the thread stops
+  reading, so a stalled frame thread backs up into TCP. `Game::update` drains
+  it once per tick, with no 256-event cap.
+- **Limits.** `SILENCE_LIMIT` is 5 s, counted from the end of the handshake,
+  and only while the thread waits to read, so decoding a large Welcome or a
+  full queue never counts as silence. `CONNECT_LIMIT` is 30 s for the TCP
+  connection, the encryption and the upgrade. Either ends the connection with
+  an `Event::Closed` error, and `Game` reconnects 3 s later as before.
+- **Drop.** Dropping a `Connection` signals the thread, which sends a Close
+  frame (at most 250 ms), closes the socket and is joined, so the connection
+  is closed before `Drop for Runtime` goes on to `HostedServer`'s final save.
+- **`wss://`.** rustls 0.23 with `ring`, `std` and `tls12` features, and the
+  `webpki-roots` certificates. The client builds its `ClientConfig` with the
+  `ring` provider explicitly, so no process-wide provider is needed.
+- **TCP_NODELAY.** Set on the client's socket and read back; the server's
+  accept loop already set it.
+- **Tests moved.** `an_edit_survives_stopping_and_reopening_the_host`, the
+  `place_light` helper and `Wire` in `editor.rs` now use
+  `network::testing::Client`, a blocking player built on `Connection`.
+- **Other.** `NSLocalNetworkUsageDescription` is in the macOS app's
+  Info.plist. `docs/development.md` describes the client connection.
+  New dev-dependencies of the client: `rcgen` and `tokio-rustls`
+  (for the `wss` test). New dependencies: `tokio-tungstenite`,
+  `futures-util` (already built for the server), `rustls`, `webpki-roots`.
+
+Checks, run in the worktree on the M5 Pro (macOS):
+
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D
+  warnings` and `cargo test --workspace --locked`: clean and passing (client
+  190 passed and 7 ignored, server 67).
+- New client tests in `network.rs`:
+  `connecting_delivers_opened_then_messages_in_order`,
+  `a_welcome_is_decoded_into_plain_data_whatever_its_key_order`,
+  `only_the_newest_snapshot_waits_and_it_keeps_its_place`,
+  `a_stalled_frame_thread_backs_up_into_the_connection_without_losing_messages`
+  (3,000 messages of 8 KiB; also sends while nothing is read),
+  `messages_are_sent_at_once_while_nothing_is_read`,
+  `a_closed_connection_reports_it_and_a_new_one_reaches_the_server_again`,
+  `a_server_that_goes_quiet_ends_the_connection`,
+  `a_server_that_keeps_talking_is_not_silent`, `a_slow_upgrade_is_not_silence`,
+  `an_upgrade_that_never_comes_ends_at_the_connect_limit`,
+  `a_refused_connection_and_a_bad_address_say_why`,
+  `dropping_the_connection_closes_the_socket_before_it_returns`,
+  `dropping_a_connection_that_is_still_connecting_does_not_wait_for_the_limit`,
+  `a_message_beyond_the_old_frame_limit_arrives_and_its_bytes_are_counted`
+  (20 MiB), `the_clients_socket_has_nagles_algorithm_off`,
+  `a_wss_handshake_succeeds_against_a_server_with_a_trusted_certificate` (a
+  rustls server with a certificate from a test authority made by `rcgen`) and
+  `a_wss_address_never_stays_connecting_when_it_cannot_be_trusted_or_is_plain`.
+  The server has `accepted_sockets_have_nagles_algorithm_off`. The silence
+  tests use a 400 ms limit; the 5 s and 30 s values are the constants.
+- Peak memory of a the_cube1m join, release build, a standalone release
+  server on a copy of the world, a headless client that joins and builds the
+  `World` the way `Game` does (`/usr/bin/time -l`, three runs each, peak
+  memory footprint): before (ewebsock, tagged `ServerMessage`) 1.18 GiB
+  (1,265 MB), maximum resident size 1.42 GiB; after (this branch) 0.95 GiB
+  (1,016 MB), resident 0.95 GiB, so 0.23 GiB less. The join took 1.5 s before
+  and 1.3 s after, in the same process, counting the world build. The "after"
+  measurement stays as the ignored test `network::tests::measure_join`; its
+  doc comment says how to run it. The "before" harness was a temporary test
+  and was not kept.
+
+Not observed, for the maintainer (the acceptance boxes above stay unticked):
+
+- Everything in the running app: minimizing during a join, restarting or
+  `kill -STOP` of a host (how long other clients take to notice and what
+  they show), a `wss://` address in the join box, and a join from a second
+  computer, including whether macOS asks for Local Network access and whether
+  a firewall prompts. The tests cover the network thread, not `Game`'s
+  reconnect timer (unchanged: 3 s after a loss).
+- The Info.plist key was added to the script, but the app was not rebuilt.
+- Windows and Linux were not built.
+
+Choices and gaps:
+
+- Reconnecting stays in `Game`: the thread ends a connection and `Game` opens
+  a new one after 3 s. The tests show a closed or silent connection ending
+  and a new `Connection` working, not `Game`'s timer.
+- The network thread decodes on its own thread, so a large Welcome delays
+  its writes and its silence check while it decodes (about 0.1 s for
+  the_cube1m). Nothing is sent before the Welcome anyway.
+- Outgoing messages queue without a bound. The 16 MiB edit check in
+  `process_edit_queue` is unchanged.
+- The connection counts bytes (`Connection::bytes_received`) but nothing shows
+  them yet; the join progress display of 2d can.
+- Trusted certificates are the bundled web roots only, not the system's.
+  A server with a private certificate authority cannot be joined over
+  `wss://` yet.
 
 ##### 2b, session 2: building on worker threads
 

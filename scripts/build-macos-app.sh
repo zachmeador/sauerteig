@@ -50,6 +50,8 @@ cat > "$sauerteig_app/Contents/Info.plist" <<'PLIST'
   <string>6.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Sauerteig connects to worlds hosted on your local network.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>LSApplicationCategoryType</key>

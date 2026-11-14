@@ -39,7 +39,7 @@ const MAX_WORLD_FRAGMENTS: usize = 786_432;
 const EDIT_BURST: f64 = 131_072.0;
 const EDIT_RATE: f64 = 65_536.0;
 const MAX_OBJECTS: usize = 1024;
-// Native ewebsock uses tungstenite's 64 MiB message limit. Geometry uses a
+// The client accepts messages up to 64 MiB. Geometry uses a
 // conservative wire-size budget; reserve room for objects, players and metadata.
 const MAX_WORLD_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_ENVELOPE_BYTES: usize = 1024 * 1024;

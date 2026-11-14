@@ -1274,10 +1274,10 @@ fn transform_shape(shape: Shape, transform: impl Fn([u8; 3]) -> [u8; 3]) -> Shap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::testing::Client;
     use sauerteig_core::ObjectKind;
     use sauerteig_core::{ClientMessage, ServerMessage};
     use sauerteig_core::{WorldBounds, WORLD_HEIGHT, WORLD_MAX};
-    use std::time::{Duration, Instant};
 
     fn object(id: u32, kind: ObjectKind, position: [f32; 3], rotation: f32) -> WorldObject {
         WorldObject {
@@ -2871,62 +2871,34 @@ mod tests {
     }
 
     struct Wire {
-        sender: ewebsock::WsSender,
-        receiver: ewebsock::WsReceiver,
+        client: Client,
         world: World,
         revision: u64,
         syncs: u64,
     }
     impl Wire {
         fn open(host: &crate::hosting::HostedServer) -> Self {
-            let (sender, receiver) =
-                ewebsock::connect(host.endpoint(), ewebsock::Options::default()).unwrap();
-            let mut wire = Self {
-                sender,
-                receiver,
-                world: World::empty(),
-                revision: 0,
+            let (client, welcome) = Client::join(&host.endpoint());
+            let mut world = World::from_compact_parts(
+                welcome.bounds,
+                &welcome.regions,
+                &welcome.cells,
+                &welcome.roots,
+            )
+            .unwrap();
+            world.replace_volumes(&welcome.volumes).unwrap();
+            Self {
+                client,
+                world,
+                revision: welcome.revision,
                 syncs: 0,
-            };
-            let ServerMessage::Welcome {
-                revision,
-                bounds,
-                regions,
-                cells,
-                roots,
-                volumes,
-                ..
-            } = wire.next(|message| matches!(message, ServerMessage::Welcome { .. }))
-            else {
-                unreachable!()
-            };
-            wire.world = World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap();
-            wire.world.replace_volumes(&volumes).unwrap();
-            wire.revision = revision;
-            wire
-        }
-        fn next(&mut self, wanted: impl Fn(&ServerMessage) -> bool) -> ServerMessage {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match self.receiver.try_recv() {
-                    Some(ewebsock::WsEvent::Message(ewebsock::WsMessage::Text(text))) => {
-                        let message = serde_json::from_str(&text).unwrap();
-                        if wanted(&message) {
-                            return message;
-                        }
-                    }
-                    Some(ewebsock::WsEvent::Error(error)) => panic!("WebSocket error: {error}"),
-                    Some(ewebsock::WsEvent::Closed) => panic!("WebSocket closed"),
-                    Some(_) => {}
-                    None => std::thread::sleep(Duration::from_millis(2)),
-                }
-                assert!(Instant::now() < deadline, "server response timed out");
             }
         }
+        fn next(&mut self, wanted: impl Fn(&ServerMessage) -> bool) -> ServerMessage {
+            self.client.message(wanted)
+        }
         fn send(&mut self, message: ClientMessage) {
-            self.sender.send(ewebsock::WsMessage::Text(
-                serde_json::to_string(&message).unwrap(),
-            ));
+            self.client.send(message);
         }
         /// Applies every patch the server queued ahead of its answer to a Sync that
         /// follows `message`, and returns the errors it reported meanwhile.

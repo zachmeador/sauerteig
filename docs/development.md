@@ -110,8 +110,16 @@ that still doesn't fit after two seconds fails as busy. The simulation continues
 and the joining peer keeps its revision backlog.
 Movement snapshots are replaceable. A world transfer times out only after 30
 seconds without a successful TCP write, including transfers longer than a minute.
-Server sockets enable TCP_NODELAY. The native client's locked blocking
-`tungstenite` connector already enables it through `ewebsock`.
+Server sockets and the client's socket enable TCP_NODELAY.
+
+The client's connection runs on its own thread (`crates/client/src/network.rs`):
+a current-thread tokio runtime with a tokio-tungstenite socket, `ws://` and
+`wss://` (rustls with its `ring` provider and the bundled web roots). It sends
+at once, decodes off the frame thread (the Welcome into a plain structure),
+and passes messages through a bounded queue that keeps only the newest
+snapshot. A connection that receives no bytes for 5 s after the handshake ends
+and the client reconnects; connecting and the handshake may take 30 s. Messages
+and frames up to 64 MiB are accepted.
 
 A simulation panic closes the room with an error, returns that error to the
 embedded host, and skips its final save. A pending autosave checks for failure

@@ -109,3 +109,23 @@ impl Connected<IncomingStream<'_, ProgressListener>> for Progress {
         stream.io().progress.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_sockets_have_nagles_algorithm_off() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut listener = ProgressListener(TcpListener::bind("127.0.0.1:0").await.unwrap());
+            let address = listener.local_addr().unwrap();
+            let _client = TcpStream::connect(address).await.unwrap();
+            let (accepted, _) = listener.accept().await;
+            assert!(accepted.socket.nodelay().unwrap());
+        });
+    }
+}

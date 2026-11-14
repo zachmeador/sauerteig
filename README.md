@@ -107,7 +107,7 @@ The full list, including selections, corner shaping, and objects, is in the
   only for people you trust.
 - Playing over the internet means running the standalone server and forwarding a
   port on your router yourself. An easier way is planned but on hold. Secure
-  `wss://` addresses don't connect yet: the game stays at "Connecting…".
+  `wss://` addresses work only with a certificate from a public authority.
 - A joining player receives the whole world as one message, so very large
   worlds can freeze the game while they load.
 - Imported maps lose their textures, models, light settings, and gameplay
