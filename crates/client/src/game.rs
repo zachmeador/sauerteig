@@ -825,10 +825,10 @@ impl Game {
                     return;
                 }
                 let start = std::time::Instant::now();
-                let chunks = self.world.apply_edits(&edits);
+                let changes = self.world.apply_edits_changes(&edits);
                 self.revision = revision;
                 // World queries and visible meshes change together on this frame boundary.
-                renderer.rebuild(&self.world, &chunks);
+                renderer.rebuild(&self.world, &changes);
                 self.last_edit_ms = start.elapsed().as_secs_f32() * 1000.0;
                 self.peak_edit_ms = self.peak_edit_ms.max(self.last_edit_ms);
                 if self.local.editing {
@@ -840,10 +840,10 @@ impl Game {
                     return;
                 }
                 let start = std::time::Instant::now();
-                match self.world.apply_root_edits(&roots) {
-                    Ok(chunks) => {
+                match self.world.apply_root_edits_changes(&roots) {
+                    Ok(changes) => {
                         self.revision = revision;
-                        renderer.rebuild(&self.world, &chunks);
+                        renderer.rebuild(&self.world, &changes);
                         self.last_edit_ms = start.elapsed().as_secs_f32() * 1000.0;
                         self.peak_edit_ms = self.peak_edit_ms.max(self.last_edit_ms);
                         if self.local.editing {
@@ -880,17 +880,14 @@ impl Game {
                 // Water and glass, then geometry, as the server applied them;
                 // a patch this world refuses changes nothing.
                 match self.world.apply_patch(&roots, volumes.as_deref()) {
-                    Ok(chunks) => {
+                    Ok(changes) => {
                         if let Some(pending) = &mut self.pending_object {
                             pending.observe_patch(&self.objects, &objects);
                         }
                         let objects_changed = self.objects != objects;
                         self.objects = objects;
                         self.revision = revision;
-                        renderer.rebuild(&self.world, &chunks);
-                        if volumes.is_some() {
-                            renderer.rebuild_volumes(&self.world);
-                        }
+                        renderer.rebuild(&self.world, &changes);
                         if objects_changed {
                             self.rebuild_objects(renderer);
                         }
@@ -1899,10 +1896,12 @@ impl Game {
                 egui::pos2(screen.right() - 24.0, 44.0),
                 egui::Align2::RIGHT_TOP,
                 format!(
-                    "{:.0} fps / {:.1} ms / {} tris",
+                    "{:.0} fps / {:.1} ms / {} tris / units re-meshed: {} opaque, {} water and glass",
                     self.fps,
                     1000.0 / self.fps,
-                    renderer.visible_triangles()
+                    renderer.visible_triangles(),
+                    renderer.remeshed.opaque,
+                    renderer.remeshed.transparent
                 ),
                 mono(10.0),
                 MUTED,

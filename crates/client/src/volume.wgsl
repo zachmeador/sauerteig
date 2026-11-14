@@ -4,6 +4,9 @@ struct VertexInput {
     @location(2) uv: vec2<f32>,
     @location(3) size: vec2<f32>,
     @location(4) material: u32,
+    // Bits 0 to 3: the quad's edges where its surface ends, u low, v low,
+    // u high, v high. Only these get an edge band.
+    @location(5) edges: u32,
 };
 struct VertexOutput {
     @builtin(position) clip: vec4<f32>,
@@ -12,6 +15,7 @@ struct VertexOutput {
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) size: vec2<f32>,
     @location(4) @interpolate(flat) material: u32,
+    @location(5) @interpolate(flat) edges: u32,
 };
 
 @vertex fn vs_main(v: VertexInput) -> VertexOutput {
@@ -22,6 +26,7 @@ struct VertexOutput {
     o.uv = v.uv;
     o.size = v.size;
     o.material = v.material;
+    o.edges = v.edges;
     return o;
 }
 
@@ -54,7 +59,11 @@ struct VertexOutput {
     // This is deliberately a stylized surface, not a reflection of geometry.
     let environment = mix(vec3<f32>(0.12, 0.16, 0.18), vec3<f32>(0.30, 0.38, 0.43),
         clamp(reflection.y * 0.5 + 0.5, 0.0, 1.0));
-    let edge_distance = min(min(v.uv.x, v.uv.y), min(v.size.x - v.uv.x, v.size.y - v.uv.y));
+    var edge_distance = 1.0e6;
+    if ((v.edges & 1u) != 0u) { edge_distance = min(edge_distance, v.uv.x); }
+    if ((v.edges & 2u) != 0u) { edge_distance = min(edge_distance, v.uv.y); }
+    if ((v.edges & 4u) != 0u) { edge_distance = min(edge_distance, v.size.x - v.uv.x); }
+    if ((v.edges & 8u) != 0u) { edge_distance = min(edge_distance, v.size.y - v.uv.y); }
     let edge = 1.0 - smoothstep(0.0, max(0.024, fwidth(edge_distance) * 1.25), edge_distance);
     let sun = normalize(camera.sun.xyz);
     let half_direction = normalize(sun + view);

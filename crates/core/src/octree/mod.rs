@@ -11,6 +11,7 @@
 //! can route them through it.
 
 mod diff;
+pub(crate) use diff::Changes;
 mod digest;
 mod format3;
 pub(crate) mod lattice;
@@ -20,11 +21,15 @@ mod private_worlds;
 mod query;
 #[cfg(test)]
 mod tests;
+mod transparent;
 
 pub(crate) use format3::{faces_of, piece_of, source_of};
 pub use format3::{Format3, Format3Piece, PieceChanges};
 pub use mesh::MESH_UNIT_SIZE;
 pub(crate) use query::fragment_overlaps_box;
+pub use transparent::{
+    TransparentMesh, TransparentVertex, EDGE_U_MAX, EDGE_U_MIN, EDGE_V_MAX, EDGE_V_MIN,
+};
 
 use crate::{FineBox, Shape, VolumeMaterial, WorldBounds, MATERIAL_COLORS};
 use lattice::Class;

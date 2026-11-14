@@ -455,3 +455,112 @@ fn private_world_meshes() {
         );
     }
 }
+
+/// Water and glass meshes on copies of private worlds: units, quads and the
+/// time to build them all; then a large water edit and its undo, with the
+/// units and shadow boxes each reports and the incremental meshes checked
+/// against fresh ones.
+#[test]
+#[ignore = "needs copies of private worlds in .local/"]
+fn private_water_and_glass_meshes() {
+    use super::tests::{all_transparent, transparent_bits};
+    println!(
+        "{:<12} {:>9} {:>8} {:>8} {:>10} {:>9} {:>10} {:>9} {:>8}",
+        "world",
+        "units",
+        "quads",
+        "mesh",
+        "edit opaque",
+        "edit wet",
+        "edit shadow",
+        "undo wet",
+        "undo opq"
+    );
+    for (name, path) in worlds() {
+        let f3 = load(&path);
+        let mut world = world_of(&f3);
+        let start = Instant::now();
+        let keys = world.transparent_keys();
+        let quads: usize = keys
+            .iter()
+            .map(|&k| world.transparent_chunk(k).quads())
+            .sum();
+        let meshed = start.elapsed();
+        // 64 m of water through the middle of the world.
+        let bounds = world.bounds().fine_box();
+        let mid: [i32; 3] = std::array::from_fn(|a| (bounds.min[a] + bounds.max[a]) / 2);
+        let region = FineBox {
+            min: mid.map(|v| v - 256),
+            max: mid.map(|v| v + 256),
+        };
+        let before = world.clone();
+        let mut meshes = all_transparent(&world);
+        let mut opaque = super::tests::all_meshes(&world);
+        let edit = crate::VolumeEdit {
+            bounds: region,
+            material: Some(crate::VolumeMaterial::Water),
+        };
+        if world.apply_volume_edits(&[edit]).is_err() {
+            println!("{name:<12} the edit is refused");
+            continue;
+        }
+        let started = Instant::now();
+        let changes = world.mesh_changes(&before);
+        let diffed = started.elapsed();
+        let started = Instant::now();
+        for key in &changes.opaque {
+            std::hint::black_box(world.mesh_chunk(*key));
+        }
+        let opaque_ms = started.elapsed();
+        let started = Instant::now();
+        for key in &changes.transparent {
+            std::hint::black_box(world.transparent_chunk(*key));
+        }
+        let wet_ms = started.elapsed();
+        println!(
+            "{name}: the edit's diff {:.2} ms, {} opaque units meshed in {:.2} ms, {} water and glass units in {:.2} ms",
+            diffed.as_secs_f64() * 1000.0,
+            changes.opaque.len(),
+            opaque_ms.as_secs_f64() * 1000.0,
+            changes.transparent.len(),
+            wet_ms.as_secs_f64() * 1000.0,
+        );
+        for key in &changes.transparent {
+            meshes.remove(key);
+            let bits = transparent_bits(&world, *key);
+            if !bits.is_empty() {
+                meshes.insert(*key, bits);
+            }
+        }
+        assert_eq!(meshes, all_transparent(&world), "{name}");
+        for key in &changes.opaque {
+            opaque.remove(key);
+            let mesh = super::tests::all_meshes_of(&world, *key);
+            if !mesh.is_empty() {
+                opaque.insert(*key, mesh);
+            }
+        }
+        assert_eq!(opaque, super::tests::all_meshes(&world), "{name}");
+        let edited = world.clone();
+        let undo = crate::VolumeEdit {
+            bounds: region,
+            material: None,
+        };
+        // Undoing restores the world's boxes as they were.
+        world.replace_volumes(before.volumes()).unwrap();
+        let _ = undo;
+        let back = world.mesh_changes(&edited);
+        println!(
+            "{:<12} {:>9} {:>8} {:>6.0}ms {:>10} {:>9} {:>10} {:>9} {:>8}",
+            name,
+            keys.len(),
+            quads,
+            meshed.as_secs_f64() * 1000.0,
+            changes.opaque.len(),
+            changes.transparent.len(),
+            changes.shadows.len(),
+            back.transparent.len(),
+            back.opaque.len(),
+        );
+    }
+}

@@ -80,17 +80,42 @@ for full and shaped leaves, conservative for pieces. A partly covered face is
 drawn whole, as Sauerbraten does, and depth testing hides the covered part.
 Cut faces where pieces of one source meet cover each other and are left out.
 Faces on the root's outer boundary are left out. `mesh_chunk` returns opaque
-surfaces only; water and glass are drawn from `volumes()`.
+surfaces only.
+
+`transparent_chunk` meshes a unit's water and glass, and `transparent_keys`
+lists the units owning any. A leaf that is not solid all through draws a face
+of its box wherever the cube beyond has another medium and does not cover it
+with solid geometry; a cube beyond of the same medium, or solid geometry
+covering the face, leaves it out, and a water-glass interface keeps both faces.
+Faces on the root's boundary are drawn. A leaf's own solid filling a face leaves
+it out, and a leaf solid all through draws nothing. Within a unit, coplanar faces
+of one medium merge into rectangles by joining whole edges, in a fixed order, so
+a unit's quads depend only on the tree. `TransparentVertex` is the vertex
+format: four vertices to a quad, outward counter-clockwise, with `uv` and `size`
+in metres along `u = (axis + 1) % 3` and `v = (axis + 2) % 3`, `material` 0 for
+water and 1 for glass, and `edges`, the `EDGE_*` bits of the quad's edges where
+the surface ends. An edge is flagged unless faces of the same surface, in any
+unit, or running on under solid geometry, continue along all of it; a partial
+continuation still flags the whole edge.
 
 Every write's units to build again come from the difference between the trees
 before and after, skipping shared subtrees: units owning a leaf with solid
 geometry that the write removed or added, and units owning a leaf beside
 changed geometry or beside a removed or added shaped leaf or piece, since a
 neighbour's coverage depends on that leaf's kind and box. `apply_root_edits`
-and `apply_patch` return them, and `changed_chunks` gives them for any other
-write, water and glass included. A client applies a `TransactionPatch` with
-`apply_patch`: the boxes first, then the metres, as the server applied the
-edit.
+returns them, and `changed_chunks` gives them for any other write, water and
+glass included. `mesh_changes(before)` gives everything a renderer builds again
+as a `MeshChanges`: `opaque` units (those of `changed_chunks`), `transparent`
+units (owning a water or glass leaf that was removed, added or changed, or one
+beside a change of cube material or of solid shape, a shaped leaf or a piece),
+and `shadows`, boxes in eighths around the solid shapes that differ, joined
+within each unit and grown by one eighth. `shadows` is what a cached shadow must
+refresh. It is empty for a change of surface materials, of water or glass, and
+for a solid leaf that only splits or merges, though that moves its faces between
+units and so lists `opaque` units. `apply_root_edits_changes`,
+`apply_edits_changes` and `apply_patch` return a `MeshChanges` too. A client
+applies a `TransactionPatch` with `apply_patch`: the boxes first, then the
+metres, as the server applied the edit.
 
 Rays, box overlap, containment, and support and ceiling queries walk the tree
 and handle each leaf kind once. Containment is exact integer arithmetic, and
@@ -113,8 +138,9 @@ but inert.
 
 Format 3 writes water and glass as boxes, and `World::volumes()` keeps them as a
 list of disjoint `MaterialVolume` boxes on the same eighth-metre grid: the
-loaded boxes until a change, after which only boxes the change touches differ,
-so unchanged glass keeps its boxes and their edge bands. Ordered `VolumeEdit`
+loaded boxes until a change, after which only boxes the change touches differ.
+The boxes serve saves, the wire and the editor; the renderer reads the tree and
+no longer calls `volumes()`, and edge bands follow surfaces, not boxes. Ordered `VolumeEdit`
 operations paint or clear water and glass without changing solid geometry;
 `apply_volume_edits` writes the edits' own boxes into the tree.
 `replace_volumes` writes cube material only where the new list differs from the

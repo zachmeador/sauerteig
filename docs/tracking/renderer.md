@@ -178,8 +178,9 @@ The maintainer approved these on 2026-11-13 with the native-first plan for
     fits in one or two units and culling keeps nearly all of it;
   - one block edit redraws 46,762 sun-shadow texels instead of 16,124.
 
-  O1b draws water and glass from the tree and changes the rebuild paths in
-  `render.rs`; N2 runs beside it, and the second to merge rebases.
+  O1b (merged 2026-11-14) draws water and glass from the tree per mesh unit
+  in one shared, sorted pool, and refreshes cached shadows only where solid
+  shape changed. N2 rebases onto it.
 - **Decided:**
   - **Lighting rule** (maintainer, 2026-11-11): every light is lit and shadowed
     the same way. Quality settings vary only detail (render scale, shadow
@@ -802,8 +803,8 @@ one-minute load average at the start of each measured invocation is given.
 
 State: running on branch `renderer-n2` since 2026-11-14, from the commit before
 octree O1a merged. The design lead rebases it onto the octree and reruns its
-measurements before merging. Octree O1b runs beside it and also edits
-`volume.wgsl` and `render.rs`; the second to merge rebases.
+measurements before merging. Octree O1b merged first and also edits
+`volume.wgsl` and `render.rs`, so N2 rebases onto it as well.
 
 - **Decided** (maintainer, 2026-11-13, under the lighting rule):
   - Every light is shadowed: 339 of 339 on the_cube1m, up from 149. No light

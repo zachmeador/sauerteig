@@ -36,6 +36,10 @@ impl Bounds {
         }
     }
 
+    pub fn overlaps(self, other: Self) -> bool {
+        self.min.cmple(other.max).all() && other.min.cmple(self.max).all()
+    }
+
     pub fn union(self, other: Self) -> Self {
         Self {
             min: self.min.min(other.min),

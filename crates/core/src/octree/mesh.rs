@@ -30,13 +30,13 @@ const CLIP_EPS: f64 = 1.0e-9;
 /// A point in 64ths of a metre on a face plane, as a fraction `x / d`,
 /// `y / d` with `d > 0`.
 #[derive(Clone, Copy)]
-struct Q {
-    x: i128,
-    y: i128,
-    d: i128,
+pub(super) struct Q {
+    pub(super) x: i128,
+    pub(super) y: i128,
+    pub(super) d: i128,
 }
 
-type P2 = [i128; 2];
+pub(super) type P2 = [i128; 2];
 
 fn cross(o: P2, a: P2, b: P2) -> i128 {
     (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
@@ -192,7 +192,7 @@ fn intersection_points(t: [P2; 3], r: Rect) -> Vec<Q> {
 
 /// Whether the union of a neighbour's faces on a plane, given as counter-
 /// clockwise triangles that do not overlap, holds every point.
-fn faces_hold(faces: &[[P2; 3]], points: &[Q]) -> bool {
+pub(super) fn faces_hold(faces: &[[P2; 3]], points: &[Q]) -> bool {
     if points.is_empty() {
         return true;
     }
@@ -214,17 +214,17 @@ fn faces_hold(faces: &[[P2; 3]], points: &[Q]) -> bool {
 
 /// One face of a leaf's box: its axis, its side and the plane it lies on.
 #[derive(Clone, Copy)]
-struct Face {
-    axis: usize,
-    positive: bool,
+pub(super) struct Face {
+    pub(super) axis: usize,
+    pub(super) positive: bool,
     /// The plane, in eighths.
-    plane: i32,
+    pub(super) plane: i32,
     /// The face's square on the plane, in eighths.
-    square: FineBox,
+    pub(super) square: FineBox,
 }
 
 impl Face {
-    fn of(at: NodeBox, k: usize) -> Self {
+    pub(super) fn of(at: NodeBox, k: usize) -> Self {
         let axis = k / 2;
         let positive = k % 2 == 1;
         let b = at.fine_box();
@@ -235,11 +235,11 @@ impl Face {
             square: b,
         }
     }
-    fn axes(self) -> (usize, usize) {
+    pub(super) fn axes(self) -> (usize, usize) {
         ((self.axis + 1) % 3, (self.axis + 2) % 3)
     }
     /// The one-eighth slab beyond the face.
-    fn beyond(self) -> FineBox {
+    pub(super) fn beyond(self) -> FineBox {
         let mut slab = self.square;
         if self.positive {
             slab.min[self.axis] = self.plane;
@@ -281,7 +281,7 @@ impl Face {
 
 /// A shape's triangles lying on its own box face `k`, as counter-clockwise
 /// triangles in 64ths on that plane.
-fn faces_on(shape: Shape, at: NodeBox, k: usize) -> Vec<[P2; 3]> {
+pub(super) fn faces_on(shape: Shape, at: NodeBox, k: usize) -> Vec<[P2; 3]> {
     let axis = k / 2;
     let level = if k % 2 == 1 { 8 } else { 0 };
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
@@ -311,7 +311,7 @@ fn lattice_face(t: [[i32; 3]; 3]) -> Option<usize> {
 }
 
 /// What the solids beyond a face are asked to cover.
-enum Region<'a> {
+pub(super) enum Region<'a> {
     /// The whole face square of a full leaf.
     Square,
     /// An exact triangle of a plain shape, counter-clockwise in 64ths.
@@ -329,7 +329,7 @@ enum Region<'a> {
 impl Octree {
     /// The side of a mesh unit in eighths: `MESH_UNIT_SIZE`, or the root when
     /// the root is smaller.
-    fn unit_size(&self) -> u32 {
+    pub(super) fn unit_size(&self) -> u32 {
         UNIT.min(self.root_box().size)
     }
 
@@ -363,7 +363,13 @@ impl Octree {
             return mesh;
         }
         let mut owned = Vec::new();
-        collect_owned(self.root_node(), self.root_box(), unit, &mut owned);
+        collect_owned(
+            self.root_node(),
+            self.root_box(),
+            unit,
+            &Node::has_geometry,
+            &mut owned,
+        );
         for (at, node) in owned {
             self.emit_leaf(at, node, &mut mesh);
         }
@@ -473,7 +479,7 @@ impl Octree {
 
     /// Whether one neighbour beyond a face covers the part of a region
     /// over its footprint.
-    fn neighbour_covers(
+    pub(super) fn neighbour_covers(
         &self,
         face: Face,
         k: usize,
@@ -525,21 +531,22 @@ impl Octree {
     }
 }
 
-/// The leaves with solid geometry whose minimum corner lies in a unit.
-fn collect_owned<'a>(
+/// The leaves a predicate keeps whose minimum corner lies in a unit.
+pub(super) fn collect_owned<'a>(
     node: &'a Node,
     at: NodeBox,
     unit: NodeBox,
+    keep: &dyn Fn(&Node) -> bool,
     out: &mut Vec<(NodeBox, &'a Node)>,
 ) {
     if at.size > unit.size {
         match node {
             Node::Branch(children) => {
                 let index = at.child_index(unit);
-                collect_owned(&children[index], at.child(index), unit, out);
+                collect_owned(&children[index], at.child(index), unit, keep, out);
             }
             leaf => {
-                if at.min == unit.min && leaf.has_geometry() {
+                if at.min == unit.min && keep(leaf) {
                     out.push((at, leaf));
                 }
             }
@@ -549,11 +556,11 @@ fn collect_owned<'a>(
     match node {
         Node::Branch(children) => {
             for (i, child) in children.iter().enumerate() {
-                collect_owned(child, at.child(i), unit, out);
+                collect_owned(child, at.child(i), unit, keep, out);
             }
         }
         leaf => {
-            if leaf.has_geometry() {
+            if keep(leaf) {
                 out.push((at, leaf));
             }
         }

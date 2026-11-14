@@ -36,7 +36,7 @@ use self::{
 use crate::lighting::{sun_cascades, LightDesc, ShadowMode, CASCADES};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
-use sauerteig_core::{ChunkKey, Mesh, World, WorldObject, FINE_UNITS, MESH_UNIT_SIZE};
+use sauerteig_core::{ChunkKey, Mesh, MeshChanges, World, WorldObject, FINE_UNITS, MESH_UNIT_SIZE};
 use std::{collections::BTreeMap, sync::Arc};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -220,6 +220,8 @@ pub struct Renderer {
     display: DisplayClock,
     /// Shadow maps rendered by the last frame: the sun's cascades and atlas faces.
     pub shadow_updates: usize,
+    /// Mesh units the last rebuild made again.
+    pub remeshed: Remeshed,
     /// Texels the last frame drew into the sun's cascades, cleared or redrawn.
     pub sun_texels: u64,
     camera_buffer: wgpu::Buffer,
@@ -255,6 +257,25 @@ pub struct Renderer {
     pub adapter_name: String,
     /// The adapter's name with its graphics API and driver.
     pub adapter_description: String,
+}
+
+/// How many mesh units the last rebuild made again, opaque and water or
+/// glass, and how many since the renderer started.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Remeshed {
+    pub opaque: usize,
+    pub transparent: usize,
+    pub total_opaque: usize,
+    pub total_transparent: usize,
+    /// Time the last rebuild spent meshing and uploading water and glass.
+    pub transparent_ms: f64,
+}
+
+impl Remeshed {
+    fn add_totals(&mut self) {
+        self.total_opaque += self.opaque;
+        self.total_transparent += self.transparent;
+    }
 }
 
 /// What the display and the frame loop say about timing, which Auto quality
@@ -673,6 +694,7 @@ impl Renderer {
             window,
             display: DisplayClock::new(options.display_hz),
             shadow_updates: 0,
+            remeshed: Remeshed::default(),
             sun_texels: 0,
             camera_buffer,
             materials,
@@ -936,6 +958,11 @@ impl Renderer {
             .collect();
         Ok(pixels)
     }
+    /// Mesh units holding water or glass, and the quads in the shared pool.
+    pub fn transparent_stats(&self) -> (usize, usize) {
+        self.volumes.stats()
+    }
+
     pub fn visible_triangles(&self) -> usize {
         self.visible_world_triangles
             + self.props.visible_triangles()
@@ -965,8 +992,17 @@ impl Renderer {
         self.lights.invalidate_all();
         self.chunks.clear();
         self.prints.clear();
-        self.rebuild_meshes(world, &world.chunk_keys());
-        self.rebuild_volumes(world);
+        let keys = world.chunk_keys();
+        self.rebuild_meshes(world, &keys, &[]);
+        let started = std::time::Instant::now();
+        self.volumes.rebuild_all(&self.device, &self.queue, world);
+        self.remeshed = Remeshed {
+            opaque: keys.len(),
+            transparent: self.volumes.stats().0,
+            transparent_ms: started.elapsed().as_secs_f64() * 1000.0,
+            ..self.remeshed
+        };
+        self.remeshed.add_totals();
     }
     /// Treat every cached shadow as stale, as after an edit that touches
     /// everything, without rebuilding any geometry.
@@ -974,13 +1010,36 @@ impl Renderer {
         self.sun.invalidate_all();
         self.lights.invalidate_all();
     }
-    pub fn rebuild_volumes(&mut self, world: &World) {
-        self.volumes.rebuild(&self.device, world);
+    /// Builds the units a change names again: opaque meshes, and water and
+    /// glass in the shared transparent pool. Cached shadows refresh only
+    /// where solid shapes changed, so a change of water, glass or surface
+    /// materials, or one that only moves faces between units, draws none.
+    pub fn rebuild(&mut self, world: &World, changes: &MeshChanges) {
+        let shadows: Vec<Bounds> = changes
+            .shadows
+            .iter()
+            .map(|b| Bounds {
+                min: Vec3::from_array(b.min.map(|v| v as f32 / FINE_UNITS as f32)),
+                max: Vec3::from_array(b.max.map(|v| v as f32 / FINE_UNITS as f32)),
+            })
+            .collect();
+        for &bounds in &shadows {
+            self.lights.invalidate_bounds(bounds);
+        }
+        self.rebuild_meshes(world, &changes.opaque, &shadows);
+        let started = std::time::Instant::now();
+        let transparent =
+            self.volumes
+                .rebuild(&self.device, &self.queue, world, &changes.transparent);
+        self.remeshed = Remeshed {
+            opaque: changes.opaque.len(),
+            transparent,
+            transparent_ms: started.elapsed().as_secs_f64() * 1000.0,
+            ..self.remeshed
+        };
+        self.remeshed.add_totals();
     }
-    pub fn rebuild(&mut self, world: &World, keys: &[ChunkKey]) {
-        self.rebuild_meshes(world, keys);
-    }
-    fn rebuild_meshes(&mut self, world: &World, keys: &[ChunkKey]) {
+    fn rebuild_meshes(&mut self, world: &World, keys: &[ChunkKey], shadows: &[Bounds]) {
         for &key in keys {
             let Mesh { vertices, indices } = world.mesh_chunk(key);
             let gpu: Vec<_> = vertices
@@ -997,25 +1056,17 @@ impl Renderer {
             // A mesh key is its unit's minimum corner in eighths of a metre.
             let min = Vec3::from_array(key.map(|v| v as f32 / FINE_UNITS as f32));
             let size = MESH_UNIT_SIZE as f32;
-            // Lights whose reach touches the old or new mesh redraw their tiles.
-            let mut dirty = Bounds {
-                min,
-                max: min + Vec3::splat(size),
-            };
-            if let Some(old) = self.chunks.get(&key) {
-                dirty = dirty.union(old.bounds);
-            }
             let mesh = GpuMesh::new(&self.device, &gpu, &indices);
-            if let Some(mesh) = &mesh {
-                dirty = dirty.union(mesh.bounds);
-            }
-            self.lights.invalidate_bounds(dirty);
-            // The sun redraws only where triangles differ from the old mesh's.
+            // The sun redraws only where triangles differ from the old mesh's,
+            // and only where a solid shape changed: faces that moved to
+            // another unit leave the shadow as it was.
             let started = std::time::Instant::now();
             let print = Fingerprint::of(min, size, &gpu, &indices);
             let old_print = self.prints.get(&key).copied().unwrap_or(Fingerprint::EMPTY);
             if let Some(changed) = print.changed_since(&old_print, min, size) {
-                self.sun.invalidate_bounds(changed);
+                if shadows.iter().any(|s| s.overlaps(changed)) {
+                    self.sun.invalidate_bounds(changed);
+                }
             }
             if print.is_empty() {
                 self.prints.remove(&key);

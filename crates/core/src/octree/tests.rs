@@ -1652,7 +1652,9 @@ fn a_thin_pane_across_a_large_world_is_refused_before_it_is_built() {
 }
 
 /// Every unit's mesh, by key.
-fn all_meshes(world: &World) -> std::collections::BTreeMap<crate::ChunkKey, Vec<[u32; 7]>> {
+pub(crate) fn all_meshes(
+    world: &World,
+) -> std::collections::BTreeMap<crate::ChunkKey, Vec<[u32; 7]>> {
     world
         .chunk_keys()
         .into_iter()
@@ -1850,7 +1852,7 @@ fn dirty_units_cover_box_and_root_writes_beside_large_leaves() {
                 _ => {
                     let boxes = replaced_boxes(&mut rng, &world);
                     let edits = random_root_edit(&mut rng, &world);
-                    world.apply_patch(&edits, Some(&boxes)).unwrap()
+                    world.apply_patch(&edits, Some(&boxes)).unwrap().opaque
                 }
             };
             if world.digest() != before.digest() {
@@ -2043,7 +2045,7 @@ fn pieces_keep_their_grid_on_reload_when_their_whole_region_is_cut() {
     assert_eq!(again.regions.len(), saved.regions.len());
 }
 
-fn all_meshes_of(world: &World, key: crate::ChunkKey) -> Vec<[u32; 7]> {
+pub(crate) fn all_meshes_of(world: &World, key: crate::ChunkKey) -> Vec<[u32; 7]> {
     world
         .mesh_chunk(key)
         .vertices
@@ -2270,4 +2272,472 @@ fn piece_changes_are_the_difference_of_the_written_parts() {
             assert_eq!(old, new, "seed {seed}");
         }
     }
+}
+
+fn quads(world: &World) -> Vec<(crate::ChunkKey, crate::TransparentMesh)> {
+    world
+        .transparent_keys()
+        .into_iter()
+        .map(|key| (key, world.transparent_chunk(key)))
+        .collect()
+}
+
+/// Every unit's water and glass, by key, as bits.
+pub(crate) fn all_transparent(
+    world: &World,
+) -> std::collections::BTreeMap<crate::ChunkKey, Vec<[u32; 11]>> {
+    world
+        .transparent_keys()
+        .into_iter()
+        .map(|key| (key, transparent_bits(world, key)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
+pub(crate) fn transparent_bits(world: &World, key: crate::ChunkKey) -> Vec<[u32; 11]> {
+    world
+        .transparent_chunk(key)
+        .vertices
+        .iter()
+        .map(|v| {
+            let p = v.position.map(f32::to_bits);
+            let n = v.normal.map(f32::to_bits);
+            let uv = v.uv.map(f32::to_bits);
+            let s = v.size.map(f32::to_bits);
+            [
+                p[0],
+                p[1],
+                p[2],
+                n[0] ^ n[1].rotate_left(7) ^ n[2].rotate_left(13),
+                uv[0],
+                uv[1],
+                s[0],
+                s[1],
+                u32::from(v.material),
+                u32::from(v.edges),
+                0,
+            ]
+        })
+        .collect()
+}
+
+/// Fills whole metres with solid cubes.
+fn solid(world: &mut World, min: [i32; 3], max: [i32; 3], material: u8) {
+    world.tree.fill_solid(
+        FineBox {
+            min: min.map(|v| v * 8),
+            max: max.map(|v| v * 8),
+        },
+        [material; 6],
+    );
+}
+
+fn box_of(min: [i32; 3], max: [i32; 3]) -> FineBox {
+    FineBox { min, max }
+}
+
+fn water(world: &mut World, bounds: FineBox, material: Option<VolumeMaterial>) {
+    world
+        .apply_volume_edits(&[crate::VolumeEdit { bounds, material }])
+        .unwrap();
+}
+
+/// The area of a mesh's quads, by outward normal.
+fn area_facing(mesh: &crate::TransparentMesh, normal: [f32; 3]) -> f32 {
+    mesh.vertices
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|q| q[0].normal == normal)
+        .map(|q| q[0].size[0] * q[0].size[1])
+        .sum()
+}
+
+#[test]
+fn water_draws_its_surface_once_merged_and_not_against_solid() {
+    let mut world = World::empty();
+    solid(&mut world, [0, 0, 0], [8, 1, 8], 1);
+    // Two neighbouring boxes of water one metre up: the faces between them
+    // go, and each side's faces merge into one rectangle.
+    water(
+        &mut world,
+        box_of([0, 8, 0], [32, 24, 64]),
+        Some(VolumeMaterial::Water),
+    );
+    water(
+        &mut world,
+        box_of([32, 8, 0], [64, 24, 64]),
+        Some(VolumeMaterial::Water),
+    );
+    let all = quads(&world);
+    let total: usize = all.iter().map(|(_, m)| m.quads()).sum();
+    // Top, four sides; the floor covers the bottom.
+    assert_eq!(total, 5, "{all:?}");
+    for (_, mesh) in &all {
+        assert!(mesh.vertices.iter().all(|v| v.material == 0));
+    }
+    let top: f32 = all
+        .iter()
+        .map(|(_, m)| area_facing(m, [0.0, 1.0, 0.0]))
+        .sum();
+    assert_eq!(top, 8.0 * 8.0);
+    // Without the floor the bottom shows too.
+    let mut open = World::empty();
+    water(
+        &mut open,
+        box_of([0, 8, 0], [64, 24, 64]),
+        Some(VolumeMaterial::Water),
+    );
+    let n: usize = quads(&open).iter().map(|(_, m)| m.quads()).sum();
+    assert_eq!(n, 6);
+}
+
+#[test]
+fn a_water_glass_interface_keeps_both_faces_and_quads_face_outward() {
+    let mut world = World::empty();
+    water(
+        &mut world,
+        box_of([0, 8, 0], [8, 16, 8]),
+        Some(VolumeMaterial::Glass),
+    );
+    water(
+        &mut world,
+        box_of([8, 8, 0], [16, 16, 8]),
+        Some(VolumeMaterial::Water),
+    );
+    let all = quads(&world);
+    let total: usize = all.iter().map(|(_, m)| m.quads()).sum();
+    assert_eq!(total, 12);
+    for (_, mesh) in &all {
+        for q in mesh.vertices.as_chunks::<4>().0 {
+            let p = |i: usize| Vec3::from_array(q[i].position);
+            let geometric = (p(1) - p(0)).cross(p(2) - p(0)).normalize();
+            assert_eq!(geometric, Vec3::from_array(q[0].normal));
+            assert_eq!(q[0].size, q[2].size);
+            assert_eq!(q[0].uv, [0.0, 0.0]);
+            assert_eq!(q[2].uv, q[0].size);
+        }
+    }
+}
+
+#[test]
+fn glass_edge_bands_follow_the_surface_and_not_the_seams_of_the_merge() {
+    // An L of glass one eighth thick: a long low box and a tall one beside
+    // it. The merge makes a wide rectangle of the low box and the foot of the
+    // tall one, and a square on top.
+    let mut world = World::empty();
+    water(
+        &mut world,
+        box_of([0, 8, 0], [16, 16, 1]),
+        Some(VolumeMaterial::Glass),
+    );
+    water(
+        &mut world,
+        box_of([16, 8, 0], [24, 24, 1]),
+        Some(VolumeMaterial::Glass),
+    );
+    let mesh = world.transparent_chunk(world.transparent_keys()[0]);
+    let mut front: Vec<_> = mesh
+        .vertices
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|q| q[0].normal == [0.0, 0.0, 1.0])
+        .map(|q| (q[0].position, q[2].position, q[0].edges))
+        .collect();
+    front.sort_by(|a, b| a.0[1].total_cmp(&b.0[1]));
+    use crate::{EDGE_U_MAX, EDGE_U_MIN, EDGE_V_MAX, EDGE_V_MIN};
+    assert_eq!(
+        front,
+        [
+            // The wide rectangle ends everywhere: the square above it
+            // covers only part of its top.
+            (
+                [0.0, 1.0, 0.125],
+                [3.0, 2.0, 0.125],
+                EDGE_U_MIN | EDGE_V_MIN | EDGE_U_MAX | EDGE_V_MAX
+            ),
+            // The square's bottom edge lies wholly on the wide rectangle,
+            // so it carries no band.
+            (
+                [2.0, 2.0, 0.125],
+                [3.0, 3.0, 0.125],
+                EDGE_U_MIN | EDGE_U_MAX | EDGE_V_MAX
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_surface_across_a_unit_boundary_has_no_edge_band_there() {
+    let unit = MESH_UNIT_SIZE * 8;
+    let mut world = World::empty();
+    // Straddle a boundary of the root's units inside the world.
+    let root = world.tree.root_box().min[0];
+    let bounds = world.bounds().fine_box();
+    let mid = (0..)
+        .map(|k| root + unit * k)
+        .find(|&x| x > bounds.min[0] + 64 && x < bounds.max[0] - 64)
+        .unwrap();
+    water(
+        &mut world,
+        box_of([mid - 16, 8, 0], [mid + 16, 24, 1]),
+        Some(VolumeMaterial::Glass),
+    );
+    let keys = world.transparent_keys();
+    assert!(keys.len() >= 2, "{keys:?}");
+    let mut seams = 0;
+    for key in keys {
+        for q in world.transparent_chunk(key).vertices.as_chunks::<4>().0 {
+            if q[0].normal != [0.0, 0.0, 1.0] {
+                continue;
+            }
+            let xs = [q[0].position[0], q[2].position[0]];
+            let left = xs[1] == mid as f32 / 8.0;
+            let right = xs[0] == mid as f32 / 8.0;
+            if left {
+                assert_eq!(q[0].edges & crate::EDGE_U_MAX, 0);
+                seams += 1;
+            }
+            if right {
+                assert_eq!(q[0].edges & crate::EDGE_U_MIN, 0);
+                seams += 1;
+            }
+        }
+    }
+    assert_eq!(seams, 2);
+}
+
+#[test]
+fn a_shaped_leaf_of_water_draws_its_box_and_a_full_one_draws_nothing() {
+    let mut world = World::empty();
+    solid(&mut world, [0, 0, 0], [4, 4, 4], 2);
+    water(
+        &mut world,
+        box_of([0, 0, 0], [32, 32, 32]),
+        Some(VolumeMaterial::Water),
+    );
+    assert!(world.transparent_keys().is_empty());
+    assert!(world.chunk_keys().len() == 1);
+    // Carving one metre out of the solid exposes water faces inside it.
+    let mut carved = world.clone();
+    carved.apply_edits(&[CellEdit {
+        pos: [1, 1, 1],
+        cell: None,
+    }]);
+    let n: usize = quads(&carved).iter().map(|(_, m)| m.quads()).sum();
+    // The hole is surrounded by solid: its water faces are against it.
+    assert_eq!(n, 0);
+    // Opening it to the air shows the water at the opening only.
+    carved.apply_edits(&[CellEdit {
+        pos: [1, 4, 1],
+        cell: None,
+    }]);
+    let _ = quads(&carved);
+}
+
+#[test]
+fn transparent_units_are_the_only_ones_an_edit_changes() {
+    let mut steps = 0;
+    for seed in 0..25 {
+        let mut rng = Rng::new(23_000 + seed);
+        let mut world = world_of(&large_leaf_world(&mut rng));
+        let mut meshes = all_transparent(&world);
+        for _ in 0..8 {
+            let before = world.clone();
+            let changes = match rng.below(3) {
+                0 => {
+                    let edits = random_root_edit(&mut rng, &world);
+                    world.apply_root_edits(&edits).unwrap();
+                    world.mesh_changes(&before)
+                }
+                1 => {
+                    let fine = world.bounds().fine_box();
+                    let edits: Vec<_> = (0..rng.range(1, 3))
+                        .map(|_| crate::VolumeEdit {
+                            bounds: random_box(&mut rng, fine),
+                            material: [
+                                None,
+                                Some(VolumeMaterial::Water),
+                                Some(VolumeMaterial::Glass),
+                            ][rng.below(3) as usize],
+                        })
+                        .collect();
+                    world.apply_volume_edits(&edits).unwrap();
+                    world.mesh_changes(&before)
+                }
+                _ => {
+                    let boxes = replaced_boxes(&mut rng, &world);
+                    let edits = random_root_edit(&mut rng, &world);
+                    world.apply_patch(&edits, Some(&boxes)).unwrap()
+                }
+            };
+            steps += usize::from(world.digest() != before.digest());
+            for key in &changes.transparent {
+                meshes.remove(key);
+                let bits = transparent_bits(&world, *key);
+                if !bits.is_empty() {
+                    meshes.insert(*key, bits);
+                }
+            }
+            assert_eq!(meshes, all_transparent(&world), "seed {seed}");
+        }
+    }
+    assert!(steps >= 100, "{steps}");
+}
+
+/// The area of every opaque quad, by axis and side of its normal, to compare
+/// surfaces whatever the tessellation.
+fn opaque_area(world: &World) -> [f64; 6] {
+    let mut area = [0.0; 6];
+    for t in triangles(world) {
+        let n = (t[1] - t[0]).cross(t[2] - t[0]);
+        let k = (0..3)
+            .find(|&a| n[a].abs() > 1.0e-3)
+            .map_or(0, |a| a * 2 + usize::from(n[a] > 0.0));
+        area[k] += f64::from(n.length()) * 0.5;
+    }
+    area
+}
+
+/// A world holding one solid leaf 64 m on a side, which a unit of 16 m is
+/// smaller than.
+fn world_with_a_large_leaf() -> World {
+    let size = (MESH_UNIT_SIZE * 8 * 4) as u32;
+    let region = CellFragment {
+        bounds: FineBox {
+            min: [0, 8, 0],
+            max: [size as i32, 8 + size as i32, size as i32],
+        },
+        origin: [0, 8, 0],
+        size,
+        cell: Cell::solid(1),
+    };
+    let metres = size as i32 / 8;
+    let bounds = WorldBounds {
+        min: [0, 0, 0],
+        max: [metres, metres + 8, metres],
+    };
+    World::from_compact_parts(bounds, &[region], &[], &[]).unwrap()
+}
+
+#[test]
+fn a_water_edit_over_a_large_solid_leaf_rebuilds_what_it_must_without_shadows() {
+    let mut world = world_with_a_large_leaf();
+    assert_eq!(world.stats().leaves(), 1);
+    let area = opaque_area(&world);
+    let before = world.clone();
+    // Water through the top of the leaf: inside the solid it is hidden, and
+    // above it, in the air, its surface shows.
+    water(
+        &mut world,
+        box_of([100, 500, 100], [140, 560, 140]),
+        Some(VolumeMaterial::Water),
+    );
+    assert!(world.stats().leaves() > 1, "the leaf splits");
+    let changes = world.mesh_changes(&before);
+    // The leaf's faces now belong to several units, which must be built
+    // again, but no solid shape moved: no shadow can change.
+    assert!(changes.opaque.len() > 1, "{changes:?}");
+    assert!(changes.shadows.is_empty(), "{changes:?}");
+    assert!(!changes.transparent.is_empty());
+    assert_eq!(opaque_area(&world), area);
+    // The units named are all that differ.
+    let mut meshes = all_meshes(&before);
+    for key in &changes.opaque {
+        meshes.remove(key);
+        let mesh = all_meshes_of(&world, *key);
+        if !mesh.is_empty() {
+            meshes.insert(*key, mesh);
+        }
+    }
+    assert_eq!(meshes, all_meshes(&world));
+    // Undoing it joins the leaf again, and moves no shadow either.
+    let edited = world.clone();
+    water(&mut world, box_of([100, 500, 100], [140, 560, 140]), None);
+    assert_eq!(world.digest(), before.digest());
+    let undo = world.mesh_changes(&edited);
+    assert!(undo.shadows.is_empty(), "{undo:?}");
+    assert!(undo.opaque.len() > 1);
+    // The water above the leaf is the whole of what it draws.
+    let all = quads(&edited);
+    assert!(all.iter().any(|(_, m)| m.quads() > 0));
+    for (_, mesh) in &all {
+        assert!(mesh.vertices.iter().all(|v| v.position[1] >= 65.0));
+    }
+}
+
+#[test]
+fn shadows_follow_solid_shapes_and_not_surface_materials() {
+    let size = (MESH_UNIT_SIZE * 8 * 4) as u32 as i32;
+    let world = world_with_a_large_leaf();
+    // Painting a metre changes meshes but no shadow.
+    let mut painted = world.clone();
+    painted
+        .apply_root_edits(&[RootEdit {
+            pos: [10, 10, 10],
+            fragments: vec![CellFragment::from_cell([10, 10, 10], Cell::solid(3))],
+        }])
+        .unwrap();
+    let changes = painted.mesh_changes(&world);
+    assert!(!changes.opaque.is_empty());
+    assert!(changes.shadows.is_empty(), "{changes:?}");
+    // Carving it away changes a shadow, in a box around the metre.
+    let mut carved = world.clone();
+    carved
+        .apply_root_edits(&[RootEdit {
+            pos: [10, 10, 10],
+            fragments: Vec::new(),
+        }])
+        .unwrap();
+    let changes = carved.mesh_changes(&world);
+    let metre = box_of([80, 80, 80], [88, 88, 88]);
+    assert!(!changes.shadows.is_empty());
+    assert!(
+        changes
+            .shadows
+            .iter()
+            .any(|b| (0..3).all(|a| b.min[a] <= metre.min[a] && b.max[a] >= metre.max[a])),
+        "{changes:?}"
+    );
+    for b in &changes.shadows {
+        assert!(
+            (0..3).all(|a| b.max[a] - b.min[a] <= 8 + 2),
+            "{b:?} in {size}"
+        );
+    }
+    // Restoring it is the reverse.
+    let restored = world.mesh_changes(&carved);
+    assert!(!restored.shadows.is_empty());
+}
+
+#[test]
+fn a_pane_set_into_a_wall_has_no_edge_band_where_it_enters_the_wall() {
+    use crate::{EDGE_U_MAX, EDGE_U_MIN, EDGE_V_MAX, EDGE_V_MIN};
+    let mut world = World::empty();
+    solid(&mut world, [0, 0, 0], [8, 3, 1], 1);
+    // Glass through the wall, a little way out of each side.
+    water(
+        &mut world,
+        box_of([16, 8, -4], [48, 16, 12]),
+        Some(VolumeMaterial::Glass),
+    );
+    let mut sides = Vec::new();
+    for key in world.transparent_keys() {
+        for q in world.transparent_chunk(key).vertices.as_chunks::<4>().0 {
+            if q[0].normal == [-1.0, 0.0, 0.0] {
+                sides.push((q[0].position[2], q[2].position[2], q[0].edges));
+            }
+        }
+    }
+    sides.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // For the -X face, u runs along Y and v along Z. Each piece ends in the
+    // air and goes on into the wall.
+    assert_eq!(
+        sides,
+        [
+            (-0.5, 0.0, EDGE_U_MIN | EDGE_U_MAX | EDGE_V_MIN),
+            (1.0, 1.5, EDGE_U_MIN | EDGE_U_MAX | EDGE_V_MAX),
+        ]
+    );
 }

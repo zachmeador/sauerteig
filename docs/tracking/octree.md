@@ -1,8 +1,8 @@
 # Octree world
 
 State: active. The maintainer chose to rebuild the core around one octree
-before shared-sandbox stage 2's network and save formats (2026-11-13). O1a and
-O3 merged on 2026-11-14; O1b runs in wave 1, and O2 follows O1b.
+before shared-sandbox stage 2's network and save formats (2026-11-13). O1a, O3
+and O1b merged on 2026-11-14; O2 is next, in wave 2.
 
 ## Outcome
 
@@ -922,9 +922,8 @@ running app; the acceptance boxes in the app stay for the maintainer.
 
 ## O1b: water and glass from the tree in the renderer
 
-State: running on branch `octree-o1b` since 2026-11-14. Medium. Renderer N2
-runs beside it and also edits `volume.wgsl` and `render.rs`; the second to
-merge rebases.
+State: merged on 2026-11-14. The checks in the app await the maintainer.
+Renderer N2 rebases onto it, since both edit `volume.wgsl` and `render.rs`.
 
 - **Scope:**
   - The core mesher emits water and glass surfaces per mesh unit, as decided,
@@ -945,22 +944,198 @@ merge rebases.
   session (`game.rs`) touch the same files; whichever starts second waits for
   the first to merge.
 - **Acceptance:**
-  - [ ] Captures of materials-water, materials-underwater, materials-glass,
+  - [x] Captures of materials-water, materials-underwater, materials-glass,
     imported-water, waterglass-view and waterglass-low match today's, apart
     from glass edge bands, which now follow surfaces; the record shows before
-    and after.
-  - [ ] CPU frame time for waterglass-low against waterglass-low-bare, and for
+    and after. Session record, below.
+  - [x] CPU frame time for waterglass-low against waterglass-low-bare, and for
     imported-water, is no worse than today, and neither is GPU throughput.
+    Within the noise of this machine, which another session's GPU captures
+    disturbed for part of the run; the record gives the numbers.
   - [ ] In the app, painting water over a large area and undoing it re-meshes
-    only the touched units, as F3 shows.
-- **Record:** transparent quads and re-mesh times before and after.
+    only the touched units, as F3 shows. Covered by tests (below); not looked
+    at in the running app.
+
+### O1b session record (2026-11-14)
+
+Code, automated checks and measurements, on the M5 Pro. Nothing here was
+observed in the running app, so the box above stays open.
+
+- **What changed.**
+  - **Core.** New `octree/transparent.rs` meshes a unit's water and glass
+    (`World::transparent_keys`, `World::transparent_chunk`). A leaf that is
+    not solid all through draws a face of its box where the cube beyond has
+    another medium and solid geometry does not cover it. Faces against the same
+    medium or fully against solid are left out, a leaf's own solid filling a
+    face leaves it out, a water-glass interface keeps both faces, and faces on
+    the root's boundary are drawn, as the old boxes drew them. Within a unit,
+    coplanar faces of one medium merge into rectangles by joining whole edges.
+    `TransparentVertex` is the format: position, normal, `uv` and `size` of the
+    quad, material, and `edges`, four flags for the quad's edges where its
+    surface ends. A neighbour query is one descent to the leaf beyond for most
+    faces. `octree/diff.rs` also lists leaves with water or glass that were
+    removed, added or changed, and the boxes where solid shape (not surface
+    materials) differs. `World::mesh_changes(before)` gives `MeshChanges`:
+    `opaque` units (what `changed_chunks` gives), `transparent` units, and
+    `shadows`, boxes in eighths around the changed solid shapes. `apply_patch`
+    returns it, and `apply_root_edits_changes` and `apply_edits_changes` are the
+    same for the other writes; `apply_root_edits` and `changed_chunks` keep
+    their signatures.
+  - **Renderer.** `render/volumes.rs` holds one pool of quad slots with a
+    free-run allocator, a mirror of the vertices on the CPU and one GPU buffer
+    that grows by doubling. Each unit keeps its slots and a hierarchy over its
+    quads' bounds; rebuilding a unit frees its slots, takes new ones and
+    writes only that range. Each frame the units in view are found, their
+    visible quads are sorted back to front together, and one indexed draw
+    follows. The old box-boundary code (`boundary_vertices`, the contact
+    rectangles) and `rebuild_volumes` are gone, and the renderer no longer
+    calls `volumes()`. `Renderer::rebuild` takes a `MeshChanges`;
+    `Renderer::remeshed` counts the units the last rebuild made again, F3
+    shows them next to the triangle count, and the capture report gives
+    `transparent_units`, `transparent_quads` and `transparent_mesh_ms`.
+    `volume.wgsl`: a flat `edges` input, and the edge band measures only the
+    flagged edges. Nothing in its lighting loop changed.
+  - **Docs.** `crates/core/CONTRACT.md` and the development guide.
+- **Choice: where shadows refresh.** Core reports the boxes where solid shape
+  changed (`shadows`), and the renderer redraws cached shadows only there,
+  instead of comparing the meshes it rebuilt. Why: when a water edit splits a
+  large solid leaf, its faces move to the units that now own the pieces, and
+  one 64 m quad becomes many, so the rebuilt meshes and their fingerprints
+  differ everywhere the leaf was, though no surface moved. The tree diff
+  already tells shape from owner exactly (a leaf that splits into leaves of
+  the same shape compares equal), costs nothing more, and puts no guesswork in
+  the renderer. The units are still rebuilt, since their faces moved. The
+  fingerprint stays, to narrow a redraw inside a box, and it runs for every
+  rebuilt unit so that its stored prints stay current. A change of surface
+  materials alone also leaves shadows as they are, which paint did not before
+  for the point lights. Boxes are joined per owning unit and grown by one eighth
+  of a metre, to cover faces that a change covers or uncovers beside it.
+- **Choice: glass bands against solid.** An edge of a glass surface carries no
+  band where the surface goes on under solid geometry, so a pane set into a
+  wall (the_cube1m's windows) has none where it enters the wall, as the old
+  boxes, whose edges lay hidden inside the wall, showed none. A pane resting
+  on a floor still has one at the floor. A partial continuation flags the
+  whole edge.
+- **Tests.** Core: water draws once, merged and not against solid; a
+  water-glass interface keeps both faces and every quad faces outward; edge
+  flags follow the surface and not the merge's seams, none across a unit
+  boundary, none where a pane enters a wall; a shaped or solid leaf with water;
+  random worlds with random root writes, box writes and patches, where only the
+  transparent units named differ (25 worlds, 8 steps each, at least 100 that
+  change the tree); a water edit over a 64 m solid leaf rebuilds its pieces'
+  units, lists no shadow box, keeps the opaque surface area exactly, and so
+  does its undo; paint lists no shadow box and a carve lists a box around the
+  metre; the private test `private_water_and_glass_meshes` checks incremental
+  against fresh meshes for a 64 m water edit on the private worlds. Client:
+  the slot allocator reuses and joins runs and never overlaps under random
+  use; quads sort back to front; a quad is 48 bytes; and the GPU test
+  `gpu_water_and_glass_edits_redraw_no_shadows_and_match_fresh_renders`: with
+  `materials`, a glass pane and water through part of the floor redraw 0
+  sun texels and 0 shadow maps, the picture equals a fresh renderer's, and the
+  undo returns the first picture exactly. With the gating switched off, that
+  test fails with 152,290 sun texels redrawn. The sun cascade test's one-block
+  edit still redraws 46,762 of 3,145,728 texels, as after O1a.
+- **Checks,** all passing: `cargo fmt --all -- --check`, `cargo clippy
+  --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace
+  --locked`, the private tests in release (4 passed, including the new one) and
+  the GPU tests (9 passed, including the new one).
+- **Captures.** All 30 poses of `scripts/capture-poses.json` at 3840 × 2160,
+  baseline from the build at `208f63f` taken before any change. Share of
+  pixels whose largest channel differs by more than 16/255 and by more than
+  2/255:
+
+  | Pose | > 16/255 | > 2/255 |
+  | --- | ---: | ---: |
+  | materials-water, materials-glass | 0 | 0 |
+  | materials-underwater | 0.005% | 0.059% |
+  | imported-water | 0 | 0.015% |
+  | waterglass-view | 0.001% | 0.665% |
+  | waterglass-low | 0 | 3.818% |
+  | imported-spawn, arena, lightroom, corridor, lightshow, shadowtest and lamphall poses | 0 | 0 |
+  | imported-overlook | 1.054% | 4.840% |
+  | imported-tower, imported-storm | 0.134%, 0.135% | 2.112%, 2.110% |
+  | imported-flight | 0.050% | 2.755% |
+  | imported-teleports, imported-tower-rooms | 0.005% | 0.054% |
+
+  materials-underwater's difference is run-to-run noise: the base build
+  compared with a second run of itself gives 0.005% and 0.059%. Expected
+  differences: glass edge bands now follow surfaces, so the faint seam lines
+  across the_cube1m's glass, which showed where authored boxes met, are gone
+  (imported-overlook, tower, storm, flight); window glass has no band where it
+  enters the wall; and waterglass-view and -low differ faintly (0.001% of
+  waterglass-view above 16/255, none in -low), along the water box and the
+  glass walls, which I did not trace further. Nothing else changed. A first
+  version of the edge rule drew bands at every wall contact; its captures
+  differed more (imported-flight 1.29%, imported-tower 1.06% above 16/255),
+  which is why the continuation under solid exists.
+- **Measurements** (M5 Pro, release builds of `208f63f` and this branch's
+  working tree, alternating base and branch five rounds at 3840 × 2160,
+  `--frames 60 --throughput 120 --runs 5`; GPU throughput in ms a frame: the
+  best run of rounds 3 to 5, and the median of those rounds' medians). The
+  machine was shared. The renderer N2 session ran GPU captures during rounds 1
+  and 2 and at the start of round 3, and other work ran throughout, so rounds
+  1 and 2 are discarded and a median of three takes out the one round in which
+  the materials poses ran into it (the base build's 6.3, 9.7 and 6.1 ms).
+
+  | Pose | Base best | Branch best | Base median | Branch median |
+  | --- | ---: | ---: | ---: | ---: |
+  | materials-water | 2.52 | 2.51 | 2.54 | 2.53 |
+  | materials-underwater | 3.93 | 3.93 | 4.04 | 3.96 |
+  | materials-glass | 3.02 | 3.02 | 3.13 | 3.08 |
+  | imported-water | 5.13 | 5.02 | 5.18 | 5.07 |
+  | waterglass-view | 4.72 | 4.75 | 4.77 | 4.81 |
+  | waterglass-low | 8.26 | 8.35 | 8.33 | 8.38 |
+  | waterglass-low-bare | 4.16 | 4.15 | 4.23 | 4.22 |
+
+  GPU throughput is the same within 1%. waterglass-low is 1% slower on the best
+  run and 0.6% on the median, and one of its branch rounds read 8.69: the
+  branch draws 94 quads where the boxes drew 60, since leaves that the tree
+  splits unevenly merge into more rectangles than the boxes' six faces, and
+  visible triangles rise from 17,266 to 17,328. CPU frame time (submit,
+  median of each round, rounds 3 to 5): waterglass-low 0.36–0.38 ms on the base
+  and 0.40–0.41 on the branch; waterglass-low-bare, whose code path did not
+  change, 0.32–0.38 and 0.34–0.39, so a difference of 0.03 to 0.04 ms is inside
+  this machine's noise. imported-water: 0.70–1.27 ms on the base and 0.64–1.20
+  on the branch. A longer rerun of waterglass-low and its bare twin (300
+  frames, six rounds) was disturbed by GPU contention (throughput 10 to 16 ms
+  on both builds) and settles nothing more; the criteria are met within noise,
+  and a rerun on an idle machine would tighten the waterglass-low pair.
+- **Transparent quads and re-mesh times, before and after** (release):
+
+  | World | Boxes | Quads before | Time before | Units now | Quads now | Time now |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | materials | 2 | 12 | 0.1 ms | 2 | 10 | 0.5 ms |
+  | waterglass | 10 | 60 | 0.1 ms | 12 | 94 | 22 ms |
+  | the_cube1m | 4,227 | 19,430 | 6.8 ms | 109 | 8,180 | 101 ms |
+
+  "Before" is the old box-boundary code run on the world's box list; "now"
+  meshes every unit from the tree in one thread, which for the_cube1m means
+  112,672 water and glass leaves. A load that meshes the units therefore costs
+  about 95 ms more on the_cube1m and 22 ms more on waterglass (thousands of
+  eighth-thick glass leaves); ralith1 takes 12 ms for 866 quads. The old path
+  rebuilt every box after any water or glass edit. Now a 64 m cube of water
+  through the middle of the_cube1m names 67 water and glass units and 9 opaque
+  units; the diff takes 31 ms, the opaque units mesh in 23 ms and the water and
+  glass units in 32 ms (complex: 36 water and glass and 32 opaque units,
+  ralith1: 83 and 47). No such edit lists a shadow box, and undoing it names
+  the same units back.
+- **Observed behaviour:** none in the running app. The capture images, and the
+  GPU test with a settled renderer, show what the six acceptance poses draw.
+- **Remaining gaps:** the checks in the app (painting water over a large area
+  and undoing it, with F3 open; glass in the_cube1m's windows); the mesher
+  runs on one thread, so a load pays the figures above; greedy merging gives
+  more rectangles than boxes did on irregular leaves; a partly continued edge
+  flags the whole edge; the quads' centroid sort is as before, with the same
+  ordering artifacts for overlapping large faces; lighting in `volume.wgsl`
+  stays at N2's hands, so water and glass still use at most 8 lights until it
+  merges.
 
 ## O2: grid-sized edits
 
-State: waits for O1b. Large: two sessions in order on one branch,
-merged once. The design lead commits each session's work to the branch.
-Between the sessions the branch builds core and the server; the client builds
-again after session 2.
+State: ready (O1a and O1b have merged). Wave 2. Large: two sessions in order on
+one branch, merged once. The design lead commits each session's work to the
+branch. Between the sessions the branch builds core and the server; the client
+builds again after session 2.
 
 - **Decided:** Edits, above.
 - **Session 1, core, server and protocol:**

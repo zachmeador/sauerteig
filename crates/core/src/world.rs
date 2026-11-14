@@ -192,6 +192,28 @@ pub struct Mesh {
     pub indices: Vec<u32>,
 }
 
+/// What a renderer builds again after the world changed, found from the
+/// difference between two trees.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshChanges {
+    /// Mesh units whose opaque mesh to build again.
+    pub opaque: Vec<ChunkKey>,
+    /// Mesh units whose water and glass to build again.
+    pub transparent: Vec<ChunkKey>,
+    /// Where a shadow can have changed, in eighths of a metre: boxes around
+    /// the solid shapes that differ, joined within each mesh unit. Empty when
+    /// only surface materials, water, glass, or the way solid leaves split
+    /// and merge changed, since none of those moves a shadow. A unit whose
+    /// opaque mesh is built again may lie outside every box.
+    pub shadows: Vec<crate::FineBox>,
+}
+
+impl MeshChanges {
+    pub fn is_empty(&self) -> bool {
+        self.opaque.is_empty() && self.transparent.is_empty() && self.shadows.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct RayHit {
     pub pos: CellPos,
@@ -435,6 +457,14 @@ impl World {
         self.tree.dirty_units(&self.tree.changes_from(&before.tree))
     }
 
+    /// Everything to build again after this world changed from `before`,
+    /// whatever wrote the change: the opaque units of `changed_chunks`, the
+    /// units whose water and glass changed, and where shadows can differ.
+    pub fn mesh_changes(&self, before: &World) -> MeshChanges {
+        self.tree
+            .mesh_changes(&self.tree.changes_from(&before.tree))
+    }
+
     /// Applies a transaction patch in the order the server applied its edit:
     /// the water and glass boxes, then the metres. The world changes only if
     /// both apply. The server has checked the world's guard, so the box
@@ -444,15 +474,15 @@ impl World {
         &mut self,
         roots: &[crate::RootEdit],
         volumes: Option<&[crate::MaterialVolume]>,
-    ) -> Result<Vec<ChunkKey>, String> {
+    ) -> Result<MeshChanges, String> {
         let mut world = self.clone();
         if let Some(volumes) = volumes {
             world.replace_volumes(volumes)?;
         }
         world.apply_root_edits(roots)?;
-        let chunks = world.changed_chunks(self);
+        let changes = world.mesh_changes(self);
         *self = world;
-        Ok(chunks)
+        Ok(changes)
     }
 
     /// Mesh units holding solid geometry, by their keys: each unit's minimum
@@ -461,14 +491,34 @@ impl World {
         self.tree.mesh_keys()
     }
 
-    /// The opaque surfaces of one mesh unit. Water and glass are drawn from
-    /// `volumes()`.
+    /// The opaque surfaces of one mesh unit.
     pub fn mesh_chunk(&self, key: ChunkKey) -> Mesh {
         self.tree.mesh_unit(key)
     }
 
+    /// Mesh units owning a leaf that draws water or glass, by their keys.
+    pub fn transparent_keys(&self) -> Vec<ChunkKey> {
+        self.tree.transparent_keys()
+    }
+
+    /// The water and glass surfaces of one mesh unit.
+    pub fn transparent_chunk(&self, key: ChunkKey) -> crate::TransparentMesh {
+        self.tree.transparent_unit(key)
+    }
+
     pub fn apply_edits(&mut self, edits: &[CellEdit]) -> Vec<ChunkKey> {
-        let roots: Vec<_> = edits
+        let roots = self.roots_of(edits);
+        self.apply_root_edits(&roots).unwrap_or_default()
+    }
+
+    /// `apply_edits`, returning everything a renderer builds again.
+    pub fn apply_edits_changes(&mut self, edits: &[CellEdit]) -> MeshChanges {
+        let roots = self.roots_of(edits);
+        self.apply_root_edits_changes(&roots).unwrap_or_default()
+    }
+
+    fn roots_of(&self, edits: &[CellEdit]) -> Vec<crate::RootEdit> {
+        edits
             .iter()
             .filter(|e| self.contains_pos(e.pos) && e.cell.is_none_or(Cell::is_valid))
             .map(|e| crate::RootEdit {
@@ -478,8 +528,7 @@ impl World {
                     .map(|c| vec![crate::CellFragment::from_cell(e.pos, c)])
                     .unwrap_or_default(),
             })
-            .collect();
-        self.apply_root_edits(&roots).unwrap_or_default()
+            .collect()
     }
 
     /// Full effective fragments intersecting the query; query edges never add caps.

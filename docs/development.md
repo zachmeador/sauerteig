@@ -158,25 +158,35 @@ the leaves around what it changes and copies only the path to them; undo merges
 them back. Rendering meshes come from the tree in 16 m mesh units: each leaf is
 drawn by the unit holding its minimum corner, faces covered by solid neighbours
 are left out, a partly covered face is drawn whole, and faces on the root's
-outer boundary are left out. Any write, water and glass included, rebuilds the
-units owning leaves it removed or added and those beside changed geometry or
-beside a shaped leaf or piece it split or merged. Raycasts and collision use the
-same leaves. Camera and shadow passes cull using actual mesh bounds. The [core
+outer boundary are left out. Any write rebuilds the units owning leaves it
+removed or added and those beside changed geometry or beside a shaped leaf or
+piece it split or merged. Raycasts and collision use the same leaves. Camera and
+shadow passes cull using actual mesh bounds. The [core
 contract](../crates/core/CONTRACT.md) describes the geometry and protocol
 invariants. The server's `/health` reports the tree's leaves by kind, its
 internal nodes, and estimated bytes by part under `world`.
 
-Water and glass are cube material in the tree. The renderer draws them from
-the world's list of disjoint eighth-metre boxes, which stay as loaded until an
-edit changes them. Volume edits rebuild cached boundary meshes; contiguous
-regions of the same material omit internal faces. Transparent faces are culled
-and sorted behind opaque geometry using the same depth buffer. This is alpha
-blending, with procedural water motion and glass tint rather than scene
-refraction or reflected scene captures. Material regions do not cast opaque
-shadows. Keep intersecting transparent regions and large visible water surfaces
-in runtime checks: sorting uses face centers and can show ordering artifacts for
-overlapping views of large faces. An underwater eye adds blue-green distance fog
-and a subtle screen tint.
+Water and glass are cube material in the tree, and the renderer draws them from
+the tree. Core meshes the same 16 m units a second time for water and glass:
+surfaces lie where a cube's material meets something else, faces against the
+same medium or fully against solid geometry are left out, and coplanar faces of
+one medium merge into rectangles within a unit. Each rectangle carries flags
+for its edges where the surface really ends, so glass's edge band follows the
+surface and not the seams of the merge, and a pane set into a wall has no band
+where it enters it. All units' quads share one pool; a unit built again replaces
+its own quads, and every frame the visible quads are sorted back to front
+together and drawn behind the opaque geometry with the same depth buffer. This
+is alpha blending, with procedural water motion and glass tint rather than
+scene refraction or reflected scene captures. Water and glass cast no shadows.
+A write reports which units to build again for opaque meshes and for water and
+glass apart (`World::mesh_changes`), and where a shadow can have changed:
+cached shadows refresh only around solid shapes that moved, so painting water,
+or splitting a large solid leaf under a water edit, redraws no shadow, though
+the meshes of the units owning its pieces are built again. F3 shows how many
+units the last rebuild made again, opaque and water or glass. Keep intersecting
+transparent regions and large visible water surfaces in runtime checks: sorting
+uses face centers and can show ordering artifacts for overlapping views of large
+faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
 
 The scene renders in linear HDR, with a filmic exposure/tonemapping pass before
 egui. Settings include quality, bloom (zero disables it), anti-aliasing, render
@@ -359,7 +369,9 @@ frame), or a `path` of waypoints to walk at `speed` metres a second or jump to
 and hold for `dwell` frames. Lights fade in and shadows render over many frames,
 so each pose first draws until lighting settles; the report gives the frames that
 took, the shadow faces rendered and reused per frame, the GPU time of the atlas
-passes apart from the sun's, and how many lights reach each cluster that has any.
+passes apart from the sun's, and how many lights reach each cluster that has any. It also gives the
+mesh units and quads of water and glass and the time the world's load spent
+meshing them (`transparent_units`, `transparent_quads`, `transparent_mesh_ms`).
 The render clock is fixed at 60 Hz. The supplied imported poses expect a **copy** of
 the library's `the_cube1m` at `.local/the_cube1m.json`. Supply your own pose
 manifest for other worlds. The tool refuses to replace existing PNGs.

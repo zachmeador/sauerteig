@@ -14,7 +14,8 @@ pub use glam::Vec3;
 pub use movement::*;
 pub use octree::{
     cube_material_for, volume_material_of, Format3, Format3Piece, Leaf, LeafGeometry, NodeBox,
-    Octree, OctreeBuilder, PieceChanges, Source, TreeStats, MAT_AIR, MAT_GLASS, MAT_WATER,
+    Octree, OctreeBuilder, PieceChanges, Source, TransparentMesh, TransparentVertex, TreeStats,
+    EDGE_U_MAX, EDGE_U_MIN, EDGE_V_MAX, EDGE_V_MIN, MAT_AIR, MAT_GLASS, MAT_WATER,
     MAX_CONVERSION_LEAVES, MAX_ROOT_SIZE, MESH_UNIT_SIZE,
 };
 pub use physics::*;

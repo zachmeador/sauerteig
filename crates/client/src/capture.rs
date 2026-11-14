@@ -343,7 +343,7 @@ fn measure_block_edit(
     let mut maps = Vec::new();
     for edit in 0..EDIT_REPEATS * 2 {
         let cell = if edit % 2 == 0 { changed } else { original };
-        let dirty = scene.world.apply_edits(&[CellEdit { pos, cell }]);
+        let dirty = scene.world.apply_edits_changes(&[CellEdit { pos, cell }]);
         renderer.rebuild(&scene.world, &dirty);
         let shot = Shot {
             pose,
@@ -682,6 +682,8 @@ async fn capture(
         let report = serde_json::json!({
             "pose": pose, "first_frame_ms": cold_frame_ms, "static_updates": static_updates,
             "triangles": renderer.triangles, "visible_triangles": renderer.visible_triangles(),
+            "transparent_units": renderer.transparent_stats().0, "transparent_quads": renderer.transparent_stats().1,
+            "transparent_mesh_ms": renderer.remeshed.transparent_ms,
             "frame_median_ms": percentile(&mut elapsed, 0.5), "frame_p95_ms": percentile(&mut elapsed, 0.95),
             "frame_ms": summary(&elapsed), "cpu_submit_ms": summary(&cpu),
             "cpu_submit_median_ms": percentile(&mut cpu, 0.5), "gpu_median_ms": gpu,
@@ -724,6 +726,7 @@ mod tests {
         render::clusters::ClusterGrid,
         render::settings::Quality,
     };
+    use sauerteig_core::VolumeEdit;
 
     const SIZE: [u32; 2] = [321, 181];
 
@@ -832,7 +835,7 @@ mod tests {
 
         // An edit beside the light redraws its tiles; the result equals a
         // renderer that built everything from the edited world.
-        let dirty = world.apply_edits(&[CellEdit {
+        let dirty = world.apply_edits_changes(&[CellEdit {
             pos: [2, 1, 0],
             cell: Some(Cell::solid(2)),
         }]);
@@ -928,7 +931,7 @@ mod tests {
 
         // One block redraws a small part of the cascades, and the result is
         // what a renderer that never saw the old block draws.
-        let dirty = world.apply_edits(&[CellEdit {
+        let dirty = world.apply_edits_changes(&[CellEdit {
             pos: [2, 1, 0],
             cell: Some(Cell::solid(2)),
         }]);
@@ -947,7 +950,7 @@ mod tests {
 
         // Removing it again, and a prop that moves, redraw their old and new
         // places.
-        let dirty = world.apply_edits(&[CellEdit {
+        let dirty = world.apply_edits_changes(&[CellEdit {
             pos: [2, 1, 0],
             cell: None,
         }]);
@@ -1298,5 +1301,74 @@ mod tests {
         );
         assert!(promoting.lighting_stats().overlay_tiles > 0);
         assert_eq!(differing(&all_dynamic, &promoted), 0);
+    }
+    #[test]
+    #[ignore = "requires a native GPU; run explicitly with --ignored"]
+    fn gpu_water_and_glass_edits_redraw_no_shadows_and_match_fresh_renders() {
+        let eye = Vec3::new(-9.0, 6.0, 10.0);
+        let look_at = Vec3::new(-3.0, 2.0, 3.0);
+        let mut renderer = headless(RendererOptions::default());
+        let Scene {
+            mut world, objects, ..
+        } = load(&mut renderer, "materials");
+        let before = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        let (units, quads) = renderer.transparent_stats();
+        assert!(units > 0 && quads > 0);
+        frame(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(renderer.sun_texels, 0, "nothing changed, nothing redrawn");
+
+        // A glass pane across the water's end, and water through part of the
+        // floor, which splits the floor's solid leaves.
+        let edits = [
+            VolumeEdit {
+                bounds: FineBox {
+                    min: [-64, 8, 56],
+                    max: [-8, 32, 57],
+                },
+                material: Some(VolumeMaterial::Glass),
+            },
+            VolumeEdit {
+                bounds: FineBox {
+                    min: [-37, 2, -37],
+                    max: [-27, 12, -27],
+                },
+                material: Some(VolumeMaterial::Water),
+            },
+        ];
+        let old = world.clone();
+        world.apply_volume_edits(&edits).unwrap();
+        let changes = world.mesh_changes(&old);
+        assert!(!changes.transparent.is_empty());
+        assert!(!changes.opaque.is_empty(), "the floor's leaves split");
+        assert!(changes.shadows.is_empty(), "{changes:?}");
+        renderer.rebuild(&world, &changes);
+        assert_eq!(renderer.remeshed.opaque, changes.opaque.len());
+        assert_eq!(renderer.remeshed.transparent, changes.transparent.len());
+        frame(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(renderer.sun_texels, 0, "water and glass move no shadow");
+        assert_eq!(renderer.shadow_updates, 0, "no light redraws a tile");
+        let edited = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_ne!(edited, before, "the pane must change the picture");
+        assert_eq!(
+            edited,
+            from_scratch(&world, &objects, RenderSettings::default(), eye, look_at)
+        );
+
+        // Undoing both brings the first picture back, again without shadows.
+        let old = world.clone();
+        world
+            .apply_volume_edits(&edits.map(|e| VolumeEdit {
+                material: None,
+                ..e
+            }))
+            .unwrap();
+        let changes = world.mesh_changes(&old);
+        assert!(changes.shadows.is_empty(), "{changes:?}");
+        renderer.rebuild(&world, &changes);
+        frame(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(renderer.sun_texels, 0);
+        assert_eq!(renderer.shadow_updates, 0);
+        let undone = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(undone, before);
     }
 }

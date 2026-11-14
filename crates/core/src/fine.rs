@@ -262,14 +262,36 @@ impl World {
     /// changes unless every edit is valid. A write that changes nothing leaves
     /// the tree as it was.
     pub fn apply_root_edits(&mut self, edits: &[RootEdit]) -> Result<Vec<ChunkKey>, String> {
+        Ok(self
+            .write_roots_changes(edits)?
+            .map_or_else(Vec::new, |changes| self.tree.dirty_units(&changes)))
+    }
+
+    /// `apply_root_edits`, returning everything a renderer builds again:
+    /// opaque units, water and glass units, and where shadows can change.
+    pub fn apply_root_edits_changes(
+        &mut self,
+        edits: &[RootEdit],
+    ) -> Result<crate::MeshChanges, String> {
+        Ok(self
+            .write_roots_changes(edits)?
+            .map_or_else(Default::default, |changes| self.tree.mesh_changes(&changes)))
+    }
+
+    /// Writes the edits and finds what changed; `None`, with the tree as it
+    /// was, when nothing did.
+    fn write_roots_changes(
+        &mut self,
+        edits: &[RootEdit],
+    ) -> Result<Option<crate::octree::Changes>, String> {
         let before = self.tree.clone();
         self.write_roots(edits)?;
         let changes = self.tree.changes_from(&before);
         if changes.changed.is_empty() {
             self.tree = before;
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        Ok(self.tree.dirty_units(&changes))
+        Ok(Some(changes))
     }
 
     /// Writes whole metres into the tree, after validating every edit.
