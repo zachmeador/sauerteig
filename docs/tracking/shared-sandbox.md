@@ -301,10 +301,11 @@ builds. These describe today's structures, which the octree replaces:
 Wave 1 holds the save and quit fixes and 2b's first session here, and in other
 tracks [octree](octree.md) O1a, [renderer](renderer.md) N1,
 [legacy import](legacy-import.md) I1 (the importer reads OCTA version 27) and
-[platforms](platforms.md) stages 1 (CI on Windows, macOS and Linux) and 2
-(identical movement in every build), side by side. As those merge, octree O1b
-and O3, [large worlds](large-worlds.md) stage 1 (a generated benchmark world),
-renderer stage 2b and renderer N1b follow. Here the order is:
+[platforms](platforms.md) stage 2 (identical movement in every build), side by
+side; platforms stage 1, CI on Windows, macOS and Linux, is parked until
+releases are near. As those merge, octree O1b and O3,
+[large worlds](large-worlds.md) stage 1 (a generated benchmark world) and
+renderer stage 2b follow. Here the order is:
 
 - The save and quit fixes go first, because 2b's first session edits the same
   parts of the client: the application handler in `lib.rs`, and `hosting.rs`.
@@ -748,10 +749,10 @@ State: waits for octree O2, both sessions of 2b and the save and quit fixes.
 Large: three sessions in order on one branch, merged once. The design lead
 commits each session's work to the branch. 2d absorbs 2c, the wire codec, which
 had nothing to check in the running app on its own. It merges only once
-movement is identical across builds and machines
-([platforms](platforms.md) stage 2): today `arena_golden`'s turning case
-differs at tick 9 in a release build (opt-level 2, thin LTO), and players run
-release builds on different systems.
+movement is identical across builds and machines: [platforms](platforms.md)
+stage 2 made it so on macOS ARM64 and x86-64, and before 2d merges the
+maintainer checks that a client on their Windows computer joining a Mac host
+doesn't snap.
 
 - **Decided:** decisions 1–4 and 10, and the world-size and public-game rules
   above.
@@ -797,8 +798,8 @@ release builds on different systems.
   which needs nightly Rust) is a later option.
 - **Touches:** core's new `wire` module and tests, a module line in its
   `lib.rs`, and its `Cargo.toml`. It runs beside everything else.
-- **Tests** (those that need no private world run in CI on all three systems
-  once [platforms](platforms.md) stage 1 lands):
+- **Tests** (those that need no private world run on the Mac and in the Linux
+  CI job):
   - [ ] Copies of every library world, nub1, the benchmark world and a
     synthetic world using every leaf kind and material round-trip through the
     codec with equal digests.
@@ -991,12 +992,12 @@ release builds on different systems.
     follows the snapshot revision rule.
   - [ ] The estimate and the question under the test memory setting, for a
     joiner and a host, with and without a GPU's own video memory.
-  - [ ] Reading the computer's memory gives a plausible total on every system
-    in CI.
+  - [ ] Reading the computer's memory gives a plausible total on macOS and in
+    the Linux CI job; the maintainer's Windows computer checks Windows.
   - [ ] A movement golden over the benchmark world's test preset, received
     through the codec and built as a joining client builds it, is exact in dev
-    and release builds on every CI system ([platforms](platforms.md) stage 2's
-    rule). The lead checks the CI part on a `ci/` branch before merging.
+    and release builds on the Mac, under Rosetta and in the Linux CI job
+    ([platforms](platforms.md) stage 2's rule).
 - **Record:** wire sizes for every library world, nub1 and the benchmark world
   (a region encoding measured about 0.2 MB for the_cube1m and nub1); LAN join
   times for the_cube1m and nub1; joiner and host memory, peak and settled,

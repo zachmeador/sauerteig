@@ -123,8 +123,7 @@ use the smaller preset.
   at merge.
 - **Acceptance:**
   - [ ] A test generates the test preset and checks its digest. It passes on the
-    Mac, and in CI on every system once platforms stage 1 has merged; the lead
-    ticks that part.
+    Mac and in the Linux CI job.
   - [ ] Import the smaller preset into a scratch library (`SAUERTEIG_DATA_DIR`),
     host it and fly through it: it shows rooms, slopes, water, glass, and lit
     and shadowed lights, not noise.

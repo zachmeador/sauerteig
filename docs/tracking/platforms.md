@@ -74,8 +74,10 @@ What it decides:
 
 ## Stage 1: CI on Windows, macOS and Linux
 
-State: ready. Wave 1. Before its new jobs run, the maintainer confirms that the
-account can't be billed for Actions.
+State: parked until releases are near (maintainer, 2026-11-14). Meanwhile the
+maintainer playtests on their own Windows computer, and the Linux job that
+already runs on every push stays as it is. A first draft of the workflow below
+is on the local branch `platforms-ci` (commit df4b48d), never pushed.
 
 - **Decided:**
   - Windows, macOS and Linux are equal targets (maintainer, 2026-11-13).
@@ -176,9 +178,9 @@ account can't be billed for Actions.
 ## Stage 2: identical movement in every build
 
 State: merged on 2026-11-14. Exact in dev and release builds on macOS ARM64 and,
-under Rosetta, x86-64; the CI runs on Linux and Windows wait for stage 1. It
-must pass there before players on different builds play together, and
-shared-sandbox 2d ships only once it has.
+under Rosetta, x86-64. The CI runs on Linux and Windows wait for stage 1, which
+is parked; until then the maintainer's Windows playtest below stands in, and
+shared-sandbox 2d ships only once it has passed.
 
 - **Why.** The server simulates every player, and each client predicts its own
   movement with the same code. On each snapshot the client takes the server's
@@ -257,12 +259,11 @@ shared-sandbox 2d ships only once it has.
     running, and the session didn't start it.
   - [x] The Sauerbraten golden passes the same way (same limits).
   - [ ] In CI, core's tests pass in dev and release builds on Linux x86-64,
-    Linux ARM64, Windows x86-64 and macOS ARM64. This needs stage 1's jobs, so
-    the lead checks it on a `ci/` branch holding both stages, or on `main` once
-    both have merged, before shared-sandbox 2d ships.
-  - [ ] Not observable on one machine: a player on Windows or Linux joining a
-    Mac host sees no snapping while strafing and turning. Needs a second
-    machine and a tester.
+    Linux ARM64, Windows x86-64 and macOS ARM64. This waits for stage 1, parked
+    until releases are near.
+  - [ ] **Maintainer:** a player on the maintainer's Windows computer joining
+    a Mac host sees no snapping while strafing and turning, before
+    shared-sandbox 2d ships.
 - **Record:**
   - **Cause.** In an optimized build, LLVM merges the `sin` and `cos` of the
     same angle in `forward` and the steering of `simulate_player_with` into one
@@ -328,9 +329,9 @@ checks:
   ran.
 - **GPU tests without the hardware.** N1b adds CI jobs that run the GPU
   tests on software drivers, Mesa's lavapipe for Vulkan on Linux and WARP for
-  DirectX 12 on Windows, once stage 1 has merged. While the repository is
-  private they run weekly and on manual runs (stage 1's schedule). They check
-  correctness and API rules, not speed.
+  DirectX 12 on Windows, once stage 1 runs; both are parked until releases are
+  near. They check correctness and API rules, not speed. Meanwhile the
+  maintainer's Windows computer covers DirectX 12 in playtests.
 - **N2** gives every light actor shadows without copying part of a depth
   texture. Direct3D 12 copies textures that can be depth targets only as whole
   subresources, except on GPUs with programmable sample positions, while wgpu 24
@@ -356,8 +357,8 @@ build as a baseline. The main pass comes after the octree and shared-sandbox
 Testers use the generated benchmark world
 ([large-worlds](large-worlds.md#stage-1-a-generated-benchmark-world) stage 1),
 because the maintainer's library of imported maps can't be shared, and release
-builds from a manual run of stage 1's CI, so they need no Rust toolchain. While
-the repository is private, a tester also needs access to it.
+builds the maintainer makes, or stage 1's once it runs, so they need no Rust
+toolchain. While the repository is private, a tester also needs access to it.
 
 - **With every number,** record the machine, system, graphics driver, backend,
   resolution and build.

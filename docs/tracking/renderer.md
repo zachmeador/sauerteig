@@ -161,9 +161,8 @@ The maintainer approved these on 2026-11-13 with the native-first plan for
   other tracks' work orders:
   - N1 in wave 1;
   - 2b in wave 1 as well, starting when N1 merges;
-  - N1b, the GPU tests on software drivers, once N1 and
-    [platforms](platforms.md) stage 1 have merged, beside the other renderer
-    stages;
+  - N1b, the GPU tests on software drivers, parked with
+    [platforms](platforms.md) stage 1 until releases are near;
   - N2 in wave 2, beside [octree](octree.md) O2, once 2b has merged;
   - N3 in wave 4, beside shared-sandbox 2e and 2f, once octree O1b has merged.
 - **The octree changes what the renderer draws.** Octree O1a builds world
@@ -210,8 +209,8 @@ The maintainer approved these on 2026-11-13 with the native-first plan for
     wgpu-core's adapter choice, not yet tried).
   - They check correctness and API rules, not speed. CI runs none of the
     `gpu_` tests today: they are ignored by default and run by hand on a Mac.
-    N1b adds a job for them, which follows [platforms](platforms.md) stage 1's
-    schedule while the repository is private.
+    N1b adds a job for them once [platforms](platforms.md) stage 1 runs; both
+    are parked until releases are near (maintainer, 2026-11-14).
 
 ### N1: native GPU features
 
@@ -446,8 +445,9 @@ Metal).
 
 ### N1b: GPU tests on software drivers
 
-State: waits for N1 and [platforms](platforms.md) stage 1, which owns
-`.github/workflows/`. Small to medium. The M5 Pro, where sessions run, has no
+State: parked with [platforms](platforms.md) stage 1, which owns
+`.github/workflows/`, until releases are near (maintainer, 2026-11-14). Small to
+medium. The M5 Pro, where sessions run, has no
 WARP or FXC and no lavapipe set up, so the design lead pushes the session's work
 to a scratch branch, runs the job, and passes on its logs.
 
@@ -914,7 +914,7 @@ State: waits for 2b. Wave 2, beside octree O2, once 2b has merged.
   - [ ] Tests: per-frame tiles with actors match fresh renders, cached tiles
     match fresh ones after edits, and unit tests cover atlas sizing, each
     level's bound and the page table. They pass on the M5 Pro, and in N1b's
-    job on lavapipe and WARP.
+    job on lavapipe and WARP once it runs.
   - [ ] **Needs a tester:** on a real Vulkan GPU and a real DirectX 12 GPU,
     the GPU tests pass and players cast shadows under every lamp.
   - [ ] **Needs a tester:** 2b's check of the lowest level, repeated on a
@@ -986,7 +986,7 @@ State: waits for N2 and [octree](octree.md) O1b. Wave 4, beside shared-sandbox
   - [ ] GPU throughput on the imported poses at 4K is no worse.
   - [ ] Tests: the new vertices give the same triangles, normals, materials
     and texture coordinates as before, and a GPU capture comparison passes on
-    the M5 Pro and in N1b's job on lavapipe and WARP.
+    the M5 Pro and in N1b's job on lavapipe and WARP once it runs.
   - [ ] **Needs a tester:** 2b's check of the lowest level, repeated on a
     reference machine.
 - **Record at the end:** bytes per piece and per triangle, raw and as
