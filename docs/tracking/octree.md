@@ -1132,8 +1132,9 @@ observed in the running app, so the box above stays open.
 
 ## O2: grid-sized edits
 
-State: ready (O1a and O1b have merged). Wave 2. Large: two sessions in order on
-one branch, merged once. The design lead commits each session's work to the
+State: waits for [lighting](lighting.md) L1, which changes light objects, since
+O2 reworks how objects travel in edits (design lead, 2026-11-14). Wave 2. Large:
+two sessions in order on one branch, merged once. The design lead commits each session's work to the
 branch. Between the sessions the branch builds core and the server; the client
 builds again after session 2.
 

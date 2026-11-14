@@ -52,6 +52,7 @@ Stage 1 below is the first work order.
 
 - [ ] Make viewing distance and editor traversal suitable for large maps, with
   deliberate performance limits rather than simply increasing every bound.
+  Viewing distance is stage 2 below; editor traversal follows.
 - [ ] Stream the world by distance, so that a player holds only what is near,
   and then size the default budget by the server's memory.
 - [ ] Exercise rendering, collision, local edits, blueprints, and save/rejoin far
@@ -369,6 +370,53 @@ twenty that way, which puts its load time next to the_cube's.
   lights have no properties and nothing is textured per cube.
 - Pieces (a shaped cube cut by an edit) don't occur: the generated trees hold
   no piece leaves, so the cost of cut shapes isn't exercised until editing runs.
+
+## Stage 2: see the whole world
+
+State: running on branch `large-worlds-2` since 2026-11-14. Medium. It runs
+beside [lighting](lighting.md) L1.
+
+- **Why** (maintainer, 2026-11-14, after playtesting nub): render distance is
+  one of the two first concerns. The camera stops drawing at 180 m
+  (`FAR_PLANE` in `render.rs`, and the clusters' `far`), and fog reaches about
+  40% at 100 m and its 85% ceiling past 180 m. Both were prototype values. nub
+  is 2 km across and its own fog setting is 12.5 km, effectively none.
+- **Decided** (design lead, 2026-11-14):
+  - Every player sees the same distance. No quality level shortens it, since how
+    far you can see matters in a fight, and the lighting rule already keeps
+    quality to detail.
+  - Until worlds carry their own fog (the [world format](world-format.md)'s
+    settings stage, which also imports Sauerbraten's `fog` and `fogcolour`), you
+    see to the far side of the world from anywhere in it, and fog thickens only
+    near that distance, so nothing pops at the edge.
+  - Lights stay lit at any distance: the cluster grid covers the whole view.
+  - Depth must stay precise at kilometres. The scene uses a 32-bit float depth
+    buffer with depth increasing away from the camera today (`LessEqual`), which
+    loses that precision; reversing it is the usual answer, but measure and
+    choose.
+  - The whole of each library map draws at once on the M5 Pro (the_cube1m's
+    world is 717,378 triangles, nub's 755,996), so no level of detail is planned.
+    Record how far sun shadows reach against how far you see, and extend the
+    cascades only if that is cheap.
+- **Out of scope:** editor flight speed, the other half of large-map traversal
+  (16 m/s today); streaming.
+- **Scope:** `render.rs` (projection, depth, fog constants), `render/clusters.rs`,
+  `render/sun.rs`, `common.wgsl` and the other shaders' fog, the capture tool,
+  and the rendering section of the [development guide](../development.md).
+- **Parallel work:** lighting L1 edits light objects, the importer and the
+  editor's light panel; the second to merge rebases.
+- **Acceptance:**
+  - [ ] Captures of nub from the playtest's spot in the large hall show its far
+    walls and the map beyond, and from high above, the_cube1m and the benchmark
+    world's nub1 preset can be seen across.
+  - [ ] No depth fighting at 1 to 3 km in captures; a light far from the camera
+    is lit; captures of the existing poses differ only where more can now be
+    seen or the fog is thinner.
+  - [ ] GPU throughput at 4K on the M5 Pro, before and after, for the imported
+    poses, the benchmark world's poses and a far view of nub, at High and Low,
+    with triangles drawn. Within budget, or the record says where and why not.
+  - [ ] **Maintainer:** fly around nub and the_cube1m; the distance and the fog
+    feel right.
 
 ## Evidence
 

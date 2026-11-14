@@ -48,7 +48,8 @@ without N2. The numbers are in [renderer](renderer.md) under N2.
   Apple M3 Pro; play checks in the running app are still to do.
 - [ ] Import and apply source light properties and sun/environment settings,
   after the two items above, as part of
-  [legacy map restoration](legacy-import.md).
+  [legacy map restoration](legacy-import.md). Lights' range and colour come
+  first, in L1 below; ambient, sky, sun and fog wait for world settings.
 - [ ] Compare representative indoor/outdoor lighting with original maps, noting
   deliberate renderer differences rather than claiming exact reproduction.
 - [ ] Light and shadow every light the same way: every light in view lit, with
@@ -59,6 +60,57 @@ without N2. The numbers are in [renderer](renderer.md) under N2.
   in [renderer](renderer.md) N2 and checked on the capture tool and the GPU
   tests on an M5 Pro; the maintainer's look in the running app and a Vulkan and
   a DirectX 12 GPU are still to do.
+
+## L1: lights keep their range and colour
+
+State: running on branch `lighting-l1` since 2026-11-14. Medium. It runs before
+[octree](octree.md) O2, which reworks how objects travel in edits, and beside
+[large worlds](large-worlds.md) stage 2.
+
+- **Why** (maintainer, 2026-11-14, after playtesting nub): light distance is one
+  of the two first concerns. A big room in nub that the original lit with one
+  large light is dark. Every imported light has the same 12 m reach and colour
+  today, while nub's 155 lights reach 11 to 44 m in the original (median 25 m);
+  154 of them reach further than here.
+- **Decided** (design lead, 2026-11-14):
+  - A light object carries its colour, range and brightness in the world. Format
+    3 gains them as optional fields of a light object, and a file without them
+    gets today's values (the warm colour, 12 m and 16). Shared-sandbox 2e's
+    format carries them, and the [world format](world-format.md)'s later
+    object-properties stage keeps them as typed properties.
+  - They travel with the light wherever objects go: the join, placing, moving
+    and deleting, undo and redo, copy and paste, blueprints and saves. Changing
+    them in the editor is an edit like moving the light.
+  - The importer copies each Sauerbraten light's radius and colour, scaled by
+    `--units-per-metre`. Sauerbraten's lightmaps fall off linearly to a light's
+    radius. Choose how radius and colour map to range, colour and brightness so
+    imported rooms are lit about as far and as brightly as in the original. If
+    that needs another falloff, it applies to every light, under the lighting
+    rule, and the captures show the change on the built-in scenes.
+  - Out of scope: spotlights (nub has none; they need a direction and cone on
+    the light object), and the map's ambient, sky, sun and fog, which wait for
+    world settings. The import report keeps listing them.
+- **Scope:** core's object types and their validation (`CONTRACT.md`), the
+  messages that carry objects, the server's object edits, the client's light
+  descriptions (`lighting.rs`) and the editor's panel for a selected light, the
+  importer's light mapping and its README, [editor controls](../editor.md) and
+  this document.
+- **Parallel work:** large-worlds stage 2 edits `render.rs`, the clusters, the
+  fog and the sun cascades; if both edit the Settings or editor panels, the
+  second to merge rebases. Octree O2 waits for this order.
+- **Acceptance:**
+  - [ ] nub imports with its lights' ranges and colours. Captures of nub's large
+    halls before and after, and complex against the original game's
+    `complex.png` by eye.
+  - [ ] Captures of the built-in scenes match, unless the falloff changed; then
+    the record lists the differences.
+  - [ ] A light's colour, range and brightness survive save and reopen, a join,
+    undo and redo, copy and paste, and a blueprint round trip. Files without
+    them load with today's values. Tests cover each.
+  - [ ] **Maintainer:** select a lamp, change its colour and range, undo it; nub's
+    big rooms are lit as you remember them, once the library is re-imported.
+- **Afterwards:** the design lead re-imports the library with the merged
+  importer and, with the maintainer's word, swaps it in, as after octree O3.
 
 ## Evidence
 
