@@ -1019,10 +1019,10 @@ State: waits for 2d. Medium.
 
 - **Decided:** decision 7, and the version policy for world files.
 - **Format 4, `world.sauerteig`:**
-  - A magic number, a header (format, world id, revision, bounds,
-    `next_object`, the estimate's totals including triangles, and the digest,
-    size and modified time of the `world.json` it came from), and the wire
-    chunks, each with a CRC32.
+  - A magic number, a header (format, world id, revision, bounds, the octree
+    root's origin, `next_object`, the estimate's totals including triangles,
+    and the digest, size and modified time of the `world.json` it came from),
+    and the wire chunks, each with a CRC32.
   - Written whole: temporary file, fsync, rename, folder fsync. Chunk bytes
     come from 2d's encoder, reusing unchanged chunks. No journal.
   - One previous generation is kept. A corrupt file is moved aside before a new

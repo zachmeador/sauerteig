@@ -4,6 +4,7 @@ mod compact;
 mod fine;
 mod geometry;
 mod movement;
+mod octree;
 mod physics;
 mod protocol;
 mod volumes;
@@ -16,6 +17,11 @@ pub use compact::{
 pub use fine::*;
 pub use glam::Vec3;
 pub use movement::*;
+pub use octree::{
+    cube_material_for, volume_material_of, Format3, Leaf, LeafGeometry, NodeBox, Octree,
+    OctreeBuilder, Source, TreeStats, MAT_AIR, MAT_GLASS, MAT_WATER, MAX_CONVERSION_LEAVES,
+    MAX_ROOT_SIZE,
+};
 pub use physics::*;
 pub use protocol::*;
 pub use volumes::*;

@@ -89,11 +89,12 @@ Design lead, 2026-11-14, after two reviews of the first draft against the code.
     "material" alone meaning a surface material, as in `Cell.material`. Water
     and glass act as they do today: they fill the cube's open space, so solid
     geometry wins at a point, water never blocks shots, and glass blocks
-    movement and shots across its whole cube. Lava, clip, noclip, death, alpha
-    and the water and glass variants are stored but inert until later stages
-    give each its own rule; noclip, for one, will make solid geometry passable.
-    Format 3 saves only water and glass, so the others survive saves from
-    shared-sandbox 2e on.
+    movement and shots across its whole cube. The water and glass variants act
+    as water and glass, and will choose a look later (design lead,
+    2026-11-14). Lava, clip, noclip, death and alpha are stored but inert until
+    later stages give each its own rule; noclip, for one, will make solid
+    geometry passable. Format 3 saves only water and glass, so the others
+    survive saves from shared-sandbox 2e on.
 - **One canonical form,** so equal worlds have equal trees and digests, and an
   edit followed by its undo restores the identical tree:
   - Eight children that are equal full or empty leaves merge into one. Shaped
@@ -109,6 +110,11 @@ Design lead, 2026-11-14, after two reviews of the first draft against the code.
     surface materials, and a planar or collapsed face's diagonal and a
     collapsed face's material take fixed values. An empty leaf of plain air
     isn't stored.
+  - **Known gap after session 1:** children that together make one shape,
+    such as a half-height slab of full eighths, don't merge into one shaped
+    leaf, so the same geometry can have two trees. Worlds stay exact, and an
+    edit followed by its undo still restores the identical tree. Sauerbraten's
+    remip makes this merge, and O2's first session adds it.
 - **Nothing derived is stored in the tree.** Queries work from leaf definitions,
   and the renderer caches meshes per mesh unit.
 - **One unit.** Positions are integers in eighth-metre units in the core and
@@ -229,6 +235,8 @@ Design lead, 2026-11-14, after two reviews of the first draft against the code.
   format is added.
 - Builds from before O2 can't join builds after it. Until 2d's version
   handshake, that shows up as a failed join.
+- Format 3 has no place for the root's origin, so the tree derives it on load
+  (session 1's record says how). Shared-sandbox 2e's binary saves store it.
 
 **Kept from today's design,** because it is sound: cheap shared snapshots, exact
 pieces instead of resampled slopes, stored face diagonals, per-object clocks,
@@ -250,13 +258,16 @@ and full replacements checked against a base revision.
   and core's separate `World` serde format. O2 removes the water and glass edit
   path with its box limits and clock, the per-root clocks, `RootCost` and the
   old messages. O3 removes the importer's box path. 2e retires format 3 as the
-  save format, and 2d replaces the JSON byte caps, `MAX_WORLD_FRAGMENTS` and
-  `MAX_OBJECTS` with the memory budget.
+  save format, and 2d replaces the JSON byte caps, `MAX_WORLD_FRAGMENTS`,
+  `MAX_OBJECTS` and the conversion guard (`MAX_CONVERSION_LEAVES`, 4,194,304
+  leaves) with the memory budget.
 
 ## O1a: one octree in the core
 
-State: ready. Wave 1, large: two sessions in order on one branch, merged once.
-The design lead commits each session's work to the branch.
+State: session 1 (the tree) is on branch `octree-o1a` for review; session 2
+follows on the same branch. Wave 1, large: two sessions in order on one
+branch, merged once. The design lead commits each session's work to the
+branch.
 
 - **Decided:** the tree, queries, physics and meshing above. Every public core
   item that the server, client, importer and capture tool use keeps its
@@ -285,6 +296,14 @@ The design lead commits each session's work to the branch.
     equal materials, as today, and report the box around a hit as its
     `bounds`.
 - **Session 2, writes and meshes:**
+  - **From session 1's review** (design lead, 2026-11-14): water and glass
+    variants act (`volume_material_of` ignores the variant bits); re-record
+    Arena's goldens once as decided, since stairs, ramps, shape_ramps,
+    wall_slide and compact_world change on the tree; find out why foundry under
+    the Sauerbraten profile drifts 2.3 cm from its recording at tick 379 on the
+    tree (the ignored `sauerbraten_on_the_tree_stays_within_tolerance_of_the_recording`),
+    then fix the tree or record why and re-record that golden; and replay
+    session 1's recorded query answers once `World` runs on the tree.
   - **Today's writes on the tree:** `apply_edits`, `apply_root_edits` (1 m
     boxes written as nodes, keeping cube material), `canonical_root_fragments`,
     `validate_root_edits`, and the cube-material writes `prepare_volume_edits`,
@@ -352,19 +371,20 @@ The design lead commits each session's work to the branch.
     which assert content instead. `compact_world.rs`'s seam after undo becomes
     "an edit and its undo restore the identical tree".
   - [ ] Arena's goldens pass, bit for bit or re-recorded once as decided.
-  - [ ] Copies of every library world, `.local/the_cube1m.json`, the arena and
+  - [x] Copies of every library world, `.local/the_cube1m.json`, the arena and
     synthetic worlds covering every fragment, override and volume case convert
-    to the tree, to format 3 and back with equal digests.
-  - [ ] Random edit and undo sequences, and random conversions, restore
-    identical trees, including edits beside groups that could merge.
+    to the tree, to format 3 and back with equal digests. Session 1, below.
+  - [x] Random edit and undo sequences, and random conversions, restore
+    identical trees, including edits beside groups that could merge. Session
+    1, on the tree's own writes; session 2 repeats it through `World`.
   - [ ] Old and new code agree on thousands of random queries over copies of
     the_cube1m and two smaller library worlds, recorded at the start: point
     material, box overlap, and support and ceiling heights exactly; ray first
     hits within 4 units in the last place of their coordinates, either cube
     where two lie at exactly the same distance; rays that start inside solid,
     as today.
-  - [ ] The format 3 output of every library copy loads in the loader from
-    before O1a.
+  - [x] The format 3 output of every library copy loads in the loader from
+    before O1a. Session 1, below.
   - [ ] the_cube1m's world-mesh triangles, water and glass excluded, fall from
     3,595,084 to at most 1.5 million. Captures of every pose in
     `scripts/capture-poses.json` match a baseline taken at the session's base
@@ -377,6 +397,204 @@ The design lead commits each session's work to the branch.
   after; client join time and frame times on the imported poses; the query
   comparison counts; nub1's counted size; any re-recorded golden and why; and
   anything that couldn't stay identical.
+
+### O1a session 1 record (2026-11-14)
+
+Code, automated checks and measurements only. Nothing here was observed in the
+running app, because `World` doesn't use the tree yet.
+
+- **Built beside today's structures,** as the design lead asked: `World` keeps
+  its storage until session 2 switches it, so its queries, its physics and
+  Arena's goldens are unchanged, and the old-versus-new comparisons call both
+  implementations directly. The tree's queries take `World`'s arguments and
+  give `World`'s results, ready for session 2 to route `World` through them.
+- **Files.**
+  - New `crates/core/src/octree/`: `mod.rs` (the tree, leaves, canonical form,
+    copy-on-write nodes, digest, `TreeStats`, the public `OctreeBuilder`, and
+    crate-private writes with parts that return what an undo writes back),
+    `lattice.rs` (exact integer geometry on the 0–8 lattice), `format3.rs`
+    (`Octree::from_format3`, `from_world`, `to_format3` and the format 3
+    views), `query.rs` (the queries listed above), `digest.rs` (SipHash-2-4
+    with a 128-bit output and fixed keys; stable, not a cryptographic
+    commitment), `tests.rs`, and `private_worlds.rs` (ignored tests on copies
+    in `.local/`).
+  - `physics.rs` runs the movement step on a crate-private `Space`. `World`'s
+    implementation calls today's functions unchanged; the tree's is the single
+    path, and `Octree::simulate_player_with` exposes it. `lib.rs` exports the
+    new types.
+  - `tests/arena_golden.rs` gains a test that runs all 19 scenarios on the
+    tree against the unchanged recording.
+- **How the tree answers as today.** Plain leaves replay today's region
+  arithmetic on the same triangles: `lattice::triangles` gives
+  `shape_triangles`'s triangles, in its order, from integer arithmetic, so an
+  imported leaf answers as its region did. Containment is exact: signed
+  crossings of a vertical probe with a fixed symbolic perturbation, in `i128`,
+  instead of the solid angle and its `atan2`. Pieces use their source's
+  triangles limited to the leaf, plus the leaf's own faces where the source's
+  solid crosses them. Only `+ - * /` and correctly rounded square roots are
+  used, so movement on the tree gives the same bits in dev and release builds;
+  the two `trig` scenarios differ in release exactly as today's code does,
+  from `sin` and `cos` in steering, which is platforms stage 2's.
+- **Choices where the order left room:**
+  1. **The root from format 3.** Format 3 can't store the root, so conversion
+     derives it: at the bounds' minimum corner when the largest whole region
+     lies on that grid, otherwise on that region's grid just below. Every
+     library world gets the bounds' corner. Limit: in a world whose bounds
+     are off its cubes' grid, such as a cropped import, edits that cut every
+     one of the largest whole regions can move the root at the next reload.
+     The geometry stays the same, but digests and the editor's grid would
+     shift. Shared-sandbox 2e's binary saves should store the root.
+  2. **Fixed diagonals.** A face's diagonal means nothing when flipping it
+     leaves every other face's triangles alone and the face has no triangles
+     or is a strictly convex planar quad. Its fixed value is the importer's
+     choice for planar faces (bits 0–3 set, 4–5 clear), so imported shapes
+     keep their triangles; with 0 as the fixed value, 5 of 1,033 ceiling
+     heights on the_cube1m changed in the last bit. A planar quad with a
+     collinear corner keeps its diagonal, since the other choice leaves a
+     T-junction that today's shape rules refuse.
+  3. **Faces without a surface** (collapsed, or cancelled as zero-thickness
+     sheets) take the material of the first face that has one, so a uniform
+     cube stays uniform and its cut faces keep its material.
+  4. **Cube material.** Water and glass act only without a variant (index bits
+     0); clip, death and the other flags are kept but inert. Format 3 writes
+     water and glass leaves as boxes merged with today's
+     `coalesce_material_volumes`.
+  5. **Pieces never grow past their source's cube.** A merged piece's cube may
+     cross the world bounds while its solid stays inside; the writer clips the
+     written region to the bounds.
+  6. **Unions of whole eighths.** A shaped cube whose solid is a union of
+     whole eighths, a half-height slab for one, splits into full and empty
+     children that no rule merges back, so two histories can give different
+     trees for equal geometry. A write returns the leaf it split as what an
+     undo writes back, so an edit and its undo still restore the identical
+     tree, and a write that changes nothing leaves the tree as it was.
+  7. **Queries that knowingly differ from today:**
+     - The support interval is closed. Today's region path misses a floor
+       lying exactly at the bottom of the interval it scans; today's cell path
+       and the tree find it.
+     - `volume_material_at` tests the point itself. Today's terrain test, a
+       box shrunk by its contact tolerance to nothing, misses solids within
+       about 63 m of the origin and reports water inside them.
+     - A ray's internal-join samples start from the unrounded hit, in `f64`.
+       Today's `f32` samples round back onto the face at grazing angles or a
+       few hundred metres out, which loses real faces or reports internal
+       joins as hits.
+     - Glass floors and ceilings count only where more glass doesn't cover
+       them. Today's count the tops of its stored boxes, internal ones
+       included.
+  8. **Hits.** A solid hit's `bounds` is the leaf's box within the hit's metre,
+     as for today's regions, so it is larger where leaves merged. A water or
+     glass hit's `bounds` is the leaf around it, and its face is the one the
+     ray crossed.
+  9. **Format 3 views.** `regions()` and `cells()` are the writer's split.
+     `root_overrides()` is empty and `override_count()` is 0, since the tree
+     has no masks. `detailed_roots()` lists metres with detail below a metre.
+     `get()` gives a one-metre shaped leaf on whole metres, or any metre of a
+     full leaf. `root_fragments()` applies `canonical_root_fragments`, then
+     merges fragments of one source into boxes.
+  10. **Guard.** Conversion refuses inputs that would expand past
+      `MAX_CONVERSION_LEAVES` (4,194,304 leaves), counting each volume box's
+      cubes before filling it, so a hostile file can't exhaust memory first; a
+      test converts an 8 km glass sheet off the grid and is refused.
+- **Checks,** all passing:
+  - `cargo fmt --all`,
+    `cargo clippy --workspace --all-targets --locked -- -D warnings` and
+    `cargo test --workspace --locked`.
+  - Unit and property tests in `octree/tests.rs` and `octree/lattice.rs`:
+    leaves given in any order, or written one by one, build the same tree;
+    leaves in octree order skip the sort; canonical merging (equal full and
+    empty leaves, pieces into a piece and back into their shape, never equal
+    shapes); normalized fields and canonical diagonals over random shapes;
+    exact containment against today's solid angle away from faces; clones
+    that share untouched nodes; 60 random sequences of 20 writes of every
+    part, with groups that merge, then undo and redo, restore identical trees;
+    80 random format 3 worlds (whole, partial and misaligned regions, cells,
+    empty cells, roots with fragments, empty override roots, water and glass)
+    convert, write and reload with equal digests, open in today's loader with
+    the same content, and give the same digest in any input order and from
+    today's `World`; the arena and hand-made cases of every part do the same;
+    the height-field and shape forms of a cube build the same tree; root
+    fragments, roots in a box and fragments in a box hold today's content;
+    on the arena, 4,000 queries of each kind agree with today's exactly; on 40
+    random worlds of 300 queries each, 8 point materials (water inside solid,
+    as in choice 7, or a point on a face), 9 rays (another cube or face at the same
+    distance, a grazing contact, or a zero-thickness sheet in today's regions)
+    and 26 support heights within 1e-4 m (today's cell paths round
+    differently) differ; movement on the tree stays within 2e-3 of today's in
+    ten runs, 1,450 of 1,669 ticks bit for bit; the arena's digest is
+    pinned.
+  - `cargo test -p sauerteig-core --test arena_golden`: the recording passes
+    bit for bit on `World` as before, and the new test runs it on the tree.
+  - On copies in `.local/` (`the_cube1m.json` and `library/<name>.json`):
+    `cargo test --release -p sauerteig-core --lib private_ -- --ignored
+    --nocapture --test-threads 1`.
+- **Conversion,** release build on the M5 Pro, all 24 copies passing. Leaves
+  are full, shaped, piece and water or glass; bytes are the tree's estimate.
+  Format 3 pieces and MiB are the server's counts for the written file, with
+  the file read before conversion in brackets.
+
+  | World | JSON | Convert | Full | Shaped | Water, glass | Internal | Bytes | Pieces | MiB |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | the_cube1m | 171 ms | 237 ms | 167,562 | 58,879 | 112,672 | 80,332 | 14.5 M | 226,441 (306,094) | 34.73 (42.76) |
+  | nub | 157 ms | 167 ms | 225,219 | 41,804 | 80,625 | 75,571 | 13.0 M | 267,023 (284,824) | 40.88 (40.57) |
+  | tubes1 | 133 ms | 104 ms | 163,276 | 29,368 | 77,023 | 62,668 | 10.5 M | 192,644 (269,084) | 27.34 (35.70) |
+  | complex | 29 ms | 64 ms | 12,838 | 14,302 | 0 | 6,929 | 1.7 M | 27,140 (37,927) | 4.73 (5.85) |
+  | ralith1 | 20 ms | 18 ms | 30,762 | 3,552 | 21,321 | 11,413 | 1.8 M | 34,314 (41,958) | 4.75 (5.49) |
+  | My world | 3 ms | 2 ms | 7,065 | 132 | 0 | 2,086 | 0.3 M | 7,197 (7,463) | 1.07 (1.10) |
+
+  No library world has exact pieces; Sauerbraten keeps many equal children
+  unmerged, which is why full leaves fall (the_cube1m's 247,215 full regions
+  become 167,562 leaves). the_cube1m writes 172,178 regions, 54,263 cells and
+  4,212 water and glass boxes (4,227 before). Writing takes 35 ms; the loader
+  from before the octree opens the result in 0.8–0.9 s. nub's written file is
+  0.3 MiB larger, because its one-metre leaves are written as cells, which
+  the server counts as roots; it stays 22 MiB under the 63 MiB guard.
+- **Query comparison,** today's `World` against the tree, 5,000 queries of
+  each kind near geometry per world. The table counts differences. Rays with
+  the same first hit, within 4 units in the last place, may name another face
+  or a larger cube; any other difference outside the listed classes fails the
+  test.
+
+  | Queries | the_cube1m | complex | ralith1 | Class |
+  | --- | --- | --- | --- | --- |
+  | Box overlap, solid and glass | 0 | 0 | 0 | |
+  | Point material | 100 | 0 | 301 | today reports water or glass inside solid, at most 62.7 m out |
+  | Support where a body stands | 1 of 2,210 | 0 of 2,324 | 0 of 1,596 | a face the body only touches, internal to a merged leaf |
+  | Ceilings | 0 of 1,033 | 0 of 613 | 0 of 459 | |
+  | Rays, first hit | 5 | 1 | 18 | today's samples round onto the face |
+  | Rays, same hit, other face | 0 | 1 | 0 | a tie on an edge |
+  | Rays, same hit, larger cube | 239 | 236 | 37 | the hit's leaf merged today's regions |
+  | Water and glass rays | 0 of 10,000 | none | 0 of 10,000 | |
+  | Step-up probes inside solid | 99 of 4,711 | 103 of 4,517 | 69 of 4,867 | internal faces between today's regions or glass boxes |
+
+  Rays hit in 4,453, 4,413 and 3,869 of 5,000 cases, and 2,459, 2,143 and
+  3,407 of them start inside solid. The tree is faster: 5,000 box queries take
+  4.0 ms against today's 16.6 ms on the_cube1m and 5,000 rays 23 ms against
+  153 ms; support queries cost the same. Today's answers are recorded in
+  `.local/query-recordings/` (ignored), and
+  `private_query_recordings_replay` checks the tree against them, for use
+  after session 2 removes today's code.
+- **Movement on the tree** against Arena's recording, every tick within the
+  2e-3 re-recording tolerance: 14 scenarios bit for bit; `stairs`, `ramps`
+  and `shape_ramps` at most 1.5e-4 m apart, with 145, 145 and 139 of 230
+  ticks exact; `wall_slide` 2.3e-5 m, 107 of 170 exact; `compact_world` with
+  identical positions and velocities but 65 of 273 grounded flags changed by
+  the closed support interval. `ramps` and `shape_ramps` build the same tree,
+  so they no longer differ from each other.
+- **Left for session 2:**
+  - Switch `World` to the tree and route its queries and `simulate_player*`
+    through `Space for Octree`; delete today's paths and the internals listed
+    under Order.
+  - Record Arena's goldens once more: `stairs`, `ramps`, `shape_ramps`,
+    `wall_slide` and `compact_world`, all within tolerance today.
+  - The writes, `volumes()` cache, mesher, size accounting, `/health` (from
+    `TreeStats`), the importer's region list, the client's error path, the
+    tests that assert internals, and the docs, as listed for session 2. The
+    tree's crate-private `write`, `clear_geometry`, `insert_source` and
+    `set_cube_material` are the primitives to build them on.
+  - Replay the recordings after the switch, and measure the standalone
+    server's memory and load time, which can't change until `World` stores
+    the tree.
 
 ## O1b: water and glass from the tree in the renderer
 

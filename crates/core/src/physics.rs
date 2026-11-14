@@ -2,8 +2,8 @@ use crate::geometry::{cell_intersects_box, max_height, ray_box_interval, shape_s
 use crate::movement::velocity_steps;
 use crate::{
     forward, spawn_point, ArenaTuning, Cell, CellPos, InputFrame, JumpLatch, MovementProfile,
-    MovementState, MovementStyle, Player, SauerbratenTuning, Vec3, VolumeMaterial, World,
-    PLAYER_HEIGHT, PLAYER_RADIUS,
+    MovementState, MovementStyle, Octree, Player, SauerbratenTuning, Vec3, VolumeMaterial, World,
+    WorldBounds, PLAYER_HEIGHT, PLAYER_RADIUS,
 };
 
 const SKIN: f32 = 0.0002;
@@ -11,12 +11,17 @@ const SKIN: f32 = 0.0002;
 /// The box a movement query sweeps. Movement takes it from the profile; hit
 /// detection keeps the shared player constants.
 #[derive(Clone, Copy)]
-struct Body {
+pub(crate) struct Body {
     radius: f32,
     height: f32,
 }
 
 impl Body {
+    #[cfg(test)]
+    pub(crate) fn new(radius: f32, height: f32) -> Self {
+        Self { radius, height }
+    }
+
     const HIT: Self = Self {
         radius: PLAYER_RADIUS,
         height: PLAYER_HEIGHT,
@@ -36,8 +41,86 @@ fn contact_skin(position: Vec3) -> f32 {
     SKIN.max(position.abs().max_element() * f32::EPSILON * 2.0)
 }
 
-fn fallback_spawn(world: &World, player_id: u32, body: Body) -> Vec3 {
-    let bounds = world.bounds();
+/// What the movement step asks of the world it moves through.
+pub(crate) trait Space {
+    fn space_bounds(&self) -> WorldBounds;
+    /// Highest floor in `[min_y, max_y]` under the body, from solids and glass.
+    fn support_between(&self, feet: Vec3, min_y: f32, max_y: f32, body: Body) -> Option<f32>;
+    /// Lowest ceiling the head meets rising from `old_head` to `new_head`.
+    fn first_ceiling(&self, feet: Vec3, old_head: f32, new_head: f32, body: Body) -> Option<f32>;
+    fn free_at(&self, position: Vec3, body: Body) -> bool;
+    fn swim_state(&self, feet: Vec3, probe_height: f32) -> bool;
+}
+
+impl Space for World {
+    fn space_bounds(&self) -> WorldBounds {
+        self.bounds()
+    }
+    fn support_between(&self, feet: Vec3, min_y: f32, max_y: f32, body: Body) -> Option<f32> {
+        support_between(self, feet, min_y, max_y, body)
+    }
+    fn first_ceiling(&self, feet: Vec3, old_head: f32, new_head: f32, body: Body) -> Option<f32> {
+        first_ceiling(self, feet, old_head, new_head, body)
+    }
+    fn free_at(&self, position: Vec3, body: Body) -> bool {
+        free_at(self, position, body)
+    }
+    fn swim_state(&self, feet: Vec3, probe_height: f32) -> bool {
+        swim_state(self, feet, probe_height)
+    }
+}
+
+/// The tree's single path: every leaf kind answers support, ceiling, overlap
+/// and swimming queries once, whatever kind of world it came from.
+impl Space for Octree {
+    fn space_bounds(&self) -> WorldBounds {
+        self.bounds()
+    }
+    fn support_between(&self, feet: Vec3, min_y: f32, max_y: f32, body: Body) -> Option<f32> {
+        let (min, max) = body_bounds(feet, body);
+        let skin = contact_skin(feet);
+        let terrain = self.terrain_support(min, max, min_y - skin, max_y + skin, false);
+        let glass = self.glass_support(min, max, min_y, max_y, skin, false);
+        match (terrain, glass) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    fn first_ceiling(&self, feet: Vec3, old_head: f32, new_head: f32, body: Body) -> Option<f32> {
+        let (min, max) = body_bounds(feet, body);
+        let skin = contact_skin(feet);
+        let terrain = self.terrain_support(min, max, old_head - skin, new_head + skin, true);
+        let glass = self.glass_support(min, max, old_head, new_head, skin, true);
+        match (terrain, glass) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    fn free_at(&self, position: Vec3, body: Body) -> bool {
+        let (min, max) = body_bounds(position, body);
+        !self.intersects_box(min, max) && !self.intersects_solid_volume(min, max)
+    }
+    fn swim_state(&self, feet: Vec3, probe_height: f32) -> bool {
+        self.volume_material_at(feet + Vec3::Y * probe_height) == Some(VolumeMaterial::Water)
+    }
+}
+
+impl Octree {
+    /// The movement step on the tree, as `simulate_player_with` steps it on a
+    /// world.
+    pub fn simulate_player_with(
+        &self,
+        player: &mut Player,
+        input: &InputFrame,
+        dt: f32,
+        profile: &MovementProfile,
+    ) {
+        simulate_in(self, player, input, dt, profile);
+    }
+}
+
+fn fallback_spawn<S: Space + ?Sized>(world: &S, player_id: u32, body: Body) -> Vec3 {
+    let bounds = world.space_bounds();
     let mut position = spawn_point(player_id);
     let skin = contact_skin(bounds.world_min().abs().max(bounds.world_max().abs()));
     for axis in [0, 2] {
@@ -445,8 +528,8 @@ fn free_at(world: &World, position: Vec3, body: Body) -> bool {
 
 /// Returns true when an obstacle stopped the move, after zeroing that axis of
 /// the player's velocity.
-fn move_horizontal(
-    world: &World,
+fn move_horizontal<S: Space + ?Sized>(
+    world: &S,
     player: &mut Player,
     body: Body,
     step_height: f32,
@@ -458,20 +541,20 @@ fn move_horizontal(
     }
     let old = player.position;
     let mut target = old;
-    let bounds = world.bounds();
+    let bounds = world.space_bounds();
     target[axis] = (target[axis] + amount).clamp(
         bounds.min[axis] as f32 + body.radius,
         bounds.max[axis] as f32 - body.radius,
     );
-    if free_at(world, target, body) {
+    if world.free_at(target, body) {
         player.position = target;
         return false;
     }
     if player.grounded {
-        if let Some(height) = support_between(world, target, old.y, old.y + step_height, body) {
+        if let Some(height) = world.support_between(target, old.y, old.y + step_height, body) {
             let mut stepped = target;
             stepped.y = height + contact_skin(stepped);
-            if free_at(world, stepped, body) {
+            if world.free_at(stepped, body) {
                 player.position = stepped;
                 return false;
             }
@@ -482,7 +565,7 @@ fn move_horizontal(
     let mut high = 1.0;
     for _ in 0..9 {
         let fraction = (low + high) * 0.5;
-        if free_at(world, old.lerp(target, fraction), body) {
+        if world.free_at(old.lerp(target, fraction), body) {
             low = fraction;
         } else {
             high = fraction;
@@ -495,12 +578,16 @@ fn move_horizontal(
 
 /// Returns true on contact with a ceiling or the ground, which also ends the
 /// player's vertical velocity.
-fn move_vertical(world: &World, player: &mut Player, body: Body, amount: f32) -> bool {
+fn move_vertical<S: Space + ?Sized>(
+    world: &S,
+    player: &mut Player,
+    body: Body,
+    amount: f32,
+) -> bool {
     let old_y = player.position.y;
     let new_y = old_y + amount;
     if amount > 0.0 {
-        let contact = if let Some(ceiling) = first_ceiling(
-            world,
+        let contact = if let Some(ceiling) = world.first_ceiling(
             player.position,
             old_y + body.height,
             new_y + body.height,
@@ -516,7 +603,7 @@ fn move_vertical(world: &World, player: &mut Player, body: Body, amount: f32) ->
         };
         player.grounded = false;
         contact
-    } else if let Some(ground) = support_between(world, player.position, new_y, old_y, body) {
+    } else if let Some(ground) = world.support_between(player.position, new_y, old_y, body) {
         player.position.y = ground + contact_skin(player.position);
         player.velocity.y = 0.0;
         player.movement.falling = 0.0;
@@ -540,6 +627,17 @@ pub fn simulate_player(world: &World, player: &mut Player, input: &InputFrame, d
 /// server and every client's prediction must use the same profile.
 pub fn simulate_player_with(
     world: &World,
+    player: &mut Player,
+    input: &InputFrame,
+    dt: f32,
+    profile: &MovementProfile,
+) {
+    simulate_in(world, player, input, dt, profile);
+}
+
+/// The movement step on any world the step can query.
+pub(crate) fn simulate_in<S: Space + ?Sized>(
+    world: &S,
     player: &mut Player,
     input: &InputFrame,
     dt: f32,
@@ -573,7 +671,7 @@ pub fn simulate_player_with(
             + Vec3::Y * axis(input.vertical);
         player.velocity = wish.clamp_length_max(1.0) * profile.fly_speed;
         player.position += player.velocity * dt;
-        let bounds = world.bounds();
+        let bounds = world.space_bounds();
         for axis in [0, 2] {
             player.position[axis] = player.position[axis].clamp(
                 bounds.min[axis] as f32 + 0.05,
@@ -593,8 +691,7 @@ pub fn simulate_player_with(
         MovementStyle::Sauerbraten(_) => player.velocity.y + player.movement.falling,
     };
     if rising <= 0.0 {
-        if let Some(ground) = support_between(
-            world,
+        if let Some(ground) = world.support_between(
             player.position,
             player.position.y - 0.075,
             player.position.y,
@@ -611,7 +708,7 @@ pub fn simulate_player_with(
         player.grounded = false;
     }
 
-    let swimming = swim_state(world, player.position, profile.height * profile.water_probe);
+    let swimming = world.swim_state(player.position, profile.height * profile.water_probe);
     let mut motion = match &profile.style {
         MovementStyle::Arena(arena) => {
             player.movement = MovementState::default();
@@ -639,14 +736,13 @@ pub fn simulate_player_with(
     if let MovementStyle::Sauerbraten(sauerbraten) = &profile.style {
         let wet = swimming
             || (player.movement.in_water
-                && swim_state(
-                    world,
+                && world.swim_state(
                     player.position,
                     profile.height * sauerbraten.water_exit_probe,
                 ));
         player.movement.in_water = wet;
     }
-    if player.position.y < world.bounds().min[1] as f32 - 12.0 {
+    if player.position.y < world.space_bounds().min[1] as f32 - 12.0 {
         player.position = fallback_spawn(world, player.id as u32, body);
         player.velocity = Vec3::ZERO;
         player.grounded = false;
