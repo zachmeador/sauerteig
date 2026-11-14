@@ -24,8 +24,8 @@ the 400,000-region cap, and can now be imported into it.
 
 Imports are built straight into the world's octree: each source leaf is a
 leaf of it with its full material value, and the world file keeps the water and
-glass. The library's copies predate the importer's handedness fix and are mirror
-images of the maps until they are re-imported.
+glass. The library's copies were re-imported on 2026-11-14 with the handedness
+fix, so they are no longer mirror images.
 
 The archive copies use fallback material. Source texture/model references are not
 loaded assets. Original light properties and spawn facing are not applied. These

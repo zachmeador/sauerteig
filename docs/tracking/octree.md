@@ -969,6 +969,19 @@ again after session 2.
   - No size limit per edit, as decided: the world guard is checked before an
     edit is applied, undo history stays within a share of memory, and rate
     limits count requests.
+  - **Loading files the tree wrote.** A format 3 file with both regions and
+    cells takes the loader's override path: after the regions are built, each
+    cell is written into the finished tree on its own, clearing and inserting
+    its metre with two copy-on-write passes from the root (`from_parts` in
+    `octree/format3.rs`). The tree's own writer emits one-metre leaves as
+    cells, so every world the server or the importer has written since O1a
+    loads this way: the_cube1m's re-import, 172,226 regions and 54,257 cells,
+    takes about twice as long to open as the older file of 306,094 regions
+    (0.89–1.85 s against 0.41–0.84 s, alternating, on a busy M5 Pro,
+    2026-11-14), though it uses 105 MiB against 135. Make files whose cells no
+    region covers load in one pass, as regions-only files do, and keep older
+    files' rule that cells and roots replace the regions in their metre.
+    Record both loads at idle before and after.
   - Remove the water and glass edit path (`VolumeEdit`,
     `TransactionPatch.volumes`, the water clock, the box limits and the
     whole-layer undo copies), the per-root clocks and maps, `RootCost`,
@@ -1034,8 +1047,8 @@ again after session 2.
 
 ## O3: imports straight into the tree
 
-State: merged on 2026-11-14. The library swap and the maintainer's look at
-re-imported maps remain.
+State: merged on 2026-11-14. The library holds the re-imports since the same
+day; the maintainer's look at them remains.
 
 - **Scope:**
   - Read the OGZ octree into the tree through O1a's builder. Edges become
@@ -1065,6 +1078,12 @@ re-imported maps remain.
   maintainer swaps it in. It happens again after 2e, so that inert materials
   and raw texture slots are kept. Implementation sessions never touch the
   library.
+  - **Done 2026-11-14.** The design lead re-imported all 22 with main at
+    `afc0358`, the defaults plus `--skip-unsupported` for the four recovered
+    copies; all 22 equal their library copies reflected. At the maintainer's
+    word the design lead swapped them in, keeping IDs and names, with the old
+    files backed up outside the repository. The server opens the swapped
+    the_cube1m, nub and complex.
 - **Acceptance:**
   - [x] Every library map, re-imported, matches its current copy reflected:
     the loaded trees' digests are equal once the current copy is reflected.
