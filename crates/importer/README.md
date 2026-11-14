@@ -78,3 +78,29 @@ The parser is an independent Rust implementation of the on-disk layout, with no 
 - [Canonical Cube 2 `worldio.cpp`](https://svn.code.sf.net/p/sauerbraten/code/src/engine/worldio.cpp): header, variables, entities, vslots, octree and version-specific surface records.
 - [Canonical Cube 2 `octa.h`](https://svn.code.sf.net/p/sauerbraten/code/src/engine/octa.h) and [`octa.cpp`](https://svn.code.sf.net/p/sauerbraten/code/src/engine/octa.cpp): edge nibbles, face winding and convexity-selected diagonals.
 - [Tesseract `worldio.cpp`](https://github.com/lsalzman/tesseract/blob/master/src/engine/worldio.cpp) and [`ents.h`](https://github.com/lsalzman/tesseract/blob/master/src/shared/ents.h): legacy OCTA compatibility and common entity IDs.
+
+## Generated benchmark worlds
+
+`sauerteig-import generate PRESET --output WORLD.json` writes a generated world
+instead of converting a map, so that a performance measurement can be repeated
+without any imported map. It also writes `WORLD.poses.json` (or `--poses FILE`),
+a pose list for the capture tool that names the world and has cameras in
+rooms, by water and glass, on the stairs and along a flight path. Existing files
+are never overwritten.
+
+```sh
+cargo run --release -p sauerteig-import -- generate small --output .local/generated/small.json
+```
+
+The presets are `test`, `small` (the size of an imported map of about 340,000
+leaves) and `nub1` (about 490,000). `--seed N` and `--edits on|off` change the
+world; the edited layer of small cubes cut into large ones, shaped cubes with
+mixed face materials and scattered blocks is on for `test` and `small` and off
+for `nub1`. The files are the same on every system for the same preset, seed and
+edits. The development guide's [performance checks](../../docs/development.md#generated-benchmark-worlds)
+say how to measure them.
+
+The file is format 3 with regions only, as `convert` writes, so the server opens
+it the way it opens an imported map. Like a converted map it writes most shaped
+cubes with explicit shapes rather than height fields. The command refuses a
+world that the server would not open: over 786,432 leaves or 63 MiB.

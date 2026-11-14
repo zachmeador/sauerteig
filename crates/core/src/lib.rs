@@ -1,5 +1,6 @@
 //! The renderer-independent world and simulation shared by every client and server.
 
+mod benchmark_world;
 mod fine;
 mod geometry;
 mod movement;
@@ -9,6 +10,10 @@ mod protocol;
 mod volumes;
 mod world;
 
+pub use benchmark_world::{
+    generate_benchmark_world, BenchmarkOptions, BenchmarkPose, BenchmarkPreset, BenchmarkWaypoint,
+    BenchmarkWorld, Features, BENCHMARK_SEED,
+};
 pub use fine::*;
 pub use glam::Vec3;
 pub use movement::*;

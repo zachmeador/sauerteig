@@ -491,9 +491,10 @@ Choices and gaps:
 #### 2b. Joining without freezing
 
 State: session 1 (the network thread) merged on 2026-11-14; its in-app checks
-wait for the maintainer. Session 2 waits for octree O1b and large-worlds stage
-1. Two sessions, each merged on its own: the network thread, then building on
-worker threads. Client only; the protocol doesn't change.
+wait for the maintainer. Session 2 is ready: octree O1b and large-worlds stage
+1 merged on 2026-11-14. Two sessions, each merged on its own: the network
+thread, then building on worker threads. Client only; the protocol doesn't
+change.
 
 - **Decided:** the client half of decision 1, and decision 2's worker-thread
   build, still fed by today's JSON Welcome.
@@ -687,7 +688,8 @@ Choices and gaps:
 
 ##### 2b, session 2: building on worker threads
 
-State: waits for session 1, octree O1b and large-worlds stage 1. Wave 2.
+State: ready (session 1, octree O1b and large-worlds stage 1 have merged).
+Wave 2.
 
 - **Building.**
   - On Welcome, worker threads build the World's tree, mesh every chunk, and

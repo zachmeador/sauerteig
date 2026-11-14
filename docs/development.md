@@ -353,6 +353,56 @@ timestamps otherwise. The asynchronous profiler never waits for a sample during
 play. Pass spans can overlap on Metal, so do not add them to obtain a GPU frame
 time.
 
+### Generated benchmark worlds
+
+Anyone can reproduce a large-world measurement without a private map library:
+`sauerteig-import generate` writes a world file and a pose file for the capture
+tool from a seed, with the same bytes on every system.
+
+```sh
+. ./scripts/env.sh
+mkdir -p .local/generated
+cargo run --release -p sauerteig-import -- generate small \
+  --output .local/generated/small.json
+```
+
+This writes `small.json` and `small.poses.json` beside it and refuses to replace
+either. The presets are `test` (about 15,000 leaves, which the digest tests
+use), `small` (about the size of the_cube, an imported map of 339,113 leaves:
+356,000 without the edited layer and 429,000 with it) and `nub1` (about the size
+of nub1: 486,000 leaves). `--edits on|off` switches the edited layer, which is on
+for `test` and `small` and off for `nub1`, whose file would pass the 63 MiB
+limit of saves and joins with it. `--seed N` changes the world; the recorded
+digests use the default seed. The command prints the tree's digest, which is
+what the core's digest test compares for `test`, and it refuses a world over the
+server's 786,432-leaf guard or 63 MiB.
+
+The worlds have what a map has: solid and shaped cubes from an eighth of a metre
+to tens of metres, built into rooms (some long and narrow, as corridors), stairwells and open
+ground,
+with a heightfield over the surroundings, lake basins and pools of water, glass
+windows, skylights and canopies, lights in the rooms and spawns outside. The
+generator is in `crates/core/src/benchmark_world.rs` and uses integers only.
+
+To measure a world, copy it first, because the server saves into its folder:
+
+```sh
+mkdir -p .local/bench && cp .local/generated/small.json .local/bench/
+cargo build --release -p sauerteig-server
+target/release/sauerteig-server --world .local/bench/small.json \
+  --bind 127.0.0.1:3100 &
+curl -s http://127.0.0.1:3100/health    # leaves by kind, nodes, bytes
+ps -o rss= -p $!                        # resident memory in KiB, after loading
+```
+
+The load time is from starting the server to its first `/health` answer. Compare
+the_cube by running the same with a copy of `.local/the_cube1m.json`, one after
+the other and several times, on a computer that is otherwise idle. Frame times
+come from the capture tool on the pose file (`--poses .local/generated/small.poses.json`)
+with `--throughput N --runs M` as below; its report also counts the world's
+triangles. The pose file names the world by the path given to `--output`, so run
+the capture tool from the folder you ran `generate` in.
+
 For fixed native renderer comparisons, source `scripts/env.sh`, then run:
 
 ```sh

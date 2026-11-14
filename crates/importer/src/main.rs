@@ -1,4 +1,5 @@
 mod cli;
+mod generate;
 
 use cli::{Center, Command};
 use sauerteig_core::FINE_UNITS;
@@ -20,7 +21,12 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let Some(args) = cli::parse(std::env::args().skip(1))? else {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|first| first == "generate") {
+        args.next();
+        return generate::run(args);
+    }
+    let Some(args) = cli::parse(args)? else {
         help();
         return Ok(());
     };
@@ -168,6 +174,7 @@ fn help() {
 
   sauerteig-import inspect MAP.ogz [--report REPORT.json] [--cfg MAP.cfg]
   sauerteig-import convert MAP.ogz --output WORLD.json [options]
+  sauerteig-import generate PRESET --output WORLD.json   (see generate --help)
 
 Conversion options:
   --units-per-metre N     Power of two, default 8 (never automatic shrinking)
