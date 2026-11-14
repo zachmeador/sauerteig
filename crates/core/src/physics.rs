@@ -566,7 +566,7 @@ pub fn simulate_player_with(
     if !player.movement.falling.is_finite() {
         player.movement.falling = 0.0;
     }
-    let right = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
+    let right = Vec3::new(libm::cosf(player.yaw), 0.0, libm::sinf(player.yaw));
     if player.editing {
         let wish = forward(player.yaw, player.pitch) * axis(input.forward)
             + right * axis(input.strafe)

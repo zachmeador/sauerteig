@@ -197,7 +197,7 @@ fn main() {
                         seq: tick,
                         forward: 1.0,
                         strafe: if index % 2 == 0 { 0.35 } else { -0.35 },
-                        yaw: to_center.x.atan2(-to_center.z),
+                        yaw: libm::atan2f(to_center.x, -to_center.z),
                         jump: (tick + index as u32 * 7).is_multiple_of(90),
                         ..InputFrame::default()
                     };

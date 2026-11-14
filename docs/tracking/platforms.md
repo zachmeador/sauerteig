@@ -175,8 +175,10 @@ account can't be billed for Actions.
 
 ## Stage 2: identical movement in every build
 
-State: ready. Wave 1, small. It must pass before players on different builds
-play together, and shared-sandbox 2d ships only once it has.
+State: merged on 2026-11-14. Exact in dev and release builds on macOS ARM64 and,
+under Rosetta, x86-64; the CI runs on Linux and Windows wait for stage 1. It
+must pass there before players on different builds play together, and
+shared-sandbox 2d ships only once it has.
 
 - **Why.** The server simulates every player, and each client predicts its own
   movement with the same code. On each snapshot the client takes the server's
@@ -248,12 +250,12 @@ play together, and shared-sandbox 2d ships only once it has.
   second to merge rebases onto the first. Don't run it beside a world-format
   stage that edits movement.
 - **Acceptance:**
-  - [ ] The cause is recorded.
-  - [ ] On the Mac, with every scenario exact, core's tests pass in dev and
-    release builds. Where the lead allows it, they also pass for
-    `x86_64-apple-darwin` under Rosetta and in Linux containers, which reach
-    x86-64 and Linux before CI does.
-  - [ ] The Sauerbraten golden passes the same way.
+  - [x] The cause is recorded (see the Record below).
+  - [x] On the Mac, with every scenario exact, core's tests pass in dev and
+    release builds, and for `x86_64-apple-darwin` under Rosetta. Linux
+    containers were not run: Docker is installed but its daemon wasn't
+    running, and the session didn't start it.
+  - [x] The Sauerbraten golden passes the same way (same limits).
   - [ ] In CI, core's tests pass in dev and release builds on Linux x86-64,
     Linux ARM64, Windows x86-64 and macOS ARM64. This needs stage 1's jobs, so
     the lead checks it on a `ci/` branch holding both stages, or on `main` once
@@ -261,9 +263,56 @@ play together, and shared-sandbox 2d ships only once it has.
   - [ ] Not observable on one machine: a player on Windows or Linux joining a
     Mac host sees no snapping while strafing and turning. Needs a second
     machine and a tester.
-- **Record:** the cause; the functions replaced and what replaced them; whether
-  Arena's recorded bits changed, by how much at most and why; and the result on
-  each system and build, on the Mac and in CI.
+- **Record:**
+  - **Cause.** In an optimized build, LLVM merges the `sin` and `cos` of the
+    same angle in `forward` and the steering of `simulate_player_with` into one
+    call of Apple's combined `__sincosf_stret`, whose result can differ in the
+    last bit from separate `sinf` and `cosf` calls, which the dev build makes.
+    `nm` on the release test binary lists `___sincosf_stret`. That is why
+    tick 9 of `turning` (the first tick with a non-trivial yaw) differs by one
+    unit in the last place in release only. On other systems the same call can
+    differ more, since each C library rounds its own way.
+  - **Replaced.** `f32::sin` and `cos` in `forward` (`lib.rs`) and the strafe
+    vector in `simulate_player_with` (`physics.rs`) became `libm::sinf` and
+    `cosf`. `powf` in `EaseTable::new` (`movement.rs`) became `libm::pow`. The
+    two `f64::atan2` calls (`shape_contains` in `geometry.rs`, the cap boundary
+    turn in `fine.rs`) became `libm::atan2`. The `powi(4)` thresholds in
+    `shape_triangles` and `clip_plane` became explicit multiplications, in
+    the same order `powi` uses, so their value is unchanged; `powi` is
+    otherwise a compiler routine that could differ by build. `sqrt`,
+    `normalize`, `length`, `rem_euclid` and `clamp` are exact IEEE operations
+    and stay. The client's own uses of the system functions (animation, audio,
+    lighting) don't feed the simulation and stay.
+  - **Guard.** `crates/core/clippy.toml` lists `disallowed-methods` for the
+    transcendental, `powf`, `powi`, `hypot` and `cbrt` methods of `f32` and
+    `f64`. Clippy applies it to the library, tests and examples, so the
+    tests' own inputs and the movement oracle use `libm` as well. I checked
+    that a violation is reported.
+  - **Goldens.** `TRIG_TOLERANCE`, the `trig` markers and the recording
+    platform line are gone; all 19 scenarios compare bit for bit everywhere.
+    The same 19 scenarios now also run under `MovementProfile::sauerbraten()`
+    against `golden/sauerbraten_trajectories.txt`, with the same per-tick
+    form. Both files are rewritten by `SAUERTEIG_RECORD_GOLDEN=1`.
+  - **Arena's bits changed,** in the two scenarios that turn the view
+    (`turning`: 242 of its 1,200 values, `pitched_flight`: 8 of its 720). Everything else
+    is unchanged, and every grounded flag is identical. Checked by comparing
+    the new recording with the old one tick by tick: the largest difference in
+    any value is 9.5e-7, against the old tolerance of 2e-3. The reason is that
+    `libm` rounds sines and cosines differently from Apple's library in the
+    last bit, and the difference then travels through the step.
+  - **Results on the Mac (aarch64-apple-darwin, M5 Pro).** `cargo test
+    --workspace --locked` and `cargo test -p sauerteig-core --release --locked`
+    pass, as does `cargo test -p sauerteig-core --locked --target
+    x86_64-apple-darwin` and the same with `--release` under Rosetta (both
+    goldens exact). Fmt and `cargo clippy --workspace --all-targets --locked
+    -- -D warnings` are clean.
+  - **Waiting for CI:** Linux x86-64, Linux ARM64, Windows x86-64 and macOS
+    ARM64 in both profiles, and the second-machine check. No Linux container
+    ran. Under Rosetta only x86-64 macOS was reached.
+  - **Choices.** The disallow list leaves `mul_add` out, because a fused
+    multiply-add is exact. The Sauerbraten golden reuses the Arena scenarios
+    unchanged, so its worlds are the same floors and ramps, and it doesn't
+    record `Player::movement` (falling velocity shows in the position).
 
 ## GPU backends
 

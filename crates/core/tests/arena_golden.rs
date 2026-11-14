@@ -1,43 +1,51 @@
-//! Arena movement must keep reproducing the trajectories recorded from the
-//! movement code that existed before movement profiles.
+//! Movement must keep reproducing recorded trajectories, bit for bit, in every
+//! build and on every system.
 //!
 //! Every scenario scripts inputs against a fixed world and compares the full
-//! per-tick state (position, velocity, grounded) bit for bit with
-//! `golden/arena_trajectories.txt`. Scenarios marked `trig` steer with
-//! `sin`/`cos` of non-trivial angles, whose last bit differs between platform
-//! math libraries; they are exact on the platform that recorded the file and
-//! within `TRIG_TOLERANCE` elsewhere. Every other scenario is exact everywhere.
+//! per-tick state (position, velocity, grounded) with the golden file of its
+//! profile: `golden/arena_trajectories.txt` holds the trajectories of the
+//! movement code that existed before movement profiles, and
+//! `golden/sauerbraten_trajectories.txt` those of the Sauerbraten profile. There
+//! is no tolerance and no exception for a platform. Core calls the `libm` crate
+//! instead of the system's math library, so the scenarios that turn the view
+//! give the same bits everywhere too.
 //!
-//! To record again after an intentional change to Arena movement:
+//! To record again after an intentional change to movement:
 //! `SAUERTEIG_RECORD_GOLDEN=1 cargo test -p sauerteig-core --test arena_golden`
 
 use sauerteig_core::*;
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::fmt::Write as _;
 
-const GOLDEN: &str = include_str!("golden/arena_trajectories.txt");
-const TRIG_TOLERANCE: f32 = 2.0e-3;
+const ARENA_GOLDEN: &str = include_str!("golden/arena_trajectories.txt");
+const SAUERBRATEN_GOLDEN: &str = include_str!("golden/sauerbraten_trajectories.txt");
 
 struct Recorder {
+    profile: MovementProfile,
     lines: Vec<String>,
     seq: u32,
 }
 
 impl Recorder {
-    fn new() -> Self {
+    fn new(profile: MovementProfile) -> Self {
         Self {
+            profile,
             lines: Vec::new(),
             seq: 0,
         }
     }
 
     fn step(&mut self, world: &World, player: &mut Player, input: &InputFrame, dt: f32) {
-        let mut explicit = player.clone();
-        simulate_player_with(world, &mut explicit, input, dt, &MovementProfile::arena());
-        simulate_player(world, player, input, dt);
-        assert_eq!(player.position, explicit.position);
-        assert_eq!(player.velocity, explicit.velocity);
-        assert!(player.movement.is_idle(), "Arena leaves no movement state");
+        if matches!(self.profile.style, MovementStyle::Arena(_)) {
+            let mut explicit = player.clone();
+            simulate_player_with(world, &mut explicit, input, dt, &self.profile);
+            simulate_player(world, player, input, dt);
+            assert_eq!(player.position, explicit.position);
+            assert_eq!(player.velocity, explicit.velocity);
+            assert!(player.movement.is_idle(), "Arena leaves no movement state");
+        } else {
+            simulate_player_with(world, player, input, dt, &self.profile);
+        }
         let bits = |value: f32| format!("{:08x}", value.to_bits());
         self.lines.push(format!(
             "{} {} {} {} {} {} {}",
@@ -570,7 +578,7 @@ fn pitched_flight(out: &mut Recorder) {
         let frame = InputFrame {
             seq: out.seq,
             yaw: PI * 0.25 + tick as f32 * 0.03,
-            pitch: (tick as f32 * 0.07).sin() * 1.2,
+            pitch: libm::sinf(tick as f32 * 0.07) * 1.2,
             forward: 1.0,
             strafe: if tick > 60 { -1.0 } else { 0.0 },
             vertical: if tick % 50 > 40 { 1.0 } else { 0.0 },
@@ -580,53 +588,44 @@ fn pitched_flight(out: &mut Recorder) {
     }
 }
 
-type Scenario = (&'static str, bool, fn(&mut Recorder));
+type Scenario = (&'static str, fn(&mut Recorder));
 
 fn scenarios() -> Vec<Scenario> {
     vec![
-        ("flat_ground", false, flat_ground),
-        ("varied_time_steps", false, varied_time_steps),
-        ("stairs", false, stairs),
-        ("ramps", false, |out| ramps(out, false)),
-        ("shape_ramps", false, |out| ramps(out, true)),
-        ("jumping", false, jumping),
-        ("ceiling_jump", false, ceiling_jump),
-        ("air_strafing", false, air_strafing),
-        ("wall_slide", false, wall_slide),
-        ("ledge_fall", false, ledge_fall),
-        ("water", false, water),
-        ("edit_flight", false, edit_flight),
-        ("glass", false, glass),
-        ("compact_world", false, compact_world),
-        ("foundry", false, foundry),
-        ("void_respawn", false, void_respawn),
-        ("invalid_state", false, invalid_state),
-        ("turning", true, turning),
-        ("pitched_flight", true, pitched_flight),
+        ("flat_ground", flat_ground),
+        ("varied_time_steps", varied_time_steps),
+        ("stairs", stairs),
+        ("ramps", |out| ramps(out, false)),
+        ("shape_ramps", |out| ramps(out, true)),
+        ("jumping", jumping),
+        ("ceiling_jump", ceiling_jump),
+        ("air_strafing", air_strafing),
+        ("wall_slide", wall_slide),
+        ("ledge_fall", ledge_fall),
+        ("water", water),
+        ("edit_flight", edit_flight),
+        ("glass", glass),
+        ("compact_world", compact_world),
+        ("foundry", foundry),
+        ("void_respawn", void_respawn),
+        ("invalid_state", invalid_state),
+        ("turning", turning),
+        ("pitched_flight", pitched_flight),
     ]
 }
 
-fn platform() -> String {
-    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
-}
-
-fn render() -> String {
+fn render(title: &str, profile: &MovementProfile) -> String {
     let mut text = String::new();
-    writeln!(
-        text,
-        "# Arena trajectories recorded from simulate_player before movement profiles."
-    )
-    .unwrap();
+    writeln!(text, "# {title}").unwrap();
     writeln!(
         text,
         "# Per tick: position, velocity (f32 bit patterns), grounded."
     )
     .unwrap();
-    writeln!(text, "platform {}", platform()).unwrap();
-    for (name, trig, run) in scenarios() {
-        let mut out = Recorder::new();
+    for (name, run) in scenarios() {
+        let mut out = Recorder::new(*profile);
         run(&mut out);
-        writeln!(text, "scenario {name}{}", if trig { " trig" } else { "" }).unwrap();
+        writeln!(text, "scenario {name}").unwrap();
         for line in out.lines {
             writeln!(text, "{line}").unwrap();
         }
@@ -634,55 +633,56 @@ fn render() -> String {
     text
 }
 
-fn float(token: &str) -> f32 {
-    f32::from_bits(u32::from_str_radix(token, 16).unwrap())
+const ARENA_TITLE: &str =
+    "Arena trajectories first recorded at b259f11; re-recorded 2026-11-14 with libm (within 9.6e-7).";
+const SAUERBRATEN_TITLE: &str = "Sauerbraten profile trajectories of the same scenarios.";
+
+fn golden_path(file: &str) -> String {
+    format!("{}/tests/golden/{file}", env!("CARGO_MANIFEST_DIR"))
 }
 
-#[test]
-fn arena_reproduces_the_recorded_trajectories() {
-    if std::env::var_os("SAUERTEIG_RECORD_GOLDEN").is_some() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/golden/arena_trajectories.txt"
-        );
-        std::fs::write(path, render()).unwrap();
-        return;
+fn record_requested() -> bool {
+    static RECORDED: std::sync::Once = std::sync::Once::new();
+    let requested = std::env::var_os("SAUERTEIG_RECORD_GOLDEN").is_some();
+    if requested {
+        RECORDED.call_once(record);
     }
-    let recorded_platform = GOLDEN
+    requested
+}
+
+fn record() {
+    let files = [
+        (
+            "arena_trajectories.txt",
+            ARENA_TITLE,
+            MovementProfile::arena(),
+        ),
+        (
+            "sauerbraten_trajectories.txt",
+            SAUERBRATEN_TITLE,
+            MovementProfile::sauerbraten(),
+        ),
+    ];
+    for (file, title, profile) in files {
+        std::fs::write(golden_path(file), render(title, &profile)).unwrap();
+    }
+}
+
+fn check(golden: &str, profile: &MovementProfile) {
+    let mut recorded = golden
         .lines()
-        .find_map(|line| line.strip_prefix("platform "))
-        .expect("golden file names its platform");
-    let exact_platform = recorded_platform == platform();
-    let mut recorded = GOLDEN
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.starts_with("platform "))
+        .filter(|line| !line.starts_with('#'))
         .peekable();
-    for (name, trig, run) in scenarios() {
-        let header = format!("scenario {name}{}", if trig { " trig" } else { "" });
+    for (name, run) in scenarios() {
+        let header = format!("scenario {name}");
         assert_eq!(recorded.next(), Some(header.as_str()), "scenario order");
-        let mut out = Recorder::new();
+        let mut out = Recorder::new(*profile);
         run(&mut out);
-        let exact = !trig || exact_platform;
         for (tick, line) in out.lines.iter().enumerate() {
             let expected = recorded
                 .next_if(|line| !line.starts_with("scenario "))
                 .unwrap_or_else(|| panic!("{name}: recording ends at tick {tick}"));
-            if exact {
-                assert_eq!(line, expected, "{name}: tick {tick} differs from recording");
-                continue;
-            }
-            let (actual, wanted): (Vec<_>, Vec<_>) = (
-                line.split(' ').collect::<Vec<_>>(),
-                expected.split(' ').collect::<Vec<_>>(),
-            );
-            assert_eq!(actual[6], wanted[6], "{name}: tick {tick} grounded flag");
-            for (a, w) in actual[..6].iter().zip(&wanted[..6]) {
-                let (a, w) = (float(a), float(w));
-                assert!(
-                    (a - w).abs() <= TRIG_TOLERANCE,
-                    "{name}: tick {tick} differs from recording by more than {TRIG_TOLERANCE}: {a} vs {w}"
-                );
-            }
+            assert_eq!(line, expected, "{name}: tick {tick} differs from recording");
         }
         assert!(
             recorded
@@ -692,4 +692,20 @@ fn arena_reproduces_the_recorded_trajectories() {
         );
     }
     assert_eq!(recorded.next(), None, "unused recorded scenarios");
+}
+
+#[test]
+fn arena_reproduces_the_recorded_trajectories() {
+    if record_requested() {
+        return;
+    }
+    check(ARENA_GOLDEN, &MovementProfile::arena());
+}
+
+#[test]
+fn sauerbraten_reproduces_the_recorded_trajectories() {
+    if record_requested() {
+        return;
+    }
+    check(SAUERBRATEN_GOLDEN, &MovementProfile::sauerbraten());
 }

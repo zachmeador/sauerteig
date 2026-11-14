@@ -516,7 +516,9 @@ fn clip_plane(
         }
         for i in 1..polygon.len() - 1 {
             let t = [polygon[0], polygon[i], polygon[i + 1]];
-            if (t[1] - t[0]).cross(t[2] - t[0]).length_squared() > CLIP_EPS.powi(4) {
+            if (t[1] - t[0]).cross(t[2] - t[0]).length_squared()
+                > (CLIP_EPS * CLIP_EPS) * (CLIP_EPS * CLIP_EPS)
+            {
                 result.push((t, face));
             }
         }
@@ -580,8 +582,10 @@ fn clip_plane(
                     let turn = |to: glam::DVec3| {
                         let outgoing = to - end;
                         let cross = incoming[u] * outgoing[v] - incoming[v] * outgoing[u];
-                        (-keep_sign * cross)
-                            .atan2(incoming[u] * outgoing[u] + incoming[v] * outgoing[v])
+                        libm::atan2(
+                            -keep_sign * cross,
+                            incoming[u] * outgoing[u] + incoming[v] * outgoing[v],
+                        )
                     };
                     turn(a.1).total_cmp(&turn(b.1))
                 })
@@ -760,7 +764,12 @@ mod tests {
                 .map(|t| t.points[0].dot(t.points[1].cross(t.points[2])) / 6.0)
                 .sum::<f32>();
             assert!(
-                (volume - (size as f32 / 8.0).powi(3)).abs() < 1.0e-5,
+                (volume - {
+                    let edge = size as f32 / 8.0;
+                    edge * edge * edge
+                })
+                .abs()
+                    < 1.0e-5,
                 "volume {volume}"
             );
         }

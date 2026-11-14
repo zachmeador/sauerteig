@@ -93,7 +93,7 @@ fn within(actual: f32, expected: f32, tolerance: f32) -> bool {
 }
 
 fn horizontal_speed(player: &Player) -> f32 {
-    player.velocity.x.hypot(player.velocity.z)
+    libm::hypotf(player.velocity.x, player.velocity.z)
 }
 
 #[test]
@@ -125,14 +125,14 @@ fn the_oracle_agrees_with_closed_form_sauerbraten_numbers() {
     let ground = 5.0_f64 / 6.0;
     assert!(within(
         metrics.time_to_90,
-        (0.02 * 0.1_f64.ln() / ground.ln()) as f32,
+        (0.02 * libm::log(0.1) / libm::log(ground)) as f32,
         5.0e-3
     ));
     // Without input the speed keeps 5/6 of itself per interval. Frame by 5 ms
     // frame the distance is a geometric series that stops at 1% of the speed.
-    let per_frame = ground.powf(0.25);
-    let frames = (0.01_f64.ln() / per_frame.ln()).ceil() as i32;
-    let series = per_frame * (1.0 - per_frame.powi(frames)) / (1.0 - per_frame);
+    let per_frame = libm::pow(ground, 0.25);
+    let frames = (libm::log(0.01) / libm::log(per_frame)).ceil() as i32;
+    let series = per_frame * (1.0 - libm::pow(per_frame, f64::from(frames))) / (1.0 - per_frame);
     let expected = metrics.top_forward as f64 * 0.005 * series;
     assert!(
         within(metrics.stop_distance, expected as f32, 1.0e-3),
@@ -453,8 +453,8 @@ fn steering_in_water_stops_gravity_and_follows_the_view_pitch() {
     };
     let climbing = swim(&profile, look_up, 300);
     let last = climbing.last().unwrap();
-    let slope = last.velocity.y / last.velocity.x.hypot(last.velocity.z);
-    assert!(within(slope, pitch.tan(), 1.0e-3), "{slope}");
+    let slope = last.velocity.y / libm::hypotf(last.velocity.x, last.velocity.z);
+    assert!(within(slope, libm::tanf(pitch), 1.0e-3), "{slope}");
     assert!(last.position.y > 30.0 + 10.0);
     // A swimmer moves by half the eased velocity.
     let speed = (last.position - after(&climbing, 4.0).position).length() / 1.0;
@@ -536,7 +536,7 @@ fn entering_water_slows_the_eased_velocity_once() {
     let mut player = player_at(Vec3::new(0.0, 30.0, 0.0));
     player.velocity = Vec3::new(8.0, 0.0, 0.0);
     // Per tick the gap to a standstill closes by (19/20) over a 20 ms interval.
-    let ease = (19.0_f64 / 20.0).powf(f64::from(FIXED_DT) / 0.02) as f32;
+    let ease = libm::pow(19.0_f64 / 20.0, f64::from(FIXED_DT) / 0.02) as f32;
     run(&world, &mut player, &profile, InputFrame::default(), 1);
     assert!(
         within(player.velocity.x, ease, 1.0e-3),

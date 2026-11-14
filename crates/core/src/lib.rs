@@ -35,8 +35,8 @@ pub const FIXED_DT: f32 = 1.0 / 60.0;
 /// Yaw zero faces -Z; positive yaw turns right and positive pitch looks up.
 pub fn forward(yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(
-        yaw.sin() * pitch.cos(),
-        pitch.sin(),
-        -yaw.cos() * pitch.cos(),
+        libm::sinf(yaw) * libm::cosf(pitch),
+        libm::sinf(pitch),
+        -libm::cosf(yaw) * libm::cosf(pitch),
     )
 }

@@ -84,17 +84,17 @@ impl Ent {
 fn vecfromyawpitch(yaw: f32, pitch: f32, mv: i32, strafe: i32) -> Vec3 {
     let mut m = Vec3::ZERO;
     if mv != 0 {
-        m.x = mv as f32 * -(RAD * yaw).sin();
-        m.y = mv as f32 * (RAD * yaw).cos();
+        m.x = mv as f32 * -libm::sinf(RAD * yaw);
+        m.y = mv as f32 * libm::cosf(RAD * yaw);
     }
     if pitch != 0.0 {
-        m.x *= (RAD * pitch).cos();
-        m.y *= (RAD * pitch).cos();
-        m.z = mv as f32 * (RAD * pitch).sin();
+        m.x *= libm::cosf(RAD * pitch);
+        m.y *= libm::cosf(RAD * pitch);
+        m.z = mv as f32 * libm::sinf(RAD * pitch);
     }
     if strafe != 0 {
-        m.x += strafe as f32 * (RAD * yaw).cos();
-        m.y += strafe as f32 * (RAD * yaw).sin();
+        m.x += strafe as f32 * libm::cosf(RAD * yaw);
+        m.y += strafe as f32 * libm::sinf(RAD * yaw);
     }
     m
 }
@@ -121,7 +121,7 @@ fn modifygravity(pl: &mut Ent, water: bool, curtime: i32) {
         } else {
             ((pl.floor.z - SLOPEZ) / (FLOORZ - SLOPEZ)).clamp(0.0, 1.0)
         };
-        pl.falling *= (1.0 - c / fric).powf(curtime as f32 / 20.0);
+        pl.falling *= libm::powf(1.0 - c / fric, curtime as f32 / 20.0);
     }
 }
 
@@ -165,7 +165,7 @@ fn modifyvelocity(pl: &mut Ent, water: bool, curtime: i32) {
     } else {
         30.0
     };
-    let f = (1.0 - 1.0 / fric).powf(curtime as f32 / 20.0);
+    let f = libm::powf(1.0 - 1.0 / fric, curtime as f32 / 20.0);
     pl.vel = Vec3::new(
         d.x + (pl.vel.x - d.x) * f,
         d.y + (pl.vel.y - d.y) * f,

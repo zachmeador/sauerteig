@@ -139,6 +139,20 @@ water. Arena clears it, and idle state is not serialized, so Arena snapshots are
 unchanged. Whatever resets a player's velocity, such as a respawn or a mode
 change, must reset `movement` with it.
 
+Movement gives the same bits in every build (dev and release) and on every
+system, with no tolerance. The server and each client's prediction compute the
+same step, and a last-bit difference can grow in collision into a visible
+correction. Code that movement depends on therefore calls the `libm` crate
+(`libm::sinf`, `libm::cosf`, `libm::pow`, `libm::atan2`, and so on) and never
+the system's math library through `f32::sin`, `powf`, `atan2` and the like,
+whose last bits differ between systems and between optimization levels. It
+writes powers as multiplications instead of `powi`. Square roots, `abs`,
+`floor`, `%` and basic arithmetic are exact in IEEE 754 and stay allowed.
+`crates/core/clippy.toml` lists the forbidden methods, and Clippy rejects them
+in every target of the crate. Two golden files pin the result: `tests/golden/`
+holds the Arena and Sauerbraten trajectories, compared bit for bit by
+`tests/arena_golden.rs`. Any later movement golden follows the same rule.
+
 ## Simulation and transport
 
 [`protocol.rs`](src/protocol.rs) defines JSON messages, with snake-case `type`

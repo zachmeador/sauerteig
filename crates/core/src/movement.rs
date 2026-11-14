@@ -183,7 +183,10 @@ impl EaseTable {
     fn new(tuning: &SauerbratenTuning, step: f32) -> Self {
         let source = tuning.easing();
         let factor = |ease: f32| {
-            (1.0 - 1.0 / f64::from(ease.max(1.0))).powf(f64::from(step) / EASE_INTERVAL) as f32
+            libm::pow(
+                1.0 - 1.0 / f64::from(ease.max(1.0)),
+                f64::from(step) / EASE_INTERVAL,
+            ) as f32
         };
         Self {
             step,
@@ -328,7 +331,14 @@ mod tests {
         assert!((table.water - 19.0 / 20.0).abs() < 1.0e-7);
         assert!((table.water_fall - 0.5).abs() < 1.0e-7);
         let quarter = tuning.ease_table(0.005);
-        assert!((quarter.ground.powi(4) - table.ground).abs() < 1.0e-6);
+        assert!(
+            ({
+                let q = quarter.ground * quarter.ground;
+                q * q
+            } - table.ground)
+                .abs()
+                < 1.0e-6
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ glam.workspace = true
 serde.workspace = true
 earcutr = "0.4"
 im = { version = "15.1", features = ["serde"] }
+libm = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

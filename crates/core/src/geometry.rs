@@ -563,7 +563,7 @@ pub(crate) fn shape_triangles(
             if (triangle[1] - triangle[0])
                 .cross(triangle[2] - triangle[0])
                 .length_squared()
-                > EPS * EPS * size.powi(4)
+                > EPS * EPS * ((size * size) * (size * size))
             {
                 triangles[face * 2 + part] = Some((triangle, face as u8));
             }
@@ -820,7 +820,7 @@ fn shape_contains(shape: Shape, point: Vec3) -> bool {
             + a.dot(b) * c.length()
             + b.dot(c) * a.length()
             + c.dot(a) * b.length();
-        angle += 2.0 * a.dot(b.cross(c)).atan2(denominator);
+        angle += 2.0 * libm::atan2(a.dot(b.cross(c)), denominator);
     }
     angle > std::f64::consts::TAU
 }
