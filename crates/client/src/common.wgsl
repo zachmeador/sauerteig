@@ -1,4 +1,7 @@
-struct LightCamera { view_proj: mat4x4<f32> };
+// One shadow tile's camera. `copy` is used only when a per-frame tile starts as
+// a copy of its static tile: the offset from a texel of the per-frame tile to
+// the same texel of the static one, and the static page.
+struct LightCamera { view_proj: mat4x4<f32>, copy: vec4<i32> };
 fn rotate_y(p: vec3<f32>, yaw: f32) -> vec3<f32> {
     let c = cos(yaw); let s = sin(yaw);
     return vec3<f32>(c*p.x + s*p.z, p.y, -s*p.x + c*p.z);
@@ -14,13 +17,16 @@ struct Camera {
 };
 // One light: position and range; color times intensity times fade, and the
 // spot cone's scale; spot direction and cone offset; and flags (bit 0 spot,
-// bits 1-2 shadow mode, 3.. overlay slots) with six 16-bit shadow tile
-// references. A spot light keeps its tile's tangent in packed.z.
+// bits 1-2 shadow mode) with a spot light's tile tangent in packed.z. Each
+// face has a static tile reference (page above a 10-bit slot) and, when actors
+// can shadow it, a per-frame one; NO_TILE where there is none.
 struct Light {
     position_range: vec4<f32>,
     color_scale: vec4<f32>,
     direction_offset: vec4<f32>,
     packed: vec4<u32>,
+    tiles: array<u32, 6>,
+    frame_tiles: array<u32, 6>,
 };
 struct LightParams {
     // Clusters across, down and in depth, then the light count.
@@ -31,8 +37,8 @@ struct LightParams {
     screen: vec4<f32>,
     // Far plane.
     range: vec4<f32>,
-    // 1 = read cluster masks, 0 = every light; two bits of tile size per page;
-    // the overlay page; lights per fragment.
+    // 1 = read cluster masks, 0 = every light; mask words in each cluster; zero;
+    // the most lights a fragment shades (no limit unless a comparison sets one).
     mode: vec4<u32>,
 };
 // Camera and lighting bindings follow the reusable types.
@@ -43,9 +49,14 @@ struct LightParams {
 @group(1) @binding(5) var<uniform> light_params: LightParams;
 @group(1) @binding(3) var<storage, read> lights: array<Light>;
 @group(1) @binding(4) var<storage, read> cluster_masks: array<u32>;
-fn light_at(i: u32) -> Light { return lights[i]; }
+// The tile size of each page: static pages first, then per-frame pages from
+// FRAME_PAGE_BASE.
+@group(1) @binding(6) var<storage, read> page_table: array<u32>;
+@group(1) @binding(7) var frame_atlas: texture_depth_2d_array;
 fn light_sphere(i: u32) -> vec4<f32> { return lights[i].position_range; }
-fn mask_word(cluster: u32, word: u32) -> u32 { return cluster_masks[cluster * MASK_WORDS + word]; }
+fn mask_word(cluster: u32, word: u32) -> u32 {
+    return cluster_masks[cluster * light_params.mode.y + word];
+}
 
 // Depth changes across a sloping receiver. Comparing every PCF tap against
 // the center depth stripes the surface; project its tangent plane instead.
@@ -65,12 +76,11 @@ fn depth_gradient(matrix: mat4x4<f32>, clip: vec4<f32>, normal: vec3<f32>) -> ve
     return vec2<f32>(da.z * ub.y - db.z * ua.y, ua.x * db.z - ub.x * da.z) / det;
 }
 
-// ATLAS_SIZE, SHADOW_NEAR, TILE_GUARD_SCALE, NO_TILE, OVERLAY_NONE, MASK_WORDS and
-// MAX_LIGHTS are defined ahead of this module by the assembler.
+// ATLAS_SIZE, SHADOW_NEAR, GUARD_TEXELS, NO_TILE, FRAME_PAGE_BASE, MAX_LIGHT_WORDS
+// and MAX_LIGHTS are defined ahead of this module by the assembler.
 // Receiver offset along the normal, and depth bias, in tile texels.
 const NORMAL_OFFSET: f32 = 1.5;
 const DEPTH_BIAS: f32 = 1.0;
-const TRANSPARENT_LIGHTS: u32 = 8u;
 // The sun: receiver offset along the normal in cascade texels (never under
 // 4 mm), the depth bias in clip depth, and how much of a cascade's edge fades
 // into the next one.
@@ -131,19 +141,21 @@ fn tile_depth(distance: f32, far: f32) -> f32 {
     return far * (d - SHADOW_NEAR) / ((far - SHADOW_NEAR) * d);
 }
 
-// Fraction of a light reaching a point through one shadow tile. `to_point` is
-// from the light, in the tile's frame (right, up, forward). Each tap compares
-// against the depth the receiver's own tangent plane has at that tap, so a
-// sloped surface does not shadow itself.
+// Fraction of a light reaching a point through one shadow tile, of the static
+// atlas or, with `frame`, of the per-frame one. `base_tan` is the tangent of the
+// half field of view without the guard band; `to_point` is from the light, in
+// the tile's frame (right, up, forward). Each tap compares against the depth
+// the receiver's own tangent plane has at that tap, so a sloped surface does
+// not shadow itself.
 fn tile_visibility(
-    tile: u32, tan_half: f32,
+    tile: u32, frame: bool, base_tan: f32,
     right: vec3<f32>, up: vec3<f32>, forward: vec3<f32>,
     far: f32, to_point: vec3<f32>, normal: vec3<f32>, taps: u32,
 ) -> f32 {
-    let page = tile >> 8u;
-    let slot = tile & 255u;
-    let size_code = (light_params.mode.y >> (page * 2u)) & 3u;
-    let size = 128.0 * f32(1u << size_code);
+    let page = tile >> 10u;
+    let slot = tile & 1023u;
+    let size = 32.0 * f32(1u << page_table[select(page, FRAME_PAGE_BASE + page, frame)]);
+    let tan_half = base_tan * size / (size - 2.0 * GUARD_TEXELS);
     let per_row = u32(ATLAS_SIZE / size);
     let origin = vec2<f32>(f32(slot % per_row), f32(slot / per_row)) * size;
 
@@ -169,31 +181,40 @@ fn tile_visibility(
     let texel_tan = tan_half / size;
     if (taps == 1u) {
         let tap = (origin + uv * size) / ATLAS_SIZE;
-        return textureSampleCompareLevel(atlas, shadow_sampler, tap, i32(page), tile_depth(d - bias, far));
+        let reference = tile_depth(d - bias, far);
+        if (frame) {
+            return textureSampleCompareLevel(frame_atlas, shadow_sampler, tap, i32(page), reference);
+        }
+        return textureSampleCompareLevel(atlas, shadow_sampler, tap, i32(page), reference);
     }
     var sum = 0.0;
     for (var i = 0u; i < 4u; i += 1u) {
         let sx = select(-0.5, 0.5, (i & 1u) != 0u);
         let sy = select(-0.5, 0.5, (i & 2u) != 0u);
-        let reference = d + clamp((slope.x * sx - slope.y * sy) * 2.0 * texel_tan, -limit, limit) - bias;
+        let reference = tile_depth(d + clamp((slope.x * sx - slope.y * sy) * 2.0 * texel_tan, -limit, limit) - bias, far);
         let tap = (origin + uv * size + vec2<f32>(sx, sy)) / ATLAS_SIZE;
-        sum += textureSampleCompareLevel(atlas, shadow_sampler, tap, i32(page), tile_depth(reference, far));
+        if (frame) {
+            sum += textureSampleCompareLevel(frame_atlas, shadow_sampler, tap, i32(page), reference);
+        } else {
+            sum += textureSampleCompareLevel(atlas, shadow_sampler, tap, i32(page), reference);
+        }
     }
     return sum * 0.25;
 }
 
-// Fraction of a light's illumination that reaches the surface.
-fn light_visibility(l: Light, s: Surface, taps: u32) -> f32 {
+// Fraction of light `index`'s illumination that reaches the surface.
+fn light_visibility(index: u32, s: Surface, taps: u32) -> f32 {
+    let l = lights[index];
     let spot = (l.packed.x & 1u) != 0u;
     let to_point = s.position - l.position_range.xyz;
     var face = 0u;
     var forward = vec3<f32>(0.0);
     var up = vec3<f32>(0.0, 1.0, 0.0);
-    var tan_half = TILE_GUARD_SCALE;
+    var base_tan = 1.0;
     if (spot) {
         forward = l.direction_offset.xyz;
         if (abs(forward.y) > 0.99) { up = vec3<f32>(0.0, 0.0, 1.0); }
-        tan_half = bitcast<f32>(l.packed.z);
+        base_tan = bitcast<f32>(l.packed.z);
     } else {
         let a = abs(to_point);
         var axis = 0u;
@@ -203,21 +224,20 @@ fn light_visibility(l: Light, s: Surface, taps: u32) -> f32 {
         forward[axis] = select(1.0, -1.0, negative);
         if (axis == 1u) { up = vec3<f32>(0.0, 0.0, 1.0); }
     }
-    let pair = l.packed[1u + face / 2u];
-    let tile = (pair >> ((face & 1u) * 16u)) & 0xFFFFu;
+    let tile = lights[index].tiles[face];
     if (tile == NO_TILE) { return 1.0; }
     let right = normalize(cross(forward, up));
     let true_up = cross(right, forward);
     let far = l.position_range.w;
-    var visibility = tile_visibility(tile, tan_half, right, true_up, forward, far, to_point, s.geometric, taps);
+    // A face that an actor can shadow has a per-frame tile that began as a copy
+    // of its static tile, so it alone gives the shadow.
     if (((l.packed.x >> 1u) & 3u) == 2u) {
-        let slot = (l.packed.x >> (3u + 4u * face)) & 15u;
-        if (slot != OVERLAY_NONE) {
-            let overlay = (light_params.mode.z << 8u) | slot;
-            visibility = min(visibility, tile_visibility(overlay, tan_half, right, true_up, forward, far, to_point, s.geometric, taps));
+        let frame_tile = lights[index].frame_tiles[face];
+        if (frame_tile != NO_TILE) {
+            return tile_visibility(frame_tile, true, base_tan, right, true_up, forward, far, to_point, s.geometric, taps);
         }
     }
-    return visibility;
+    return tile_visibility(tile, false, base_tan, right, true_up, forward, far, to_point, s.geometric, taps);
 }
 
 fn light_term(i: u32, s: Surface) -> LightTerm {
@@ -233,7 +253,7 @@ fn light_term(i: u32, s: Surface) -> LightTerm {
     let direction = to_light * inverseSqrt(max(d2, 0.0001));
     let n_dot_l = dot(s.normal, direction);
     if (n_dot_l <= 0.0) { return t; }
-    let l = light_at(i);
+    let l = lights[i];
     let window = 1.0 - d2 / r2;
     var attenuation = window * window / (1.0 + d2);
     if ((l.packed.x & 1u) != 0u) {
@@ -253,7 +273,7 @@ fn light_term(i: u32, s: Surface) -> LightTerm {
     t.used = true;
     var visibility = 1.0;
     if (((l.packed.x >> 1u) & 3u) != 0u) {
-        visibility = light_visibility(l, s, select(1u, 4u, weight >= SHARP_LIGHT));
+        visibility = light_visibility(i, s, select(1u, 4u, weight >= SHARP_LIGHT));
     }
     let radiance = l.color_scale.rgb * (attenuation * visibility);
     if (s.specular_only) {
@@ -266,22 +286,25 @@ fn light_term(i: u32, s: Surface) -> LightTerm {
     return t;
 }
 
-// The lights of a fragment's cluster, or every light in list mode, up to
-// `cap` of those that reach the surface, most important first.
+// The lights of a fragment's cluster, or every light in list mode, up to `cap`
+// of those that reach the surface. The cap is the largest u32 unless a
+// comparison capture sets one.
 fn shade_local_lights(frag: vec4<f32>, s: Surface, cap: u32) -> LightSum {
     var sum: LightSum;
     sum.diffuse = vec3<f32>(0.0);
     sum.specular = vec3<f32>(0.0);
     var used = 0u;
+    let count = min(light_params.grid.w, MAX_LIGHTS);
     if (light_params.mode.x == 1u) {
         let cluster = cluster_index(frag);
-        for (var w = 0u; w < MASK_WORDS; w += 1u) {
+        let words = min(light_params.mode.y, MAX_LIGHT_WORDS);
+        for (var w = 0u; w < words; w += 1u) {
             var bits = mask_word(cluster, w);
             while (bits != 0u) {
                 let bit = firstTrailingBit(bits);
                 bits = bits & (bits - 1u);
                 // Masks are not rewritten in frames without lights.
-                if (w * 32u + bit >= light_params.grid.w) { return sum; }
+                if (w * 32u + bit >= count) { return sum; }
                 let term = light_term(w * 32u + bit, s);
                 if (term.used) {
                     sum.diffuse += term.diffuse;
@@ -292,7 +315,6 @@ fn shade_local_lights(frag: vec4<f32>, s: Surface, cap: u32) -> LightSum {
             }
         }
     } else {
-        let count = min(light_params.grid.w, MAX_LIGHTS);
         for (var i = 0u; i < count; i += 1u) {
             let term = light_term(i, s);
             if (term.used) {

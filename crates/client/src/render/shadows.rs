@@ -1,6 +1,6 @@
 use super::{
     atlas::PAGE_SIZE,
-    lightset::{OverlayJob, TileJob, OVERLAY_CLASS},
+    lightset::{FrameJob, TileJob},
     timing::GpuTiming,
 };
 use glam::Mat4;
@@ -30,7 +30,8 @@ pub(super) fn depth_texture(
     })
 }
 
-const PAGE_LABELS: [&str; 15] = [
+/// Pass labels for the first pages; later pages share the last one.
+const PAGE_LABELS: [&str; 8] = [
     "shadow page 1",
     "shadow page 2",
     "shadow page 3",
@@ -38,49 +39,43 @@ const PAGE_LABELS: [&str; 15] = [
     "shadow page 5",
     "shadow page 6",
     "shadow page 7",
-    "shadow page 8",
-    "shadow page 9",
-    "shadow page 10",
-    "shadow page 11",
-    "shadow page 12",
-    "shadow page 13",
-    "shadow page 14",
-    "shadow page 15",
+    "shadow page 8+",
 ];
-/// The most atlas pages: their sizes share one 32-bit table with the overlay's.
-pub(super) const MAX_PAGES: usize = PAGE_LABELS.len() - 1;
-/// Tile cameras are bound with dynamic offsets of this stride.
-pub(super) const CAMERA_STRIDE: u64 = 256;
-/// Atlas tiles and overlay tiles that can render in one frame.
-pub(super) const MAX_TILE_VIEWS: usize = 40;
 
-/// The shadow atlas: depth pages shared by the tiles of many lights, plus one
-/// overlay page that moving actors draw into afresh each frame.
-pub(super) struct ShadowAtlasGpu {
-    pub array: wgpu::TextureView,
-    pages: Vec<wgpu::TextureView>,
-    overlay_page: usize,
-    camera_buffer: wgpu::Buffer,
-    camera_group: wgpu::BindGroup,
-    clear_pipeline: wgpu::RenderPipeline,
-    tile_pipeline: wgpu::RenderPipeline,
+fn page_label(page: usize) -> &'static str {
+    PAGE_LABELS[page.min(PAGE_LABELS.len() - 1)]
 }
 
-impl ShadowAtlasGpu {
-    pub fn new(
-        device: &wgpu::Device,
-        pages: usize,
-        shader: &wgpu::ShaderModule,
-        buffers: &[wgpu::VertexBufferLayout<'_>],
-    ) -> Self {
-        assert!(pages <= MAX_PAGES);
-        let texture = depth_texture(device, PAGE_SIZE, pages as u32 + 1, "shadow atlas");
+/// Bytes of one 1024² `Depth32Float` page.
+pub(super) const PAGE_BYTES: usize = (PAGE_SIZE * PAGE_SIZE * 4) as usize;
+/// The atlas texture gains pages in steps of this many layers, so a growing
+/// world copies it a few times, not once a page.
+const GROWTH_PAGES: usize = 4;
+/// The atlas texture gives layers back once this many are unused.
+const SHRINK_PAGES: usize = 12;
+/// Tile cameras are bound with dynamic offsets of this stride: a matrix, then
+/// the offset to the static tile for a per-frame tile that starts as a copy.
+pub(super) const CAMERA_STRIDE: u64 = 256;
+/// What the shadow shader reads of a camera: a matrix and the copy offset.
+pub(super) const CAMERA_BYTES: u64 = 80;
+
+/// A depth texture of 1024² pages, with a view of the whole array and of each
+/// page.
+struct Pages {
+    texture: wgpu::Texture,
+    array: wgpu::TextureView,
+    views: Vec<wgpu::TextureView>,
+}
+
+impl Pages {
+    fn new(device: &wgpu::Device, layers: usize, label: &str) -> Self {
+        let texture = depth_texture(device, PAGE_SIZE, layers as u32, label);
         let array = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("shadow atlas"),
+            label: Some(label),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let views = (0..=pages as u32)
+        let views = (0..layers as u32)
             .map(|layer| {
                 texture.create_view(&wgpu::TextureViewDescriptor {
                     label: Some("shadow page"),
@@ -91,48 +86,140 @@ impl ShadowAtlasGpu {
                 })
             })
             .collect();
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("shadow tile cameras"),
-            size: CAMERA_STRIDE * MAX_TILE_VIEWS as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        Self {
+            texture,
+            array,
+            views,
+        }
+    }
+
+    fn layers(&self) -> usize {
+        self.views.len()
+    }
+}
+
+/// The shadow atlas: depth pages shared by the tiles of many lights, which
+/// grow with the lights, plus a second texture of per-frame tiles that moving
+/// actors draw into afresh each frame. Nothing renders into the texture it
+/// samples.
+pub(super) struct ShadowAtlasGpu {
+    device_layers: usize,
+    atlas: Pages,
+    frame: Pages,
+    camera_buffer: wgpu::Buffer,
+    camera_slots: usize,
+    camera_layout: wgpu::BindGroupLayout,
+    camera_group: wgpu::BindGroup,
+    copy_layout: wgpu::BindGroupLayout,
+    copy_group: wgpu::BindGroup,
+    clear_pipeline: wgpu::RenderPipeline,
+    tile_pipeline: wgpu::RenderPipeline,
+    copy_pipeline: wgpu::RenderPipeline,
+}
+
+fn camera_buffer(device: &wgpu::Device, slots: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shadow tile cameras"),
+        size: CAMERA_STRIDE * slots as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn camera_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow tile cameras"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(CAMERA_BYTES),
+            }),
+        }],
+    })
+}
+
+fn copy_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    atlas: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow tile copy source"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(atlas),
+        }],
+    })
+}
+
+impl ShadowAtlasGpu {
+    pub fn new(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        buffers: &[wgpu::VertexBufferLayout<'_>],
+    ) -> Self {
+        let device_layers = device.limits().max_texture_array_layers as usize;
+        let atlas = Pages::new(device, GROWTH_PAGES, "shadow atlas");
+        let frame = Pages::new(device, 1, "shadow actor tiles");
+        let camera_slots = 64;
+        let camera_buffer = camera_buffer(device, camera_slots);
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow tile camera layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(64),
+                    min_binding_size: wgpu::BufferSize::new(CAMERA_BYTES),
                 },
                 count: None,
             }],
         });
-        let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow tile cameras"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
+        let camera_group = camera_group(device, &camera_layout, &camera_buffer);
+        let copy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow tile copy layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &camera_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(64),
-                }),
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
             }],
         });
-        let depth_pipeline = |label, entry, layout: &wgpu::PipelineLayout, buffers, state| {
+        let copy_group = copy_group(device, &copy_layout, &atlas.array);
+        let depth_pipeline = |label,
+                              vertex,
+                              fragment: Option<&str>,
+                              layout: &wgpu::PipelineLayout,
+                              buffers,
+                              state| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: shader,
-                    entry_point: Some(entry),
+                    entry_point: Some(vertex),
                     buffers,
                     compilation_options: Default::default(),
                 },
-                fragment: None,
+                fragment: fragment.map(|entry_point| wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(entry_point),
+                    targets: &[],
+                    compilation_options: Default::default(),
+                }),
                 primitive: wgpu::PrimitiveState {
                     cull_mode: None,
                     ..Default::default()
@@ -153,9 +240,15 @@ impl ShadowAtlasGpu {
             bind_group_layouts: &[],
             push_constant_ranges: &[],
         });
+        let copy_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow tile copy layout"),
+            bind_group_layouts: &[&camera_layout, &copy_layout],
+            push_constant_ranges: &[],
+        });
         let tile_pipeline = depth_pipeline(
             "shadow tile depth",
             "vs_main",
+            None,
             &tile_layout,
             buffers,
             wgpu::DepthStencilState {
@@ -167,25 +260,125 @@ impl ShadowAtlasGpu {
                 ..super::depth_state()
             },
         );
+        let always = wgpu::DepthStencilState {
+            depth_compare: wgpu::CompareFunction::Always,
+            ..super::depth_state()
+        };
         let clear_pipeline = depth_pipeline(
             "shadow tile clear",
             "vs_clear",
+            None,
             &clear_layout,
             &[],
-            wgpu::DepthStencilState {
-                depth_compare: wgpu::CompareFunction::Always,
-                ..super::depth_state()
-            },
+            always.clone(),
+        );
+        let copy_pipeline = depth_pipeline(
+            "shadow tile copy",
+            "vs_clear",
+            Some("fs_copy"),
+            &copy_pipeline_layout,
+            &[],
+            always,
         );
         Self {
-            array,
-            pages: views,
-            overlay_page: pages,
+            device_layers,
+            atlas,
+            frame,
             camera_buffer,
+            camera_slots,
+            camera_layout,
             camera_group,
+            copy_layout,
+            copy_group,
             clear_pipeline,
             tile_pipeline,
+            copy_pipeline,
         }
+    }
+
+    pub fn array(&self) -> &wgpu::TextureView {
+        &self.atlas.array
+    }
+
+    pub fn frame_array(&self) -> &wgpu::TextureView {
+        &self.frame.array
+    }
+
+    /// Pages the textures have layers for: the atlas's, then the per-frame one's.
+    pub fn layers(&self) -> (usize, usize) {
+        (self.atlas.layers(), self.frame.layers())
+    }
+
+    /// Bytes of both textures.
+    pub fn bytes(&self) -> usize {
+        (self.atlas.layers() + self.frame.layers()) * PAGE_BYTES
+    }
+
+    /// Give the atlas layers for `pages` pages, copying what it holds into a
+    /// larger texture when it grows, the per-frame texture layers for
+    /// `frame_pages`, and the tile cameras room for `tiles` tiles. Returns whether either texture was replaced, so that
+    /// shaders can be pointed at the new one.
+    pub fn reserve(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pages: usize,
+        frame_pages: usize,
+        tiles: usize,
+    ) -> bool {
+        self.reserve_cameras(device, tiles);
+        let mut replaced = false;
+        let wanted = pages
+            .next_multiple_of(GROWTH_PAGES)
+            .max(GROWTH_PAGES)
+            .min(self.device_layers);
+        // It shrinks only once a good many layers sit empty at the end, so a
+        // light or two coming and going never copies it.
+        let have = self.atlas.layers();
+        if wanted > have || wanted + SHRINK_PAGES <= have {
+            let resized = Pages::new(device, wanted, "shadow atlas");
+            // Whole layers, which every backend can copy for depth textures.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &resized.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::Extent3d {
+                    width: PAGE_SIZE,
+                    height: PAGE_SIZE,
+                    depth_or_array_layers: have.min(wanted) as u32,
+                },
+            );
+            self.atlas = resized;
+            self.copy_group = copy_group(device, &self.copy_layout, &self.atlas.array);
+            replaced = true;
+        }
+        // The per-frame texture holds nothing between frames, so it follows
+        // the need in both directions, with room to spare before it shrinks.
+        let have = self.frame.layers();
+        if frame_pages > have || (frame_pages * 4 < have && have > 2) {
+            let layers = frame_pages.max(1).min(self.device_layers);
+            self.frame = Pages::new(device, layers, "shadow actor tiles");
+            replaced = true;
+        }
+        replaced
+    }
+
+    fn reserve_cameras(&mut self, device: &wgpu::Device, slots: usize) {
+        if slots <= self.camera_slots {
+            return;
+        }
+        self.camera_slots = slots.next_power_of_two();
+        self.camera_buffer = camera_buffer(device, self.camera_slots);
+        self.camera_group = camera_group(device, &self.camera_layout, &self.camera_buffer);
     }
 
     /// Render each dirty tile into its page: one pass per page, with the tile
@@ -200,24 +393,24 @@ impl ShadowAtlasGpu {
         draw: &mut dyn FnMut(&mut wgpu::RenderPass<'_>, usize),
     ) {
         for (i, job) in jobs.iter().enumerate() {
-            self.write_camera(queue, i, &job.matrix);
+            self.write_camera(queue, i, &job.matrix, [0; 4]);
         }
         let mut pages: Vec<usize> = jobs.iter().map(|j| usize::from(j.tile.page)).collect();
         pages.sort_unstable();
         pages.dedup();
         for page in pages {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(PAGE_LABELS[page]),
+                label: Some(page_label(page)),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.pages[page],
+                    view: &self.atlas.views[page],
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: timing.pass(PAGE_LABELS[page]),
+                timestamp_writes: timing.pass(page_label(page)),
                 occlusion_query_set: None,
             });
             for (i, job) in jobs
@@ -236,53 +429,81 @@ impl ShadowAtlasGpu {
         }
     }
 
-    /// Draw moving actors into the overlay page, cleared first: one tile per
-    /// overlay job, after the cameras of the atlas jobs.
-    pub fn render_overlay(
+    /// Draw moving actors into the per-frame tiles, one pass per page of that
+    /// texture, cleared first: one tile per job, after the cameras of the atlas
+    /// jobs. Each tile first receives its static tile's depth, drawn as a
+    /// triangle that reads the atlas and writes the depth, so that shading needs
+    /// only the per-frame tile. (Copying the rectangle would be simpler, and
+    /// DirectX 12 does not allow it for depth textures on every GPU.)
+    pub fn render_frame(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         timing: &mut GpuTiming,
         first_view: usize,
-        jobs: &[OverlayJob],
+        jobs: &[FrameJob],
         draw: &mut dyn FnMut(&mut wgpu::RenderPass<'_>),
     ) {
         if jobs.is_empty() {
             return;
         }
         for (i, job) in jobs.iter().enumerate() {
-            self.write_camera(queue, first_view + i, &job.matrix);
+            let [x, y] = job.class.origin(job.tile.slot);
+            let [sx, sy] = job.class.origin(job.source.slot);
+            self.write_camera(
+                queue,
+                first_view + i,
+                &job.matrix,
+                [
+                    sx as i32 - x as i32,
+                    sy as i32 - y as i32,
+                    i32::from(job.source.page),
+                    0,
+                ],
+            );
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shadow overlay"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.pages[self.overlay_page],
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+        let mut pages: Vec<usize> = jobs.iter().map(|j| usize::from(j.tile.page)).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        for page in pages {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow actor tiles"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.frame.views[page],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: timing.pass("shadow overlay"),
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&self.tile_pipeline);
-        for (i, job) in jobs.iter().enumerate() {
-            let [x, y] = OVERLAY_CLASS.origin(job.slot);
-            self.place(&mut pass, x, y, OVERLAY_CLASS.size());
-            let offset = (first_view + i) as u32 * CAMERA_STRIDE as u32;
-            pass.set_bind_group(0, &self.camera_group, &[offset]);
-            draw(&mut pass);
+                timestamp_writes: timing.pass("shadow actor tiles"),
+                occlusion_query_set: None,
+            });
+            for (i, job) in jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| usize::from(j.tile.page) == page)
+            {
+                let [x, y] = job.class.origin(job.tile.slot);
+                self.place(&mut pass, x, y, job.class.size());
+                let offset = (first_view + i) as u32 * CAMERA_STRIDE as u32;
+                pass.set_pipeline(&self.copy_pipeline);
+                pass.set_bind_group(0, &self.camera_group, &[offset]);
+                pass.set_bind_group(1, &self.copy_group, &[]);
+                pass.draw(0..3, 0..1);
+                pass.set_pipeline(&self.tile_pipeline);
+                pass.set_bind_group(0, &self.camera_group, &[offset]);
+                draw(&mut pass);
+            }
         }
     }
 
-    fn write_camera(&self, queue: &wgpu::Queue, index: usize, matrix: &Mat4) {
-        queue.write_buffer(
-            &self.camera_buffer,
-            index as u64 * CAMERA_STRIDE,
-            bytemuck::bytes_of(&matrix.to_cols_array_2d()),
-        );
+    fn write_camera(&self, queue: &wgpu::Queue, index: usize, matrix: &Mat4, copy: [i32; 4]) {
+        let mut bytes = [0u8; CAMERA_BYTES as usize];
+        bytes[..64].copy_from_slice(bytemuck::bytes_of(&matrix.to_cols_array_2d()));
+        bytes[64..].copy_from_slice(bytemuck::bytes_of(&copy));
+        queue.write_buffer(&self.camera_buffer, index as u64 * CAMERA_STRIDE, &bytes);
     }
 
     fn place(&self, pass: &mut wgpu::RenderPass<'_>, x: u32, y: u32, size: u32) {
@@ -302,6 +523,12 @@ mod tests {
             assert_eq!(class.per_row() * class.size(), PAGE_SIZE);
             assert_eq!(class.per_page() as u32, class.per_row() * class.per_row());
         }
-        assert!(OVERLAY_CLASS.per_page() > super::super::lightset::OVERLAY_SLOTS);
+    }
+
+    #[test]
+    fn a_page_is_four_mebibytes() {
+        assert_eq!(PAGE_BYTES, 4 << 20);
+        assert_eq!(CAMERA_BYTES % 16, 0);
+        const { assert!(CAMERA_BYTES <= CAMERA_STRIDE) };
     }
 }

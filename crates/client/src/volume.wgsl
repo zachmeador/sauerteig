@@ -87,7 +87,7 @@ struct VertexOutput {
     surface.view = view;
     surface.specular_power = select(180.0, 100.0, water);
     surface.specular_only = true;
-    let local = shade_local_lights(v.clip, surface, min(light_params.mode.w, TRANSPARENT_LIGHTS));
+    let local = shade_local_lights(v.clip, surface, light_params.mode.w);
     let glints = vec3<f32>(0.72, 0.76, 0.76) * specular * 0.65 + local.specular * 0.24;
     let fog = fog_factor(v.position);
     return vec4<f32>(mix(color, camera.fog.rgb, fog) * alpha + glints * (1.0 - fog), alpha);

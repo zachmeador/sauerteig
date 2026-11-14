@@ -67,9 +67,9 @@ tree. P places the chosen prop. Wall lamps align to walls; hanging lamps mount t
 ceilings, or stand two metres above an aimed floor. Lamp models are decoration:
 place a separate light node with L where illumination is needed. Light nodes have
 small editor-only markers and no physical fixture in play. Each is a warm point
-light with a 12 metre range that casts shadows from the surrounding geometry, and
-from players near it if it is among the eight most important lights in view; their
-color, range, and brightness are fixed until object properties exist. Props
+light with a 12 metre range that casts shadows from the surrounding geometry and
+from players near it; their color, range, and brightness are fixed until object
+properties exist. Props
 are decorative: use cube geometry for collision underneath large barriers.
 Older Sauerteig worlds that relied on a lamp prop alone for illumination need a
 separate light node beside it.

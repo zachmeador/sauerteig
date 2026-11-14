@@ -1,13 +1,18 @@
 //! GPU resources for clustered lighting: the light and mask buffers, the
 //! culling pass that fills the masks, and the bind group the scene shaders read.
 use super::{
-    lightset::{FramePlan, LightConfig},
-    shaders::{self, LightLayout},
+    clusters::ClusterGrid,
+    device::MAX_ARRAY_LAYERS,
+    lightset::{FramePlan, LightConfig, MAX_LIGHTS_IN_VIEW},
+    shaders,
     timing::GpuTiming,
 };
 use crate::lighting::GpuLight;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
+
+/// Lights the buffers hold before the first frame needs more.
+const MIN_CAPACITY: usize = 256;
 
 /// What the shaders need to find a fragment's cluster and read its lights.
 /// Mirrors `LightParams` in `common.wgsl`.
@@ -30,13 +35,7 @@ pub struct ClusterView {
 }
 
 impl LightParams {
-    pub fn new(
-        config: &LightConfig,
-        view: ClusterView,
-        count: usize,
-        page_classes: u32,
-        brute_force: bool,
-    ) -> Self {
+    pub fn new(config: &LightConfig, view: ClusterView, count: usize, brute_force: bool) -> Self {
         let grid = config.grid;
         Self {
             grid: [grid.dims[0], grid.dims[1], grid.dims[2], count as u32],
@@ -45,8 +44,8 @@ impl LightParams {
             range: [grid.far, 0.0, 0.0, 0.0],
             mode: [
                 u32::from(!brute_force),
-                page_classes,
-                config.pages as u32,
+                ClusterGrid::mask_words(count) as u32,
+                0,
                 config.light_cap,
             ],
         }
@@ -58,25 +57,67 @@ struct Cull {
     group: wgpu::BindGroup,
     light_view: wgpu::Buffer,
     workgroups: u32,
-    #[cfg(test)]
+}
+
+/// The buffers that grow with the number of lights in view.
+struct Buffers {
+    capacity: usize,
+    lights: wgpu::Buffer,
     masks: wgpu::Buffer,
 }
 
 pub(super) struct LightGpu {
     config: LightConfig,
-    layout: LightLayout,
     pub bind_layout: wgpu::BindGroupLayout,
     pub group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    sun: wgpu::TextureView,
     atlas: wgpu::TextureView,
-    lights: wgpu::Buffer,
-    masks: wgpu::Buffer,
+    frame_atlas: wgpu::TextureView,
+    buffers: Buffers,
     params: wgpu::Buffer,
+    page_table: wgpu::Buffer,
     cull: Cull,
     pub count: usize,
     /// View-space spheres and projection scale of the last upload.
     pub last_views: Vec<[f32; 4]>,
     last_scale: Vec2,
+}
+
+fn make_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    size: usize,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size as u64,
+        usage,
+        mapped_at_creation: false,
+    })
+}
+
+impl Buffers {
+    fn new(device: &wgpu::Device, grid: ClusterGrid, capacity: usize) -> Self {
+        let usage = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE;
+        let mask_bytes = grid.count() * ClusterGrid::mask_words(capacity) * 4;
+        Self {
+            capacity,
+            lights: make_buffer(
+                device,
+                "lights",
+                capacity * std::mem::size_of::<GpuLight>(),
+                usage,
+            ),
+            masks: make_buffer(
+                device,
+                "cluster masks",
+                mask_bytes,
+                usage | wgpu::BufferUsages::COPY_SRC,
+            ),
+        }
+    }
 }
 
 impl LightGpu {
@@ -85,9 +126,8 @@ impl LightGpu {
         config: LightConfig,
         sun: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
-        atlas: &wgpu::TextureView,
+        [atlas, frame_atlas]: [&wgpu::TextureView; 2],
     ) -> Self {
-        let layout = LightLayout::new(&config);
         let buffer_type = wgpu::BufferBindingType::Storage { read_only: true };
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
@@ -100,75 +140,60 @@ impl LightGpu {
             has_dynamic_offset: false,
             min_binding_size: None,
         };
+        let depth_array = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        };
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lights and shadows layout"),
             entries: &[
-                entry(
-                    0,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
+                entry(0, depth_array),
                 entry(
                     1,
                     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                 ),
-                entry(
-                    2,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                ),
+                entry(2, depth_array),
                 entry(3, buffer(buffer_type)),
                 entry(4, buffer(buffer_type)),
                 entry(5, buffer(wgpu::BufferBindingType::Uniform)),
+                entry(6, buffer(buffer_type)),
+                entry(7, depth_array),
             ],
         });
-        let light_bytes = (layout.max_lights as usize * std::mem::size_of::<GpuLight>()) as u64;
         let grid = config.grid;
-        let mask_bytes = (grid.count() * grid.words as usize * 4) as u64;
-        let usage = |extra| extra | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE;
-        let make = |label, size, usage| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage,
-                mapped_at_creation: false,
-            })
-        };
-        let lights = make("lights", light_bytes, usage(wgpu::BufferUsages::empty()));
-        let masks = make(
-            "cluster masks",
-            mask_bytes,
-            usage(wgpu::BufferUsages::COPY_SRC),
-        );
-        let params = make(
+        let buffers = Buffers::new(device, grid, MIN_CAPACITY);
+        let params = make_buffer(
+            device,
             "light parameters",
-            std::mem::size_of::<LightParams>() as u64,
+            std::mem::size_of::<LightParams>(),
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        let page_table = make_buffer(
+            device,
+            "shadow page table",
+            MAX_ARRAY_LAYERS as usize * 2 * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         let group = Self::bind(
             device,
             &bind_layout,
-            [sun, atlas],
+            [sun, atlas, frame_atlas],
             sampler,
-            [&lights, &masks, &params],
+            [&buffers.lights, &buffers.masks, &params, &page_table],
         );
-        let cull = Cull::new(device, config, layout, &params, &masks);
+        let cull = Cull::new(device, config, &params, &buffers);
         Self {
             config,
-            layout,
             bind_layout,
             group,
             sampler: sampler.clone(),
+            sun: sun.clone(),
             atlas: atlas.clone(),
-            lights,
-            masks,
+            frame_atlas: frame_atlas.clone(),
+            buffers,
             params,
+            page_table,
             cull,
             count: 0,
             last_views: Vec::new(),
@@ -179,9 +204,9 @@ impl LightGpu {
     fn bind(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        [sun, atlas]: [&wgpu::TextureView; 2],
+        [sun, atlas, frame_atlas]: [&wgpu::TextureView; 3],
         sampler: &wgpu::Sampler,
-        [lights, masks, params]: [&wgpu::Buffer; 3],
+        [lights, masks, params, page_table]: [&wgpu::Buffer; 4],
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lights and shadows"),
@@ -211,36 +236,99 @@ impl LightGpu {
                     binding: 5,
                     resource: params.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: page_table.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(frame_atlas),
+                },
             ],
         })
     }
 
-    /// Point the scene shaders at new sun cascade maps.
-    pub fn set_sun(&mut self, device: &wgpu::Device, sun: &wgpu::TextureView) {
+    fn rebind(&mut self, device: &wgpu::Device) {
         self.group = Self::bind(
             device,
             &self.bind_layout,
-            [sun, &self.atlas],
+            [&self.sun, &self.atlas, &self.frame_atlas],
             &self.sampler,
-            [&self.lights, &self.masks, &self.params],
+            [
+                &self.buffers.lights,
+                &self.buffers.masks,
+                &self.params,
+                &self.page_table,
+            ],
         );
     }
 
-    /// Write this frame's lights and parameters.
+    /// Point the scene shaders at new sun cascade maps.
+    pub fn set_sun(&mut self, device: &wgpu::Device, sun: &wgpu::TextureView) {
+        self.sun = sun.clone();
+        self.rebind(device);
+    }
+
+    /// Point the scene shaders at a grown atlas or per-frame texture.
+    pub fn set_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        atlas: &wgpu::TextureView,
+        frame_atlas: &wgpu::TextureView,
+    ) {
+        self.atlas = atlas.clone();
+        self.frame_atlas = frame_atlas.clone();
+        self.rebind(device);
+    }
+
+    /// Make the light and mask buffers hold `count` lights.
+    fn reserve(&mut self, device: &wgpu::Device, count: usize) {
+        if count <= self.buffers.capacity {
+            return;
+        }
+        let capacity = count.next_power_of_two().max(MIN_CAPACITY);
+        self.buffers = Buffers::new(device, self.config.grid, capacity);
+        self.cull = Cull::new(device, self.config, &self.params, &self.buffers);
+        self.rebind(device);
+    }
+
+    /// Bytes of the buffers that grow with the lights in view.
+    pub fn buffer_bytes(&self) -> usize {
+        let b = &self.buffers;
+        (b.lights.size() + b.masks.size() + self.cull.light_view.size()) as usize
+    }
+
+    /// Write this frame's lights, page table and parameters.
     pub fn upload(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         plan: &FramePlan,
         view: ClusterView,
         brute_force: bool,
     ) {
-        let count = plan.lights.len().min(self.layout.max_lights as usize);
+        let count = plan.lights.len().min(MAX_LIGHTS_IN_VIEW);
+        self.reserve(device, count);
         self.count = count;
         let records: Vec<GpuLight> = plan.lights[..count].iter().map(|l| l.gpu).collect();
         if count > 0 {
-            queue.write_buffer(&self.lights, 0, bytemuck::cast_slice(&records));
+            queue.write_buffer(&self.buffers.lights, 0, bytemuck::cast_slice(&records));
         }
-        let params = LightParams::new(&self.config, view, count, plan.page_classes, brute_force);
+        if !plan.page_classes.is_empty() {
+            queue.write_buffer(
+                &self.page_table,
+                0,
+                bytemuck::cast_slice(&plan.page_classes),
+            );
+        }
+        if !plan.frame_page_classes.is_empty() {
+            queue.write_buffer(
+                &self.page_table,
+                u64::from(MAX_ARRAY_LAYERS) * 4,
+                bytemuck::cast_slice(&plan.frame_page_classes),
+            );
+        }
+        let params = LightParams::new(&self.config, view, count, brute_force);
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
         let views: Vec<[f32; 4]> = plan.lights[..count].iter().map(|l| l.view).collect();
         if count > 0 {
@@ -258,8 +346,9 @@ impl LightGpu {
             .iter()
             .map(|&v| glam::Vec4::from_array(v))
             .collect();
+        let words = ClusterGrid::mask_words(spheres.len()).max(1);
         grid.build_masks(self.last_scale, &spheres)
-            .chunks(grid.words as usize)
+            .chunks(words)
             .map(|words| words.iter().map(|w| w.count_ones()).sum())
             .collect()
     }
@@ -281,7 +370,7 @@ impl LightGpu {
 
     #[cfg(test)]
     pub fn mask_buffer(&self) -> &wgpu::Buffer {
-        &self.cull.masks
+        &self.buffers.masks
     }
 }
 
@@ -289,17 +378,16 @@ impl Cull {
     fn new(
         device: &wgpu::Device,
         config: LightConfig,
-        layout: LightLayout,
         params: &wgpu::Buffer,
-        masks: &wgpu::Buffer,
+        buffers: &Buffers,
     ) -> Self {
         let grid = config.grid;
-        let light_view = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("light view spheres"),
-            size: (layout.max_lights as usize * 16) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let light_view = make_buffer(
+            device,
+            "light view spheres",
+            buffers.capacity * 16,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -340,11 +428,11 @@ impl Cull {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: masks.as_entire_binding(),
+                    resource: buffers.masks.as_entire_binding(),
                 },
             ],
         });
-        let module = shaders::module(device, "clusters", layout);
+        let module = shaders::module(device, "clusters");
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("light cull pipeline layout"),
             bind_group_layouts: &[&bind_layout],
@@ -363,8 +451,6 @@ impl Cull {
             group,
             light_view,
             workgroups: (grid.count() as u32).div_ceil(64),
-            #[cfg(test)]
-            masks: masks.clone(),
         }
     }
 }

@@ -11,8 +11,6 @@ pub struct ClusterGrid {
     /// The first slice ends here; the others grow exponentially up to `far`.
     pub split: f32,
     pub far: f32,
-    /// 32-bit words in each cluster's light mask.
-    pub words: u32,
 }
 
 impl ClusterGrid {
@@ -21,15 +19,15 @@ impl ClusterGrid {
         near: 0.06,
         split: 4.0,
         far: 180.0,
-        words: 8,
     };
 
     pub fn count(&self) -> usize {
         self.dims.iter().map(|&d| d as usize).product()
     }
 
-    pub fn max_lights(&self) -> usize {
-        self.words as usize * 32
+    /// 32-bit words in each cluster's light mask for `lights` lights.
+    pub fn mask_words(lights: usize) -> usize {
+        lights.div_ceil(32)
     }
 
     pub fn ratio(&self) -> f32 {
@@ -94,13 +92,13 @@ impl ClusterGrid {
     }
 
     /// For each cluster, a bit per light whose view-space sphere (xyz, radius)
-    /// reaches it. Lights past the mask width are ignored.
+    /// reaches it, in `mask_words(lights.len())` words a cluster.
     pub fn build_masks(&self, scale: Vec2, lights: &[Vec4]) -> Vec<u32> {
-        let words = self.words as usize;
+        let words = Self::mask_words(lights.len());
         let mut masks = vec![0; self.count() * words];
         for cluster in 0..self.count() {
             let (min, max) = self.bounds(scale, cluster as u32);
-            for (i, light) in lights.iter().take(self.max_lights()).enumerate() {
+            for (i, light) in lights.iter().enumerate() {
                 if sphere_reaches(min, max, light.truncate(), light.w) {
                     masks[cluster * words + i / 32] |= 1 << (i % 32);
                 }
@@ -143,7 +141,10 @@ mod tests {
             assert_eq!(grid.slice_depths(0), (0.06, 4.0));
         }
         assert_eq!(ClusterGrid::CLUSTERED.count(), 3456);
-        assert_eq!(ClusterGrid::CLUSTERED.max_lights(), 256);
+        assert_eq!(ClusterGrid::mask_words(256), 8);
+        assert_eq!(ClusterGrid::mask_words(257), 9);
+        assert_eq!(ClusterGrid::mask_words(1000), 32);
+        assert_eq!(ClusterGrid::mask_words(0), 0);
     }
 
     #[test]
@@ -207,7 +208,7 @@ mod tests {
             state as f32 / u32::MAX as f32
         };
         for grid in [ClusterGrid::CLUSTERED] {
-            let lights: Vec<Vec4> = (0..grid.max_lights())
+            let lights: Vec<Vec4> = (0..1000)
                 .map(|_| {
                     Vec4::new(
                         next() * 80.0 - 40.0,
@@ -218,7 +219,7 @@ mod tests {
                 })
                 .collect();
             let masks = grid.build_masks(scale, &lights);
-            let words = grid.words as usize;
+            let words = ClusterGrid::mask_words(lights.len());
             for _ in 0..4000 {
                 let pixel = Vec2::new(next() * 1919.0 + 0.5, next() * 1079.0 + 0.5);
                 let depth = 0.06 + next() * 120.0;
@@ -243,9 +244,7 @@ mod tests {
         let grid = ClusterGrid::CLUSTERED;
         let light = Vec4::new(0.0, 0.0, -50.0, cull_radius(2.0));
         let masks = grid.build_masks(scale_of(projection), &[light]);
-        let hit: Vec<_> = (0..grid.count())
-            .filter(|&c| masks[c * grid.words as usize] & 1 == 1)
-            .collect();
+        let hit: Vec<_> = (0..grid.count()).filter(|&c| masks[c] & 1 == 1).collect();
         assert!(!hit.is_empty());
         assert!(hit.len() < grid.count() / 20, "{} clusters", hit.len());
         // Fixed light order: the masks of an empty list are empty.

@@ -3,10 +3,7 @@
 //! frame the visible quads of all units are sorted back to front together and
 //! drawn with one indexed draw.
 
-use super::{
-    culling::{Bounds, Frustum},
-    shaders::LightLayout,
-};
+use super::culling::{Bounds, Frustum};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use sauerteig_core::{ChunkKey, TransparentVertex, World};
@@ -138,10 +135,9 @@ impl VolumeRenderer {
         format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
         lights_layout: &wgpu::BindGroupLayout,
-        light_buffers: LightLayout,
         sample_counts: &[u32],
     ) -> Self {
-        let shader = super::shaders::module(device, "volume", light_buffers);
+        let shader = super::shaders::module(device, "volume");
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("transparent volume layout"),
             bind_group_layouts: &[camera_layout, lights_layout],

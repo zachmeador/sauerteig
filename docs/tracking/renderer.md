@@ -12,7 +12,7 @@ measured on named hardware, not assumed.
 
 ## Current behavior
 
-- **Stages 1, 2 and 2b and N1 are in place.** The scene renders in linear HDR
+- **Stages 1, 2 and 2b, N1 and N2 are in place.** The scene renders in linear HDR
   with bloom, filmic tonemapping, MSAA (Off, 2×, 4×, 8× where the adapter
   supports them, and Auto), render scaling, motion interpolation, and per-pass
   GPU timings in F3.
@@ -23,15 +23,16 @@ measured on named hardware, not assumed.
 - **The sun** has three cascades centred on the eye, reaching 15, 42 and 150 m,
   that don't shimmer as the eye moves or turns. A rebuilt chunk or object
   redraws only the texels it touches in each cascade.
-- **Lights.** Every light node in view is a clustered point light, up to 256
-  ranked by range over distance. A cached atlas shadows up to 149 point lights,
-  and lights it can't hold fade out rather than leak through walls, so
-  the_cube1m draws 149 of its 339. A fragment shades at most 16 of the lights
-  that reach it, 8 on water and glass, most important first. Players cast
-  shadows under the eight most important lamps.
+- **Lights.** Every light node in view is a clustered point light, and every
+  one is shadowed: the_cube1m's 339 lights, not 149. The cluster masks and the
+  light buffer grow with the lights in view, a fragment shades every light of
+  its cluster that reaches it, and a shadow atlas that grows with the lights
+  shrinks tiles to 64² and 32² before it drops a light. Each level bounds the
+  atlas's memory, 60 MiB at Low and 256 MiB at the others. Every shadowed light
+  shadows players and other moving actors, in per-frame tiles (see N2 below).
 - **GPU requests.** `Renderer::create` asks Vulkan, DirectX 12 and Metal
   adapters for the features and limits the renderer uses (`render/device.rs`;
-  see N1 below), and refuses an adapter that lacks a required one with a
+  see N1 and N2 below), and refuses an adapter that lacks a required one with a
   message that names it and the minimum specification.
 - **World meshes** use a 52-byte vertex and an index buffer that only counts
   up: 576 MiB for the_cube1m and 824 MiB for nub1, about 2 KB per piece
@@ -801,10 +802,10 @@ one-minute load average at the start of each measured invocation is given.
 
 ### N2: every light shadowed
 
-State: running on branch `renderer-n2` since 2026-11-14, from the commit before
-octree O1a merged. The design lead rebases it onto the octree and reruns its
-measurements before merging. Octree O1b merged first and also edits
-`volume.wgsl` and `render.rs`, so N2 rebases onto it as well.
+State: merged on 2026-11-14, rebased onto octree O1a and O1b. The maintainer
+hasn't looked at it in the app, and nobody has run it on Vulkan or DirectX 12
+hardware. The session's results below were measured before octree O1a merged,
+on a busy machine; the design lead's measurements after the rebase come first.
 
 - **Decided** (maintainer, 2026-11-13, under the lighting rule):
   - Every light is shadowed: 339 of 339 on the_cube1m, up from 149. No light
@@ -910,25 +911,32 @@ measurements before merging. Octree O1b merged first and also edits
 - **Acceptance:**
   - [ ] On a copy of the_cube1m on the M5 Pro, once lighting settles, F3
     shows 339 of 339 lights drawn and shadowed, none over budget or fading.
-  - [ ] The 1,000-light scene draws every light in view and matches a
-    brute-force render.
-  - [ ] A GPU test shows an opaque fragment reached by more than 16 lights,
+    *Not observed in F3.* The capture report shows 333 of 333 in view drawn and
+    shadowed at the spawn pose, 290 of 290 at the overlook, none over budget.
+  - [x] The 1,000-light scene draws every light in view and matches a
+    brute-force render (`gpu_a_thousand_lights_match_a_brute_force_render_within_the_lowest_bound`).
+  - [x] A GPU test shows an opaque fragment reached by more than 16 lights,
     and a water or glass fragment reached by more than 8, shading all of
-    them.
-  - [ ] At the lowest level, the atlas stays within its bound on the_cube1m
-    and on the 1,000-light scene, and every light keeps a shadow.
+    them (`gpu_a_fragment_reached_by_more_than_sixteen_lights_shades_all_of_them`,
+    `gpu_a_water_fragment_reached_by_more_than_eight_lights_shades_all_of_them`).
+  - [x] At the lowest level, the atlas stays within its bound on the_cube1m
+    and on the 1,000-light scene, and every light keeps a shadow (see the
+    table below; with 16 actors present it goes one page past).
   - [ ] In lightroom-actors-4, lightroom-actors-16 and lamphall-actor, every
     light whose range reaches an actor casts that actor's shadow. Walking
     past lamps on the_cube1m in the app, player shadows never switch on or
-    off as lights change rank.
-  - [ ] 4K GPU throughput on the M5 Pro for the imported, lightroom and
+    off as lights change rank. *The first half is covered by unit tests and
+    the capture report (25 of 44 lights have actor tiles in
+    lightroom-actors-4, 35 in -16); the walk in the app is not observed.*
+  - [x] 4K GPU throughput on the M5 Pro for the imported, lightroom and
     lamphall poses at the default and lowest levels, against 6.06 ms, and
     atlas update times for flights, teleports and the edit storm, compared
-    with stage 2's.
-  - [ ] Tests: per-frame tiles with actors match fresh renders, cached tiles
+    with stage 2's. Tables below; several poses miss 6.06 ms at the default
+    level, as they did before N2.
+  - [x] Tests: per-frame tiles with actors match fresh renders, cached tiles
     match fresh ones after edits, and unit tests cover atlas sizing, each
-    level's bound and the page table. They pass on the M5 Pro, and in N1b's
-    job on lavapipe and WARP once it runs.
+    level's bound and the page table. They pass on the M5 Pro; N1b's job on
+    lavapipe and WARP doesn't exist yet.
   - [ ] **Needs a tester:** on a real Vulkan GPU and a real DirectX 12 GPU,
     the GPU tests pass and players cast shadows under every lamp.
   - [ ] **Needs a tester:** 2b's check of the lowest level, repeated on a
@@ -944,6 +952,301 @@ measurements before merging. Octree O1b merged first and also edits
   - lights per cluster (p50, p95 and max) on the imported poses, and the cost
     of shading every light against stage 2's per-fragment cap;
   - both actor-shadow methods' cost and the choice.
+
+#### N2 results
+
+Measured and written on 2026-11-14 on the maintainer's M5 Pro (Apple M5 Pro,
+Metal), release builds of `renderer-n2` as a working tree on base commit
+`847b67d`, before octree O1a merged, so the_cube1m has its 3.6 million world
+triangles. Other sessions were compiling throughout: the one-minute load
+average at the start of the invocations ran from 2.6 to 22, and GPU time is
+shared, so medians swing by several milliseconds and the **minimum over all
+runs** (15 per cell: 3 rounds of 5) is the closest to an idle machine. Tables
+give min / median; read differences under about 0.5 ms as noise. The design
+lead is to rerun them after the rebase.
+
+- **What changed.**
+  - **Atlas** (`render/atlas.rs`, `render/lightset.rs`, `render/shadows.rs`).
+    Five tile sizes, 32² to 512², with a 10-bit slot and a page number in a
+    32-bit tile reference; pages of 1024² (4 MiB) made as tiles need them, in a
+    texture that gains layers in steps of four (copied whole) and gives them
+    back when twelve sit unused. A storage-buffer page table holds each page's
+    tile size (`page_table`, binding 6). The guard band is now two texels at
+    every tile size (it was a fixed 128/124 scale, 2 texels at 128² and 8 at
+    512²).
+  - **Grants** (`grant_classes`). All lights start at the largest of 128²,
+    64² and 32² that fits the level's bound together, then each grows in
+    importance order, and the most important sharpen up to what their
+    projected size asks. `OverBudget::FadeOut`, `Unshadowed` and candidate
+    eviction are gone: a light with nothing free takes the least recently used
+    out-of-view light's tiles, and then pages past the bound; only the device's
+    layer ceiling (2,048 where offered) leaves a light dark.
+  - **Bounds.** `ShadowDetail::atlas_pages`: 15 pages (60 MiB) at Low, 64
+    (256 MiB) at the others, static and per-frame tiles together. An eighth of
+    the bound is left for per-frame tiles, and 2 pages of slack unplanned.
+  - **Moving the atlas toward its bound.** Tiles of a light change size after a
+    second of use and eight lights at a time; shrinking may make a page when
+    the atlas is past its bound; `compact` moves the last page's tiles, or the
+    emptiest page's, onto earlier pages so the pool can trim.
+  - **Lit lights.** The 256-light cap, `MASK_WORDS` and `MAX_LIGHTS` are gone.
+    Light, light-sphere and mask buffers grow (powers of two) with the lights in
+    view, `grid.w` and `mode.y` carry the count and the mask words, and the cull
+    shader loops over words of 32 lights. Shader loops are bounded by constants
+    the shader clamps to (`MAX_LIGHTS` 262,144, `MAX_LIGHT_WORDS`), so the
+    `SAFETY` comment stays true. No per-fragment cap: `shade_local_lights`
+    shades every light of the cluster that reaches the surface. A `--light-cap`
+    capture flag restores one, for comparison only.
+  - **Actors.** `ACTOR_SHADOW_LIGHTS`, `OVERLAY_SLOTS` and the overlay page are
+    gone. Each frame, every face of a shadowed light that an actor can reach
+    gets a tile in a second texture; see the choice below.
+  - **Light record** is 112 bytes (six static and six per-frame 32-bit tile
+    references). Nodes now default to `ShadowMode::Dynamic`; `Static` remains
+    for comparison captures.
+  - **Device request** (`render/device.rs`): three storage buffers per stage
+    (was two) and 256 array layers (was 64), raised to the adapter's limit up to
+    2,048.
+  - **Tools.** The `lightfield` scene (120 × 76 m hall, 1,000 light nodes, pillars
+    and two long walls) with poses `lightfield-center`, `-corner` and
+    `-actors-16`; `--light-cap`; the report's `shadow_atlas_bytes`,
+    `shadow_atlas_layers` and `light_buffer_bytes`; `--over-budget` and
+    `--actor-lights` are removed.
+- **Choices where the order was open.**
+  - **Actor shadows: a draw that copies the static depth into the per-frame
+    tile (`Copy`), not sampling a per-frame tile beside the static one
+    (`Beside`).** Both were built and run on the M5 Pro at 4K, default level,
+    from alternating rounds (build `renderer-n2` before `Beside` was removed;
+    min / median, ms a frame):
+
+    | Pose | Beside | Copy |
+    | --- | ---: | ---: |
+    | lightroom-actors-4 | 12.20 / 14.60 | 10.28 / 11.12 |
+    | lightroom-actors-16 | 11.80 / 16.43 | 11.06 / 11.41 |
+    | lamphall-actor | 4.17 / 6.29 | 3.67 / 3.77 |
+    | lightfield-actors-16 | 38.2 / 50.1 | 32.1 / 46.1 |
+    | lightroom-center (no actors) | 10.54 / 12.49 | 10.54 / 14.47 |
+
+    Copy costs nothing measurable over no actors and Beside costs 0.7 to 1.7 ms,
+    which is the second set of shadow taps for every fragment on a face that
+    has one. The price of Copy is memory: a per-frame tile must match its static
+    tile's size to be a 1:1 copy (Beside could cap them at 256²), so at High
+    lightroom-actors-4 needed 15 per-frame pages (60 MiB) and -16 needed 22,
+    where Beside needed 4 and 7. At Low tiles are at most 128² and it needs 2 to
+    3. I chose the faster path and removed `Beside`; the run above is the
+    only record of it. This does leave one gap, below.
+  - **Cluster masks, not lists.** Masks sized by the lights in view are
+    deterministic in size (432 bytes a light for the 3,456 clusters) and need no
+    second pass or atomic counter; the cull pass is 0.01 to 0.06 ms on every pose
+    run, including 1,000 lights. The cost is that a fragment reads every word of
+    its cluster's mask, 32 for 1,000 lights.
+  - **Stricter reach test for actors.** Actor vertices are bucketed into 1 m
+    cells and each light face tests the cells, so 1,000 lights and 16 actors
+    don't cost 6,000 tests against every vertex.
+  - **Truncation.** At most 262,144 lights in view are lit (what the masks fit
+    in the 128 MiB storage binding every adapter guarantees).
+  - **Shadow bounds** as above: the lowest level keeps 60 MiB, which includes
+    per-frame tiles, so shared-sandbox's fixed 0.6 GiB stands.
+- **Cost of shading every light.** No cap is in the code, and none is
+  proposed: removing the stage 2 cap's 16 (and 8 on water) changed nothing
+  measurable. From alternating runs of the same build with `--light-cap`, 4K,
+  default level, 4 rounds, min / median:
+
+  | Pose | No cap | Cap 16 | Cap 8 |
+  | --- | ---: | ---: | ---: |
+  | lightroom-center | 9.84 / 11.39 | 9.96 / 11.31 | 8.99 / 10.58 |
+  | imported-tower | 12.16 / 14.00 | 11.97 / 13.26 | 11.96 / 12.68 |
+  | imported-water | 5.96 / 6.62 | 5.91 / 6.37 | 5.74 / 6.37 |
+
+  Few fragments have more than 16 lights that pass the faint-light test, so the
+  loop rarely runs past 16 (the busiest cluster holds 27 lights in
+  lightroom-center and 35 in imported-tower; the median lit cluster holds 17
+  and 15). **Open decision for the maintainer:** several poses miss 6.06 ms at
+  4K at the default level, with or without N2 (tower 12 ms, lightroom 9.8 ms,
+  overlook 9 ms; base commit numbers in the next table), and at Low
+  imported-tower still takes 6.8 ms. A cap would not fix them (cap 8 saves 0.8
+  ms on lightroom-center and nothing on the tower), so what should be done about
+  dense views at 4K, a lower default level for Auto, cheaper per-light shading,
+  or accepting them, is for the maintainer. I have not chosen.
+- **4K throughput against the base commit** (3840×2160, `--throughput 120
+  --runs 5`, 3 alternating rounds of base and N2 at the default level (High)
+  and at Low, min / median, ms; the build is the final working tree):
+
+  | Pose | Base | N2 | Base Low | N2 Low |
+  | --- | ---: | ---: | ---: | ---: |
+  | imported-spawn | 5.65 / 9.93 | 7.23 / 8.30 | 5.73 / 8.20 | 5.62 / 8.31 |
+  | imported-overlook | 9.07 / 10.90 | 11.19 / 12.30 | 7.78 / 9.18 | 5.85 / 10.64 |
+  | imported-tower | 12.06 / 14.37 | 13.68 / 15.57 | 7.79 / 11.68 | 8.96 / 10.77 |
+  | imported-water | 6.22 / 7.75 | 7.52 / 9.99 | 4.87 / 6.76 | 5.27 / 7.41 |
+  | lightroom-center | 9.74 / 14.22 | 12.99 / 14.08 | 6.13 / 8.88 | 7.98 / 8.52 |
+  | lamphall-actor | 6.68 / 8.63 | 5.62 / 6.73 | 3.02 / 4.32 | 3.81 / 5.02 |
+
+  This batch ran under heavier contention than an earlier one of the same
+  comparison (the build before `Beside` was removed, min / median; load 3 to
+  8), which gave N2 at the default level 5.91, 9.65, 12.03, 5.86, 9.79 and 3.92
+  against the base's 5.47, 9.02, 11.90, 6.18, 9.58 and 4.16, and at Low 4.58,
+  6.12, 6.82, 3.60, 5.34 and 2.26 against 4.48, 5.88, 6.85, 3.95, 5.44 and 2.37.
+  So N2 is within noise of the base at Low, and at the default level costs
+  roughly 0.2 to 0.6 ms in dense views, more in this batch. The default level
+  shades 333 lights at the spawn instead of 149, and spends the 256 MiB bound
+  on larger tiles near the eye: with `--pages 16` the dense poses came back to
+  the base's numbers (9.69 against 9.58 on lightroom-center). I did not isolate
+  the rest. Against 6.06 ms: imported-spawn, imported-water and lamphall-actor
+  fit at the default level; overlook, tower and lightroom-center don't, as
+  before; at Low the overlook just misses (5.85 to 6.12) and the tower doesn't.
+- **After the rebase** (design lead, 2026-11-14, M5 Pro, release builds of main
+  at `1e5a102` and of N2 rebased onto it, idle machine with load averages 1.9
+  to 4.0, 3840×2160, `--throughput 120 --runs 5`, three alternating rounds,
+  median and range of the rounds' medians, ms):
+
+  | Pose | High main | High N2 | Low main | Low N2 |
+  | --- | ---: | ---: | ---: | ---: |
+  | imported-spawn | 2.95 (2.93–2.96) | 3.17 (3.13–3.19) | 1.97 (1.97–1.99) | 2.09 (2.09–2.11) |
+  | imported-overlook | 6.75 (6.72–6.78) | 7.13 (7.08–7.16) | 3.82 (3.80–3.82) | 4.03 (4.02–4.06) |
+  | lightroom-center | 9.54 (9.49–9.55) | 9.49 (9.43–9.54) | 5.40 (5.38–5.41) | 5.38 (5.38–5.41) |
+  | imported-tower | 11.25 (11.22–11.26) | 11.02 (10.98–11.03) | 6.27 (6.25–6.31) | 6.18 (6.16–6.18) |
+  | imported-tower-rooms | 8.96 (8.95–9.28) | 9.03 (9.03–9.08) | 5.13 (5.12–5.14) | 5.20 (5.17–5.40) |
+  | lightroom-actors-16 | 9.76 (9.70–9.84) | 9.96 (9.93–9.97) | 5.53 (5.52–5.56) | 5.40 (5.35–5.40) |
+  | lamphall-actor | 4.14 (4.13–4.31) | 3.42 (3.42–3.44) | 2.38 (2.38–2.39) | 1.98 (1.97–1.99) |
+
+  N2 costs up to 0.4 ms at High and 0.2 ms at Low in the imported views, is
+  even in the dense ones, and saves 0.4–0.7 ms where actors stand under lamps.
+  Against 6.06 ms: at Low every pose fits except imported-tower (6.18 ms); at
+  High imported-overlook, the tower views and the light room don't, as on main.
+  Captures of the 30 poses at 1920×1080 against main differ where N2 meant
+  them to, in share of pixels over 16/255: lightroom-actors-16 2.8%,
+  imported-tower-rooms 2.0%, imported-teleports 1.1%, lightroom-actors-4 and
+  imported-tower 0.3%, imported-flight 0.17%, lamphall-actor 0.13%, every
+  other pose 0.1% or less; water and glass match. All checks pass after the
+  rebase, the 12 GPU tests included.
+- **1,000-light scene** (`lightfield`, 4K, final build, min / median over
+  3 rounds): lightfield-center, 527 lights in view, 28.1 / 28.3 ms at the default
+  level and 15.8 / 15.8 at Low; lightfield-corner, all 1,000 in view, 28.0 / 28.2
+  and 15.6 / 15.7; lightfield-actors-16 28.2 / 28.4 and 16.0 / 16.1. These are
+  far over 6.06 ms: the busiest cluster has 107 to 172 lights (median 51 to 56)
+  and every fragment shades dozens. It is a stress scene, not a target.
+- **Atlas pages and memory** (capture report, 1920×1080, atlas and per-frame
+  textures as allocated, 4 MiB a page):
+
+  | Scene and pose | Level | Lights in view | Static pages | Per-frame pages | Atlas MiB | Bound |
+  | --- | --- | ---: | ---: | ---: | ---: | ---: |
+  | the_cube1m, spawn | default | 333 | 33 | 0 | 148 | 64 |
+  | the_cube1m, overlook | default | 290 | 56 | 0 | 228 | 64 |
+  | the_cube1m, flight | default | 141 | 56 | 0 | 232 | 64 |
+  | lightfield, center | default | 527 | 54 | 0 | 228 | 64 |
+  | lightfield, corner | default | 1,000 | 54 | 0 | 260 | 64 |
+  | lightfield, center | Low | 527 | 12 | 0 | 52 | 15 |
+  | lightfield, corner | Low | 1,000 | 12 | 0 | 84 | 15 |
+  | lightfield, 16 actors | Low | 496 | 14 | 2 | 88 | 15 |
+  | lightroom, 16 actors | default | 44 | 56 | 16 | 288 | 64 |
+
+  (The "MiB" column counts texture layers, which grow in steps of four, and
+  includes light buffers only where stated.) The spawn row was captured early,
+  while the atlas was still compacting; after settling the default level
+  settles at 54 to 56 pages everywhere, because sharpening spends the pages it
+  is given. At Low, 12 pages hold 1,000 lights as 32² and 64² tiles; the_cube1m
+  at Low was not captured separately (its 333 lights at 64² need 8 pages).
+  nub1 and the benchmark world's nub1 preset: **not measured** (nub1 isn't in
+  this machine's library, and the generated world doesn't exist yet).
+- **Per-light memory** (the term for shared-sandbox's estimate): a light's
+  buffer entries are 112 bytes of record, 16 of light sphere and 432 of cluster
+  mask, 0.56 KB (0.28 MB for 500 lights; the buffers grow by powers of two, 280
+  KiB at 333 lights, 560 KiB at 1,000). Its atlas tiles are six times a tile:
+  0.375 MiB at 128², 96 KiB at 64², 24 KiB at 32², up to 6 MiB at 512². Within
+  a level's bound that is capped (60 MiB at Low, 256 MiB elsewhere); past the
+  bound a point light takes 24 KiB. Whole-process peak memory footprint of the
+  capture tool on the_cube1m at 1080p (`/usr/bin/time -l`, imported-spawn):
+  with the 339 lights 3.006 GB at the default level and 2.774 GB at Low, without
+  them (a copy of the world with its light nodes removed) 2.888 and 2.754 GB.
+  So the lights cost about 0.12 GB at the default level and 0.02 GB at Low, not
+  the 0.17 to 0.35 GiB inferred before; the inference doesn't hold here (single
+  capture runs, one machine).
+- **Atlas update times** (4K, serial frames, GPU time of the atlas passes, mean
+  / p99 ms, median of 3 alternating rounds; frame median / p95 ms):
+
+  | Pose | Base | N2 |
+  | --- | ---: | ---: |
+  | imported-flight | 0.60 / 3.49 (14.0 / 22.0) | 0.22 / 2.32 (13.2 / 20.4) |
+  | imported-teleports | 1.19 / 4.62 (15.9 / 18.8) | 0.08 / 2.47 (15.4 / 17.2) |
+  | imported-storm | 2.44 / 4.55 (27.9 / 30.6) | 1.66 / 3.89 (25.9 / 27.1) |
+  | lightroom-storm | 1.41 / 4.09 (10.6 / 15.5) | 1.02 / 2.86 (10.6 / 14.5) |
+
+  These are lower despite more lights shadowed, because most of the work is the
+  initial fill, which is now outside the measured frames (see the settle
+  times). The pass timestamps overlap on Metal and some frames report stale
+  values; read them as indications.
+- **Settling after a jump or join.** Rendering every tile at six faces a frame
+  takes longer with more lights: imported-spawn needed 334 frames (5.6 s at
+  60 Hz) from a cold start against 156 before, and the 1,000-light corner pose
+  1,730 to 2,150 frames (30 to 36 s). It stays at six faces a frame (twelve for
+  three frames after a jump), the stage 2 budget, and at most 1.5 ms of GPU
+  time. A few runs of the spawn pose took up to 1,159 frames while `compact`
+  moved tiles; I did not chase it.
+- **Lights per cluster** (clusters that have any; p50 / p95 / max, 1920×1080):
+  imported-spawn 3 / 42 / 118, overlook 8 / 26 / 54, tower 15 / 25 / 35,
+  tower-rooms 16 / 27 / 38, lightroom-center 17 / 23 / 27, lightfield-center
+  56 / 82 / 107, lightfield-corner 51 / 93 / 172.
+- **Expected differences in the captures.** All 30 poses of the base manifest
+  were captured at 1920×1080 with `capture` at `847b67d`, and again with an
+  intermediate build of N2 (compared pixel by pixel; differing pixels, with how
+  many differ by more than 8 levels out of 255):
+  - **Guard band** (confirmed: with the old fixed scale put back, arena-shadow
+    and shadowtest-wall were byte-identical to the base): arena-shadow 0.64%,
+    arena-yard 0.04%, shadowtest-floor 0.55%, shadowtest-wall 0.38%, lightshow-
+    spots 0.08%, waterglass 0.00 to 0.01%, one pixel wide along shadow edges and
+    cube-face seams.
+  - **Larger atlas, so sharper tiles near the eye, and no per-fragment cap**
+    (not separated): lightroom-center, -corner and -storm 2.9%, corridor-view
+    2.0%, corridor-wall 3.0% (edges between wall and floor, up to 129 levels
+    on a pixel), materials 0.1 to 0.5%.
+  - **Lights that gain shadows:** imported-tower 12.3%, imported-tower-rooms
+    12.3%, imported-flight 6.9%, imported-teleports 5.0%, imported-storm 2.9%,
+    imported-overlook 2.0%, imported-spawn 0.02%, imported-water 0.00%.
+  - **Every light shadows actors:** lightroom-actors-16 30.9%, lightroom-actors-4
+    11.8%, lamphall-actor 0.8%, lightshow-dynamic 0.3% and -moved 0.6%.
+  The three `lightfield` poses are new. lightfield-center is blown out in the
+  floor (a thousand 16-unit lights overlap), which suits a stress scene but not
+  a look test. The captures were not repeated with the final build; the
+  pruning after them touched only the actor-tile path.
+- **Checks run** from `/Users/zach/gits/sauerteig-worktrees/renderer-n2` after
+  `. ./scripts/env.sh`: `cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (230
+  client tests pass, 12 ignored), and `cargo test -p sauerteig-client --lib gpu_
+  --locked -- --ignored --test-threads=1` (11 pass on the M5 Pro, 96 s). New
+  tests: in `atlas.rs` the five tile sizes, the page pool (creation, ceiling,
+  a full page of 32² tiles), growth past the bound, eviction order, replacement
+  limits and `sparse_pages_are_emptied_and_given_back`; in `lightset.rs` grants,
+  1,000 lights within the bound, a lower bound shrinking tiles without losing a
+  light, per-frame tiles (where, how many, whatever the rank) and the page
+  table; in `lighting.rs` the guard band and the 112-byte record; in
+  `clusters.rs` 1,000-light masks; GPU tests listed in the acceptance list, and
+  `gpu_spot_lights_and_actor_tiles_render`.
+- **Not observed:** the F3 line, Settings, and a level change in a running
+  window; flying through the_cube1m to see tiles fill, lights pop, or player
+  shadows switch; any adapter other than the M5 Pro; the lowest level on a
+  reference machine; nub1 and the benchmark world.
+- **Gaps.**
+  - **Per-frame tiles are as large as their static tiles**, so at the default
+    level a room of actors near lights with 512² tiles takes the atlas past its
+    bound (16 actors in the lightroom: 72 pages against 64). F3 reports it. At
+    Low they stay within one page of the bound.
+  - **The default level spends its whole bound** (54 to 56 static pages) on
+    sharper tiles, and costs a few tenths of a millisecond to more than a
+    millisecond at 4K for it; whether High should ask for less is for the
+    maintainer.
+  - **Settling is slower** with more lights (above); the budget of six faces a
+    frame was not raised.
+  - **Fragmentation:** pages typed for one tile size can hold the atlas past
+    its bound until `compact` empties them; it converges in tests but one run
+    of the spawn pose took 1,159 frames to settle.
+  - **The atlas shrinks only in steps of twelve unused layers**, and a world
+    switch doesn't reset it.
+  - **Tile size follows projected size at 128² and up only.** Lights far away
+    still get 128² when there is room.
+  - **Vulkan and DirectX 12:** the layer request (up to 2,048), the
+    three storage buffers, the fragment depth output of `fs_copy` and whole-layer
+    depth copies are untested there; no sub-rectangle depth copy is used.
+  - **O1a and O1b:** nothing here depends on the mesh unit size; culling uses
+    `mesh.bounds` and the opaque keys. The measurements need rerunning after
+    the rebase.
 
 ### N3: lighter world meshes
 

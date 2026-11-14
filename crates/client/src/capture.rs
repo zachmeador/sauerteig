@@ -3,7 +3,7 @@ mod scenes;
 
 use crate::{
     lighting::ShadowMode,
-    render::{settings::RenderSettings, OverBudget, Renderer, RendererOptions},
+    render::{settings::RenderSettings, Renderer, RendererOptions},
     scene::Geometry,
 };
 use glam::Vec3;
@@ -20,7 +20,7 @@ use std::{
 };
 
 /// Frames drawn while waiting for shadows and fades to finish, at most.
-const SETTLE_LIMIT: usize = 900;
+const SETTLE_LIMIT: usize = 2400;
 
 #[derive(Deserialize)]
 struct WorldFile {
@@ -205,7 +205,7 @@ fn is_sun_static_pass(label: &str) -> bool {
     label.starts_with("sun static") || label.starts_with("sun cascade")
 }
 
-/// The atlas's tile and overlay passes alone, without the sun's window.
+/// The atlas's tile and actor-tile passes alone, without the sun's window.
 fn is_atlas_pass(label: &str) -> bool {
     label.starts_with("shadow")
 }
@@ -242,15 +242,8 @@ pub fn run() -> Result<(), String> {
             "--pages" => {
                 options.atlas_pages = Some(value.parse().map_err(|_| "Invalid page count")?)
             }
-            "--actor-lights" => {
-                options.actor_lights = Some(value.parse().map_err(|_| "Invalid light count")?)
-            }
-            "--over-budget" => {
-                options.over_budget = match value.as_str() {
-                    "fade" => OverBudget::FadeOut,
-                    "unshadowed" => OverBudget::Unshadowed,
-                    _ => return Err("Use --over-budget fade or unshadowed".into()),
-                }
+            "--light-cap" => {
+                options.light_cap = Some(value.parse().map_err(|_| "Invalid light cap")?)
             }
             "--display-hz" => {
                 options.display_hz = Some(value.parse().map_err(|_| "Invalid refresh rate")?)
@@ -691,6 +684,9 @@ async fn capture(
             "shadow_gpu_ms_per_frame": summary(&shadow_gpu), "atlas_gpu_ms_per_frame": summary(&atlas_gpu),
             "shadow_updates_per_frame": summary(&updates),
             "lighting": renderer.lighting_stats(), "settled": settled, "settle_frames": settle_frames,
+            "shadow_atlas_bytes": renderer.shadow_atlas_bytes(),
+            "shadow_atlas_layers": renderer.shadow_atlas_layers(),
+            "light_buffer_bytes": renderer.light_buffer_bytes(),
             "measured_frames": cameras.len(), "frames_to_settle_after_jump": jump_settle,
             "faces_rendered_per_frame": summary(&rendered), "faces_used_per_frame": summary(&used),
             "cache_hit_rate": (used_total > 0.0).then(|| 1.0 - rendered_total / used_total),
@@ -708,7 +704,7 @@ async fn capture(
         "frames": frames, "warmup": warmup, "settings": settings, "effective": renderer.render_description(),
         "sun_cascade_bytes": renderer.sun_cascade_bytes(),
         "sample_counts": renderer.sample_counts(), "brute_force": options.brute_force,
-        "over_budget": format!("{:?}", options.over_budget),
+        "light_cap": options.light_cap,
         "timing": "headless serial submit + GPU completion; excludes PNG readback, UI generation, simulation and presentation",
         "poses": reports});
     std::fs::write(
@@ -1097,7 +1093,7 @@ mod tests {
             grid.build_masks(scale, &lights(0.999)),
             grid.build_masks(scale, &lights(1.001)),
         );
-        let words = grid.words as usize;
+        let words = ClusterGrid::mask_words(spheres.len());
         let mut set = 0;
         for cluster in 0..grid.count() {
             for word in 0..words {
@@ -1211,14 +1207,11 @@ mod tests {
 
     #[test]
     #[ignore = "requires a native GPU; run explicitly with --ignored"]
-    fn gpu_spot_lights_and_actor_overlays_render() {
+    fn gpu_spot_lights_and_actor_tiles_render() {
         let eye = Vec3::new(-4.0, 3.2, 11.0);
         let look_at = Vec3::new(1.5, 1.2, 3.0);
-        // Only lights that are dynamic themselves shadow actors.
-        let mut renderer = headless(RendererOptions {
-            actor_lights: Some(0),
-            ..Default::default()
-        });
+        let with_actor = Some(Vec3::new(1.5, 1.0, 4.5));
+        let mut renderer = headless(RendererOptions::default());
         let scene = load(&mut renderer, "lightshow");
         let empty = settled(
             &mut renderer,
@@ -1230,8 +1223,7 @@ mod tests {
         );
         let stats = renderer.lighting_stats();
         assert_eq!(stats.shadowed, 5, "{stats:?}");
-        assert_eq!(stats.overlay_tiles, 0);
-        let with_actor = Some(Vec3::new(1.5, 1.0, 4.5));
+        assert_eq!(stats.frame_tiles, 0);
         let a = settled(
             &mut renderer,
             &scene.world,
@@ -1240,7 +1232,7 @@ mod tests {
             eye,
             look_at,
         );
-        assert!(renderer.lighting_stats().overlay_tiles > 0);
+        assert!(renderer.lighting_stats().frame_tiles > 0);
         let b = settled(
             &mut renderer,
             &scene.world,
@@ -1251,8 +1243,18 @@ mod tests {
         );
         let (moved, appeared) = (differing(&a, &b), differing(&empty, &a));
         assert!(appeared > 0 && moved > 0, "{appeared} {moved}");
-        // The dynamic light's overlay casts the actor's shadow; making the
-        // light static removes it, leaving only the sun's.
+        // The actor is gone again, and nothing of it is left in a tile.
+        let gone = settled(
+            &mut renderer,
+            &scene.world,
+            &scene.objects,
+            None,
+            eye,
+            look_at,
+        );
+        assert_eq!(differing(&gone, &empty), 0);
+        // Making every light static removes the lights' actor shadows,
+        // leaving only the sun's.
         let mut lights = scene.lights.clone();
         lights.iter_mut().for_each(|l| {
             if l.shadow == ShadowMode::Dynamic {
@@ -1268,39 +1270,146 @@ mod tests {
             eye,
             look_at,
         );
-        assert_eq!(renderer.lighting_stats().overlay_tiles, 0);
+        assert_eq!(renderer.lighting_stats().frame_tiles, 0);
         assert!(differing(&a, &static_a) > 0);
-        // The most important lights shadow actors whatever their own mode: the
-        // same lights, all static, draw what all dynamic lights draw.
-        let with_mode = |scene: &Scene, mode| -> Vec<LightDesc> {
-            let mut lights = scene.lights.clone();
-            for light in lights.iter_mut().filter(|l| l.shadow != ShadowMode::Off) {
-                light.shadow = mode;
-            }
-            lights
-        };
-        renderer.set_extra_lights(with_mode(&scene, ShadowMode::Dynamic));
-        let all_dynamic = settled(
+    }
+
+    /// The lightfield, where a floor point has dozens of lights in reach.
+    fn lightfield_pixels(options: RendererOptions) -> (Vec<u8>, Renderer) {
+        let mut renderer = headless(options);
+        let scene = load(&mut renderer, "lightfield");
+        let pixels = settled(
             &mut renderer,
             &scene.world,
             &scene.objects,
-            with_actor,
-            eye,
-            look_at,
+            None,
+            Vec3::new(3.5, 2.6, 3.5),
+            Vec3::new(-30.0, 4.0, -20.0),
         );
-        let mut promoting = headless(RendererOptions::default());
-        let scene = load(&mut promoting, "lightshow");
-        promoting.set_extra_lights(with_mode(&scene, ShadowMode::Static));
-        let promoted = settled(
-            &mut promoting,
-            &scene.world,
-            &scene.objects,
-            with_actor,
-            eye,
-            look_at,
+        (pixels, renderer)
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; run explicitly with --ignored"]
+    fn gpu_a_fragment_reached_by_more_than_sixteen_lights_shades_all_of_them() {
+        let (all, renderer) = lightfield_pixels(RendererOptions::default());
+        let (_, spheres, scale) = renderer.cluster_readback();
+        // Count what reaches the clusters: some must hold far more than 16.
+        let grid = ClusterGrid::CLUSTERED;
+        let lights: Vec<_> = spheres.iter().map(|&s| glam::Vec4::from_array(s)).collect();
+        let masks = grid.build_masks(scale, &lights);
+        let words = ClusterGrid::mask_words(lights.len());
+        let most = masks
+            .chunks(words)
+            .map(|c| c.iter().map(|w| w.count_ones()).sum::<u32>())
+            .max()
+            .unwrap();
+        assert!(most > 40, "{most} lights in the busiest cluster");
+        let (capped, _) = lightfield_pixels(RendererOptions {
+            light_cap: Some(16),
+            ..Default::default()
+        });
+        assert!(
+            differing(&all, &capped) > 1000,
+            "a cap of 16 changed {} bytes",
+            differing(&all, &capped)
         );
-        assert!(promoting.lighting_stats().overlay_tiles > 0);
-        assert_eq!(differing(&all_dynamic, &promoted), 0);
+        // With no cap the clusters give what evaluating every light does.
+        let (brute, _) = lightfield_pixels(RendererOptions {
+            brute_force: true,
+            ..Default::default()
+        });
+        assert_eq!(differing(&all, &brute), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; run explicitly with --ignored"]
+    fn gpu_a_water_fragment_reached_by_more_than_eight_lights_shades_all_of_them() {
+        let eye = Vec3::new(-19.0, 4.5, -19.0);
+        let look_at = Vec3::new(2.0, 2.5, 2.0);
+        let draw = |options: RendererOptions| {
+            let mut renderer = headless(options);
+            let scene = load(&mut renderer, "waterglass");
+            // Twelve more lights over the tank, to the eight it has.
+            let mut lights = scene.lights.clone();
+            lights.extend((0..12).map(|i| {
+                LightDesc::point(
+                    500 + i,
+                    Vec3::new(
+                        -6.0 + (i % 4) as f32 * 4.0,
+                        3.2,
+                        -4.0 + (i / 4) as f32 * 4.0,
+                    ),
+                )
+            }));
+            renderer.set_extra_lights(lights);
+            let pixels = settled(
+                &mut renderer,
+                &scene.world,
+                &scene.objects,
+                None,
+                eye,
+                look_at,
+            );
+            (pixels, renderer)
+        };
+        let (all, renderer) = draw(RendererOptions::default());
+        let (_, spheres, _) = renderer.cluster_readback();
+        // A point in the middle of the tank's surface.
+        let water = Vec3::new(0.0, 2.0, 0.0);
+        let eye_to_water = |s: &[f32; 4]| {
+            let view = glam::Mat4::look_to_rh(eye, (look_at - eye).normalize(), Vec3::Y);
+            let center = view.inverse().transform_point3(Vec3::new(s[0], s[1], s[2]));
+            center.distance(water) < s[3] / 1.002
+        };
+        let reaching = spheres.iter().filter(|s| eye_to_water(s)).count();
+        assert!(reaching > 8, "{reaching} lights reach the water");
+        let (capped, _) = draw(RendererOptions {
+            light_cap: Some(8),
+            ..Default::default()
+        });
+        assert!(differing(&all, &capped) > 0);
+        let (brute, _) = draw(RendererOptions {
+            brute_force: true,
+            ..Default::default()
+        });
+        assert_eq!(differing(&all, &brute), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; run explicitly with --ignored"]
+    fn gpu_a_thousand_lights_match_a_brute_force_render_within_the_lowest_bound() {
+        let eye = Vec3::new(3.5, 2.6, 3.5);
+        let look_at = Vec3::new(-30.0, 4.0, -20.0);
+        let mut images = Vec::new();
+        for brute_force in [false, true] {
+            let mut renderer = headless(RendererOptions {
+                brute_force,
+                // The lowest level's bound.
+                atlas_pages: Some(15),
+                ..Default::default()
+            });
+            let scene = load(&mut renderer, "lightfield");
+            let pixels = settled(
+                &mut renderer,
+                &scene.world,
+                &scene.objects,
+                None,
+                eye,
+                look_at,
+            );
+            let stats = renderer.lighting_stats();
+            println!("{stats:?}");
+            assert!(stats.drawn > 300, "{stats:?}");
+            assert_eq!(stats.shadowed, stats.drawn);
+            assert_eq!(stats.over_budget, 0);
+            assert_eq!(stats.pages_past_bound(), 0, "{stats:?}");
+            let (atlas, frame) = renderer.shadow_atlas_layers();
+            assert!(atlas + frame <= 16, "{atlas} + {frame} layers");
+            images.push(pixels);
+        }
+        assert_eq!(differing(&images[0], &images[1]), 0);
+        assert!(images[0].iter().map(|&b| u32::from(b)).sum::<u32>() > 100_000);
     }
     #[test]
     #[ignore = "requires a native GPU; run explicitly with --ignored"]

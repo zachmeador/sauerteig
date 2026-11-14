@@ -1,40 +1,28 @@
-use super::{atlas::PAGE_SIZE, lightset::LightConfig};
-use crate::lighting::{NO_TILE, OVERLAY_NONE, SHADOW_NEAR, TILE_GUARD_SCALE};
+use super::{atlas::PAGE_SIZE, device::MAX_ARRAY_LAYERS, lightset::MAX_LIGHTS_IN_VIEW};
+use crate::lighting::{NO_TILE, SHADOW_NEAR, TILE_GUARD_TEXELS};
 
 const COMMON: &str = include_str!("../common.wgsl");
 
-/// The sizes of the light buffers, which the shaders get as constants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct LightLayout {
-    pub mask_words: u32,
-    pub max_lights: u32,
+/// The constants every shader gets ahead of its source. The loops over lights
+/// are bounded by `MAX_LIGHTS` and `MAX_LIGHT_WORDS`, however many lights a
+/// frame has; the frame's own count is read from the light parameters.
+fn header() -> String {
+    format!(
+        "const MAX_LIGHTS: u32 = {}u;\nconst MAX_LIGHT_WORDS: u32 = {}u;\n\
+         const ATLAS_SIZE: f32 = {:?};\nconst SHADOW_NEAR: f32 = {:?};\n\
+         const GUARD_TEXELS: f32 = {:?};\nconst NO_TILE: u32 = {}u;\n\
+         const FRAME_PAGE_BASE: u32 = {}u;\n",
+        MAX_LIGHTS_IN_VIEW,
+        MAX_LIGHTS_IN_VIEW.div_ceil(32),
+        PAGE_SIZE as f32,
+        SHADOW_NEAR,
+        TILE_GUARD_TEXELS,
+        NO_TILE,
+        MAX_ARRAY_LAYERS,
+    )
 }
 
-impl LightLayout {
-    pub fn new(config: &LightConfig) -> Self {
-        Self {
-            mask_words: config.grid.words,
-            max_lights: config.max_lights as u32,
-        }
-    }
-
-    fn header(&self) -> String {
-        format!(
-            "const MASK_WORDS: u32 = {}u;\nconst MAX_LIGHTS: u32 = {}u;\n\
-             const ATLAS_SIZE: f32 = {:?};\nconst SHADOW_NEAR: f32 = {:?};\n\
-             const TILE_GUARD_SCALE: f32 = {:?};\nconst NO_TILE: u32 = {}u;\nconst OVERLAY_NONE: u32 = {}u;\n",
-            self.mask_words,
-            self.max_lights,
-            PAGE_SIZE as f32,
-            SHADOW_NEAR,
-            TILE_GUARD_SCALE,
-            NO_TILE,
-            OVERLAY_NONE,
-        )
-    }
-}
-
-pub(super) fn source(name: &str, layout: LightLayout) -> String {
+pub(super) fn source(name: &str) -> String {
     let (common, body) = match name {
         "world" => (COMMON, include_str!("../world.wgsl")),
         "sky" => (COMMON, include_str!("../sky.wgsl")),
@@ -46,7 +34,7 @@ pub(super) fn source(name: &str, layout: LightLayout) -> String {
         "post" => return include_str!("../post.wgsl").to_owned(),
         _ => unreachable!("unknown embedded shader"),
     };
-    format!("{}\n{common}\n{body}", layout.header())
+    format!("{}\n{common}\n{body}", header())
 }
 
 fn types_only() -> &'static str {
@@ -56,8 +44,8 @@ fn types_only() -> &'static str {
         .unwrap()
 }
 
-pub(super) fn module(device: &wgpu::Device, name: &str, layout: LightLayout) -> wgpu::ShaderModule {
-    trusted(device, name, source(name, layout))
+pub(super) fn module(device: &wgpu::Device, name: &str) -> wgpu::ShaderModule {
+    trusted(device, name, source(name))
 }
 
 /// Compile an embedded shader without wgpu's forced loop bounding.
@@ -70,11 +58,13 @@ pub(super) fn trusted(device: &wgpu::Device, label: &str, source: String) -> wgp
     // for shaders that might never finish, and none of the shaders embedded in
     // this crate can run forever, because every loop has a bounded trip count:
     // counted loops run to a constant (4 shadow taps, 3 × 3 filters, 8 cluster
-    // corners, `MASK_WORDS` words of a light mask, and at most `MAX_LIGHTS`
-    // lights), and the clustered loop over the set bits of a mask word clears its
-    // lowest bit each time round, so it ends within 32 iterations, 256 across a
-    // cluster's 8 words. `bounds_checks` stays true, so out-of-range reads and
-    // writes are still contained.
+    // corners, the 32 bits of a mask word), or to a count that is clamped to a
+    // constant in the shader before the loop (at most `MAX_LIGHTS` lights and
+    // `MAX_LIGHT_WORDS` words of a cluster's mask, whatever the light
+    // parameters say), and the clustered loop over the set bits of a mask word
+    // clears its lowest bit each time round, so it ends within 32 iterations.
+    // `bounds_checks` stays true, so out-of-range reads and writes are still
+    // contained.
     unsafe {
         device.create_shader_module_trusted(
             wgpu::ShaderModuleDescriptor {
@@ -92,19 +82,12 @@ pub(super) fn trusted(device: &wgpu::Device, label: &str, source: String) -> wgp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        lighting::GpuLight,
-        render::{device::requested_limits, lightset::LightConfig},
-    };
+    use crate::{lighting::GpuLight, render::device::requested_limits};
 
     const SHADERS: [&str; 6] = ["world", "sky", "volume", "shadow", "clusters", "post"];
 
-    fn layout() -> LightLayout {
-        LightLayout::new(&LightConfig::default())
-    }
-
-    fn validate(name: &str, layout: LightLayout) -> (naga::Module, naga::valid::ModuleInfo) {
-        let source = source(name, layout);
+    fn validate(name: &str) -> (naga::Module, naga::valid::ModuleInfo) {
+        let source = source(name);
         let module = naga::front::wgsl::parse_str(&source)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
         let info = naga::valid::Validator::new(
@@ -112,14 +95,14 @@ mod tests {
             naga::valid::Capabilities::empty(),
         )
         .validate(&module)
-        .unwrap_or_else(|e| panic!("{name} {layout:?}: {e:?}"));
+        .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         (module, info)
     }
 
     #[test]
     fn every_assembled_shader_validates() {
         for name in SHADERS {
-            validate(name, layout());
+            validate(name);
         }
     }
 
@@ -127,7 +110,7 @@ mod tests {
     fn entry_points_stay_within_the_requested_limits() {
         let limits = requested_limits(1920);
         for name in SHADERS {
-            let (module, info) = validate(name, layout());
+            let (module, info) = validate(name);
             for (index, entry) in module.entry_points.iter().enumerate() {
                 let usage = info.get_entry_point(index);
                 let used = |wanted: &dyn Fn(&naga::GlobalVariable) -> bool| {
@@ -185,19 +168,20 @@ mod tests {
 
     #[test]
     fn the_light_buffers_fit_the_requested_binding_sizes() {
-        let layout = layout();
-        let config = LightConfig::default();
-        assert_eq!(layout.mask_words, 8);
-        assert_eq!(layout.max_lights, 256);
         let limits = requested_limits(1920);
-        let masks = config.grid.count() as u64 * u64::from(config.grid.words) * 4;
-        let lights = u64::from(layout.max_lights) * std::mem::size_of::<GpuLight>() as u64;
+        let grid = crate::render::clusters::ClusterGrid::CLUSTERED;
+        let masks = grid.count() as u64 * MAX_LIGHTS_IN_VIEW.div_ceil(32) as u64 * 4;
+        let lights = MAX_LIGHTS_IN_VIEW as u64 * std::mem::size_of::<GpuLight>() as u64;
         assert!(masks.max(lights) <= u64::from(limits.max_storage_buffer_binding_size));
+        // A page table entry for every page of both atlases.
+        assert!(
+            MAX_ARRAY_LAYERS as u64 * 2 * 4 <= u64::from(limits.max_storage_buffer_binding_size)
+        );
     }
 
     #[test]
     fn shader_structs_match_the_rust_records() {
-        let (module, _) = validate("world", layout());
+        let (module, _) = validate("world");
         let mut layouter = naga::proc::Layouter::default();
         layouter.update(module.to_ctx()).unwrap();
         let size_of = |name: &str| {

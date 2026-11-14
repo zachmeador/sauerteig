@@ -21,7 +21,6 @@ use settings::{Quality, QualityLevel, RenderSettings, Resolved};
 use shadows::ShadowAtlasGpu;
 use sun::SunShadows;
 
-pub use self::lightset::OverBudget;
 use self::{
     culling::{Bounds, Frustum},
     lights::{ClusterView, LightGpu},
@@ -30,7 +29,6 @@ use self::{
         MAX_OBJECT_EDITS, OBJECT_REACH,
     },
     props::{instance_layout, PropRenderer, ShadowTarget, TileView},
-    shaders::LightLayout,
     volumes::VolumeRenderer,
 };
 use crate::lighting::{sun_cascades, LightDesc, ShadowMode, CASCADES};
@@ -52,14 +50,13 @@ const SHADOW_BUDGET_MS: f64 = 1.5;
 pub struct RendererOptions {
     /// Evaluate every light at every fragment instead of reading cluster masks.
     pub brute_force: bool,
-    pub over_budget: OverBudget,
     /// Shadow mode of the lights light nodes place.
     pub node_shadows: ShadowMode,
-    /// Shadow atlas pages instead of the lighting path's default, up to 14.
+    /// The atlas's bound in pages instead of the quality level's.
     pub atlas_pages: Option<usize>,
-    /// How many of the most important shadowed lights shadow moving actors,
-    /// instead of the default.
-    pub actor_lights: Option<usize>,
+    /// The most lights a fragment shades, for comparing against the cap
+    /// stage 2 had. The game never sets one.
+    pub light_cap: Option<u32>,
     /// Advance light fades and residency by this much each frame, not by the
     /// clock, so captures repeat.
     pub fixed_frame_time: Option<f32>,
@@ -545,14 +542,16 @@ impl Renderer {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-        let mut light_config = LightConfig::default();
-        if let Some(pages) = options.atlas_pages {
-            light_config.pages = pages.clamp(1, shadows::MAX_PAGES);
+        let mut light_config = LightConfig {
+            bound_pages: options
+                .atlas_pages
+                .unwrap_or_else(|| applied.shadows.atlas_pages()),
+            ceiling_pages: device.limits().max_texture_array_layers as usize,
+            ..LightConfig::default()
+        };
+        if let Some(cap) = options.light_cap {
+            light_config.light_cap = cap;
         }
-        if let Some(lights) = options.actor_lights {
-            light_config.actor_lights = lights;
-        }
-        let light_layout = LightLayout::new(&light_config);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison"),
             compare: Some(wgpu::CompareFunction::LessEqual),
@@ -565,15 +564,20 @@ impl Renderer {
             contents: bytemuck::cast_slice(&[[0.0f32; 4]]),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let shadow_module = shaders::module(&device, "shadow", light_layout);
+        let shadow_module = shaders::module(&device, "shadow");
         let atlas = ShadowAtlasGpu::new(
             &device,
-            light_config.pages,
             &shadow_module,
             &[GpuVertex::layout(), instance_layout()],
         );
         let sun = SunShadows::new(&device, applied.shadows.cascade_size(), &shadow_module);
-        let light_gpu = LightGpu::new(&device, light_config, sun.array(), &sampler, &atlas.array);
+        let light_gpu = LightGpu::new(
+            &device,
+            light_config,
+            sun.array(),
+            &sampler,
+            [atlas.array(), atlas.frame_array()],
+        );
         let materials = crate::materials::Materials::new(&device, &queue)?;
         let props = PropRenderer::new(&device)?;
         let volumes = VolumeRenderer::new(
@@ -581,10 +585,9 @@ impl Renderer {
             HDR_FORMAT,
             &camera_layout,
             &light_gpu.bind_layout,
-            light_layout,
             &sample_counts,
         );
-        let shader = shaders::module(&device, "world", light_layout);
+        let shader = shaders::module(&device, "world");
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world pipeline layout"),
             bind_group_layouts: &[&camera_layout, &light_gpu.bind_layout, &materials.layout],
@@ -637,7 +640,7 @@ impl Renderer {
                 bind_group_layouts: &[&camera_layout],
                 push_constant_ranges: &[],
             });
-        let sky = shaders::module(&device, "sky", light_layout);
+        let sky = shaders::module(&device, "sky");
         let sky_pipeline = sample_counts
             .iter()
             .map(|&sample_count| {
@@ -708,8 +711,7 @@ impl Renderer {
                 fixed: options.fixed_frame_time,
             },
             lights: {
-                let mut lights =
-                    LightSet::new(light_config, options.over_budget, options.node_shadows);
+                let mut lights = LightSet::new(light_config, options.node_shadows);
                 lights.set_max_tile_class(applied.shadows.max_tile_class());
                 lights
             },
@@ -775,6 +777,11 @@ impl Renderer {
         if wanted.shadows.max_tile_class() != self.applied.shadows.max_tile_class() {
             self.lights
                 .set_max_tile_class(wanted.shadows.max_tile_class());
+        }
+        if self.options.atlas_pages.is_none()
+            && wanted.shadows.atlas_pages() != self.applied.shadows.atlas_pages()
+        {
+            self.lights.set_bound_pages(wanted.shadows.atlas_pages());
         }
         self.applied = wanted;
     }
@@ -860,16 +867,23 @@ impl Renderer {
     pub fn lighting_description(&self) -> String {
         let l = &self.lighting;
         format!(
-            "lights: {} drawn / {} in view / {} total, {} shadowed ({} with actors), {} over budget, {} waiting; shadow faces {} new / {} resident",
+            "lights: {} drawn / {} in view / {} total, {} shadowed ({} with actors), {} waiting, {} unshadowable; shadow faces {} new / {} resident, {} for actors; atlas {} pages of {}{}",
             l.drawn,
             l.visible,
             l.world_lights,
             l.shadowed,
             l.actor_shadowed,
-            l.over_budget,
             l.waiting,
+            l.over_budget,
             l.tiles_rendered,
             l.tiles_resident,
+            l.frame_tiles,
+            l.pages_made + l.frame_pages,
+            l.bound_pages,
+            match l.pages_past_bound() {
+                0 => String::new(),
+                past => format!(" ({past} past the bound)"),
+            },
         )
     }
     pub fn lighting_stats(&self) -> LightingStats {
@@ -886,6 +900,18 @@ impl Renderer {
     /// The anti-aliasing sample counts this adapter can run, 1 first.
     pub fn sample_counts(&self) -> &[u32] {
         &self.sample_counts
+    }
+    /// Bytes of the shadow atlas and per-frame tile textures.
+    pub fn shadow_atlas_bytes(&self) -> usize {
+        self.atlas.bytes()
+    }
+    /// Pages of the atlas texture and of the per-frame one, as layers.
+    pub fn shadow_atlas_layers(&self) -> (usize, usize) {
+        self.atlas.layers()
+    }
+    /// Bytes of the buffers that grow with the lights in view.
+    pub fn light_buffer_bytes(&self) -> usize {
+        self.light_gpu.buffer_bytes()
     }
     /// How many of the last frame's lights reach each view cluster.
     pub fn cluster_counts(&self) -> Vec<u32> {
@@ -1198,6 +1224,7 @@ impl Renderer {
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         self.light_gpu.upload(
+            &self.device,
             &self.queue,
             &plan,
             ClusterView {
@@ -1220,6 +1247,16 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        if self.atlas.reserve(
+            &self.device,
+            &mut encoder,
+            plan.page_classes.len(),
+            plan.frame_page_classes.len(),
+            plan.jobs.len() + plan.frame_jobs.len(),
+        ) {
+            self.light_gpu
+                .set_atlas(&self.device, self.atlas.array(), self.atlas.frame_array());
+        }
         let paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -1318,12 +1355,12 @@ impl Renderer {
                 },
             );
             let dynamic = &self.dynamic;
-            self.atlas.render_overlay(
+            self.atlas.render_frame(
                 &mut encoder,
                 &self.queue,
                 &mut self.timing,
                 plan.jobs.len(),
-                &plan.overlay,
+                &plan.frame_jobs,
                 &mut |pass| {
                     pass.set_vertex_buffer(1, identity.slice(..));
                     dynamic.draw_prefix(pass, shadow_index_count);

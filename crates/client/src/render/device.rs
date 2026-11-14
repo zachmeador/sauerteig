@@ -24,9 +24,13 @@ pub(super) fn no_adapter_message() -> String {
 /// Scene targets up to this many pixels across work on every adapter that has
 /// the minimum specification. A bigger window asks for more.
 const MIN_TEXTURE_DIMENSION: u32 = 8192;
-/// The material arrays hold at most 64 layers (`MAX_MATERIALS` in
-/// `materials.rs`).
-const MATERIAL_LAYERS: u32 = 64;
+/// Array layers every adapter has (WebGPU's default, and the minimum Vulkan
+/// guarantees): the material arrays need 64 (`MAX_MATERIALS` in
+/// `materials.rs`), and the shadow atlas needs a layer for each 4 MiB page.
+const MIN_ARRAY_LAYERS: u32 = 256;
+/// The most layers the renderer asks for, where the adapter offers them: the
+/// most pages a shadow atlas can have, which hold 350,000 lights at 32².
+pub(super) const MAX_ARRAY_LAYERS: u32 = 2048;
 
 /// Features the renderer uses where the adapter has them.
 const OPTIONAL_FEATURES: Features =
@@ -49,12 +53,13 @@ pub(super) fn requested_limits(target: u32) -> Limits {
     Limits {
         max_texture_dimension_1d: side,
         max_texture_dimension_2d: side,
-        max_texture_array_layers: MATERIAL_LAYERS,
+        max_texture_array_layers: MIN_ARRAY_LAYERS,
         // Camera, lights and shadows, materials.
         max_bind_groups: 3,
-        // The light list and cluster masks read in fragment shaders; the
-        // culling pass reads the light spheres and writes the masks.
-        max_storage_buffers_per_shader_stage: 2,
+        // The light list, cluster masks and shadow page table read in
+        // fragment shaders; the culling pass reads the light spheres and
+        // writes the masks.
+        max_storage_buffers_per_shader_stage: 3,
         // One 64-lane workgroup per 64 clusters.
         max_compute_invocations_per_workgroup: 64,
         max_compute_workgroup_size_x: 64,
@@ -108,9 +113,15 @@ pub(super) fn plan_request(
             missing.join(", ")
         ));
     }
+    // The atlas grows with the lights, so it takes every layer the adapter
+    // offers up to a ceiling.
+    let mut granted = wanted;
+    granted.max_texture_array_layers = limits
+        .max_texture_array_layers
+        .clamp(MIN_ARRAY_LAYERS, MAX_ARRAY_LAYERS);
     Ok(DeviceRequest {
         features: features & OPTIONAL_FEATURES,
-        limits: wanted,
+        limits: granted,
     })
 }
 
@@ -201,7 +212,7 @@ mod tests {
         let request = plan(Features::all(), &Limits::default(), DownlevelFlags::all()).unwrap();
         // Only the two optional features, though the adapter offers all.
         assert_eq!(request.features, OPTIONAL_FEATURES);
-        assert_eq!(request.limits.max_storage_buffers_per_shader_stage, 2);
+        assert_eq!(request.limits.max_storage_buffers_per_shader_stage, 3);
         assert_eq!(request.limits.max_texture_dimension_2d, 8192);
         // Without them, none are requested.
         let request = plan(Features::empty(), &Limits::default(), DownlevelFlags::all()).unwrap();

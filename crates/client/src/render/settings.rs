@@ -105,6 +105,17 @@ impl ShadowDetail {
         }
     }
 
+    /// The shadow atlas's memory in 1024² pages of 4 MiB, static tiles and
+    /// per-frame tiles together. The lowest level keeps 60 MiB; the others
+    /// allow 256 MiB. A bound changes tile sizes, never which lights are
+    /// shadowed.
+    pub fn atlas_pages(self) -> usize {
+        match self {
+            Self::Low => 15,
+            Self::Medium | Self::High | Self::Ultra => 64,
+        }
+    }
+
     pub fn label(self) -> String {
         format!(
             "{} (sun {}, lights {})",

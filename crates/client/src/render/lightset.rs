@@ -7,10 +7,10 @@ use super::{
 };
 #[cfg(test)]
 use crate::lighting::DEFAULT_INTENSITY;
-use crate::lighting::{light_from_object, GpuLight, LightDesc, ShadowMode, NO_TILE, OVERLAY_NONE};
+use crate::lighting::{light_from_object, GpuLight, LightDesc, ShadowMode, NO_TILE};
 use glam::{Mat4, Vec3};
 use sauerteig_core::{ObjectKind, WorldObject};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Lights fade in and out over this long.
 pub const FADE_SECONDS: f32 = 0.25;
@@ -22,56 +22,69 @@ const TELEPORT_DISTANCE: f32 = 24.0;
 const BOOST_FRAMES: u32 = 3;
 /// The most tile faces rendered in a frame: six faces, doubled after a join.
 pub const MAX_TILE_JOBS: usize = 12;
-/// Moving actors draw into this many overlay tiles at most.
-pub const OVERLAY_SLOTS: usize = 15;
-pub const OVERLAY_CLASS: TileClass = TileClass::Medium;
-/// How many of the most important shadowed lights also shadow moving actors.
-pub const ACTOR_SHADOW_LIGHTS: usize = 8;
-/// A light that shadows actors keeps doing so until it ranks this many places
-/// past the limit, so lights near it do not swap back and forth.
-const ACTOR_SHADOW_MARGIN: usize = 2;
+/// The most lights in view that are lit: what the cluster masks and the light
+/// buffer fit in a 128 MiB storage binding, the smallest every adapter
+/// guarantees. No scene comes near it.
+pub const MAX_LIGHTS_IN_VIEW: usize = 262_144;
 /// How far a prop, tree or pad casts a shadow, for invalidating tiles.
 pub const OBJECT_REACH: f32 = 10.0;
 /// More object changes than this at once invalidate everything.
 pub const MAX_OBJECT_EDITS: usize = 64;
+/// Pages left unplanned in the static atlas, so that pages typed for one tile
+/// size, tiles being replaced and rounding never push it past its bound.
+const GRANT_SLACK_PAGES: usize = 2;
+/// Moving actors are found in cells this many metres across when asking which
+/// lights reach one.
+const ACTOR_CELL: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LightConfig {
     pub grid: ClusterGrid,
-    pub max_lights: usize,
-    /// Lights evaluated per opaque fragment; water and glass evaluate fewer.
+    /// The most lights a fragment shades. Nothing sets it in the game: it is
+    /// `u32::MAX`, and a comparison capture can lower it.
     pub light_cap: u32,
-    pub pages: usize,
+    /// The atlas's memory in 1024² pages of 4 MiB, static tiles and per-frame
+    /// tiles together. A level's shadow detail sets it.
+    pub bound_pages: usize,
+    /// The most pages the device has layers for.
+    pub ceiling_pages: usize,
     pub faces_per_frame: usize,
     pub max_tile_class: TileClass,
     pub max_shadowed: usize,
-    /// Shadowed lights, most important first, that also shadow actors.
-    pub actor_lights: usize,
+}
+
+/// Pages of the 15 at the lowest level that per-frame tiles may use before
+/// the atlas counts as past its bound: an eighth of the pages, at least one.
+pub fn frame_reserve(bound_pages: usize) -> usize {
+    (bound_pages / 8).max(1)
+}
+
+impl LightConfig {
+    /// Pages the static tiles may take.
+    pub fn static_bound(&self) -> usize {
+        self.bound_pages
+            .saturating_sub(frame_reserve(self.bound_pages))
+            .max(1)
+    }
+
+    /// Pages the planner shares out among the lights in view.
+    fn grant_budget(&self) -> usize {
+        self.static_bound().saturating_sub(GRANT_SLACK_PAGES).max(1)
+    }
 }
 
 impl Default for LightConfig {
     fn default() -> Self {
         Self {
             grid: ClusterGrid::CLUSTERED,
-            max_lights: 256,
-            light_cap: 16,
-            pages: 14,
+            light_cap: u32::MAX,
+            bound_pages: 15,
+            ceiling_pages: 255,
             faces_per_frame: 6,
             max_tile_class: TileClass::Large,
             max_shadowed: usize::MAX,
-            actor_lights: ACTOR_SHADOW_LIGHTS,
         }
     }
-}
-
-/// What happens to a light that needs shadows but cannot get a tile.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum OverBudget {
-    /// It fades out rather than leak light through walls.
-    #[default]
-    FadeOut,
-    /// It stays, unshadowed. For comparison captures only.
-    Unshadowed,
 }
 
 struct Tracked {
@@ -79,9 +92,6 @@ struct Tracked {
     fade: f32,
     seen: u64,
     edited_at: f64,
-    /// The light was among the most important shadowed lights last frame, so
-    /// moving actors shadow it too.
-    actor_shadow: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -127,10 +137,20 @@ pub struct TileJob {
     pub face: usize,
 }
 
+/// A per-frame tile: the actors that a light's face can see, drawn afresh each
+/// frame into a texture of their own, so that no pass samples what it renders
+/// into.
 #[derive(Clone, Copy, Debug)]
-pub struct OverlayJob {
-    pub slot: u8,
+pub struct FrameJob {
+    /// The tile in the per-frame texture, and the static tile it belongs to.
+    pub tile: TileRef,
+    pub source: TileRef,
+    pub class: TileClass,
     pub matrix: Mat4,
+    #[cfg(test)]
+    pub light: u32,
+    #[cfg(test)]
+    pub face: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
@@ -141,26 +161,44 @@ pub struct LightingStats {
     /// Lights uploaded this frame, including ones still fading in or out.
     pub drawn: usize,
     pub shadowed: usize,
-    /// Shadowed lights that also shadow moving actors.
+    /// Shadowed lights with a per-frame tile on some face, because an actor is
+    /// in reach of it.
     pub actor_shadowed: usize,
-    /// Lights waiting for a first render, and lights with no tile to hold one.
+    /// Lights waiting for a first render, and lights the device has no page
+    /// left for, which stay dark rather than leak light through walls.
     pub waiting: usize,
     pub over_budget: usize,
     /// Shadow faces sampled, rendered this frame, and held by the atlas.
     pub tiles_used: usize,
     pub tiles_rendered: usize,
     pub tiles_resident: usize,
+    /// Pages of the static atlas holding tiles, and pages it has made.
     pub pages: usize,
-    pub overlay_tiles: usize,
+    pub pages_made: usize,
+    /// Per-frame tiles this frame, and the pages of their texture.
+    pub frame_tiles: usize,
+    pub frame_pages: usize,
+    /// The level's bound on pages, static and per-frame together.
+    pub bound_pages: usize,
     pub budget: usize,
+}
+
+impl LightingStats {
+    /// Atlas pages made past the level's bound, for lights that would
+    /// otherwise have gone without a shadow.
+    pub fn pages_past_bound(&self) -> usize {
+        (self.pages_made + self.frame_pages).saturating_sub(self.bound_pages)
+    }
 }
 
 pub struct FramePlan {
     pub lights: Vec<PlannedLight>,
     pub jobs: Vec<TileJob>,
-    pub overlay: Vec<OverlayJob>,
-    /// Two bits per atlas page, then the overlay page, giving each tile size.
-    pub page_classes: u32,
+    pub frame_jobs: Vec<FrameJob>,
+    /// The tile size code of each page of the static atlas and of the
+    /// per-frame texture, for the page table.
+    pub page_classes: Vec<u32>,
+    pub frame_page_classes: Vec<u32>,
     pub stats: LightingStats,
     /// Nothing is waiting to render or fade.
     pub settled: bool,
@@ -221,7 +259,6 @@ impl ObjectDigest {
 
 pub struct LightSet {
     config: LightConfig,
-    over_budget: OverBudget,
     /// The shadow mode of lights placed by light nodes.
     node_shadow: ShadowMode,
     atlas: ShadowAtlas,
@@ -235,12 +272,11 @@ pub struct LightSet {
 }
 
 impl LightSet {
-    pub fn new(config: LightConfig, over_budget: OverBudget, node_shadow: ShadowMode) -> Self {
+    pub fn new(config: LightConfig, node_shadow: ShadowMode) -> Self {
         Self {
             config,
-            over_budget,
             node_shadow,
-            atlas: ShadowAtlas::new(config.pages),
+            atlas: ShadowAtlas::new(config.static_bound(), config.ceiling_pages),
             tracked: HashMap::new(),
             objects: ObjectDigest::default(),
             frame: 0,
@@ -251,17 +287,24 @@ impl LightSet {
         }
     }
 
-    /// Whether any light may shadow moving actors, so their vertices are needed.
     /// The largest tile any light's shadow may use: a quality choice that
     /// changes detail, never which lights are shadowed.
     pub fn set_max_tile_class(&mut self, class: TileClass) {
         self.config.max_tile_class = class;
     }
+
+    /// The atlas's memory bound in pages, which a quality level sets. Tiles
+    /// shrink to fit a lower bound; no light loses its shadow.
+    pub fn set_bound_pages(&mut self, pages: usize) {
+        self.config.bound_pages = pages;
+        self.atlas.set_bound(self.config.static_bound());
+    }
+
+    /// Whether any light may shadow moving actors, so their vertices are needed.
     pub fn shadows_actors(&self) -> bool {
-        self.tracked.values().any(|t| {
-            t.desc.shadow == ShadowMode::Dynamic
-                || (self.config.actor_lights > 0 && t.desc.needs_shadow())
-        })
+        self.tracked
+            .values()
+            .any(|t| t.desc.shadow == ShadowMode::Dynamic && t.desc.needs_shadow())
     }
 
     /// Everything the tiles drew has changed.
@@ -304,8 +347,10 @@ impl LightSet {
             world_lights: self.tracked.len(),
             ..Default::default()
         };
+        self.atlas.set_bound(self.config.static_bound());
         let (visible, shadow_order) = self.select(view, &mut stats);
         self.serve_shadows(&shadow_order, view);
+        self.atlas.compact(self.now);
 
         let wanted = self.config.faces_per_frame * if self.boost > 0 { 2 } else { 1 };
         let budget = wanted.min(input.faces_limit.max(1));
@@ -317,7 +362,8 @@ impl LightSet {
         stats.tiles_rendered = faces.len();
         let mut settled = faces.is_empty() && !self.atlas.dirty(order.iter().copied());
 
-        let (lights, overlay) = self.records(&visible, input, &mut stats, &mut settled);
+        let (lights, frame_jobs, frame_pool) =
+            self.records(&visible, input, &mut stats, &mut settled);
         let jobs = faces
             .iter()
             .map(|face| {
@@ -325,7 +371,7 @@ impl LightSet {
                 TileJob {
                     tile: face.tile,
                     class: face.class,
-                    matrix: desc.tile_projection(face.face),
+                    matrix: desc.tile_projection(face.face, face.class.size()),
                     center: desc.position,
                     range: desc.range,
                     #[cfg(test)]
@@ -335,14 +381,20 @@ impl LightSet {
                 }
             })
             .collect();
+        self.atlas.trim();
         let atlas = self.atlas.stats();
         stats.tiles_resident = atlas.tiles;
         stats.pages = atlas.pages;
+        stats.pages_made = atlas.created;
+        stats.frame_tiles = frame_jobs.len();
+        stats.frame_pages = frame_pool.classes.len();
+        stats.bound_pages = self.config.bound_pages;
         FramePlan {
             lights,
             jobs,
-            overlay,
+            frame_jobs,
             page_classes: self.page_classes(),
+            frame_page_classes: frame_pool.classes.iter().map(|c| c.code()).collect(),
             stats,
             settled,
         }
@@ -367,8 +419,7 @@ impl LightSet {
             })
             .collect();
         let faces: Vec<usize> = order.iter().map(|(_, d)| d.face_count()).collect();
-        let granted = grant_classes(&faces, &wanted, self.config.pages);
-        // Lights past the atlas's capacity are not served this frame.
+        let granted = grant_classes(&faces, &wanted, self.config.grant_budget());
         for (&(id, desc), &class) in order.iter().zip(&granted) {
             self.atlas.ensure(&Request {
                 id,
@@ -381,30 +432,25 @@ impl LightSet {
     }
 
     /// The records of the lights to draw, in importance order, with fades
-    /// advanced, and the overlay tiles their dynamic shadows need.
+    /// advanced, and the per-frame tiles that actors in reach of them need.
     fn records(
         &mut self,
         visible: &[u32],
         input: &FrameInput,
         stats: &mut LightingStats,
         settled: &mut bool,
-    ) -> (Vec<PlannedLight>, Vec<OverlayJob>) {
+    ) -> (Vec<PlannedLight>, Vec<FrameJob>, FramePool) {
         let mut lights = Vec::with_capacity(visible.len());
-        let mut overlay = Vec::new();
+        let mut frame_jobs = Vec::new();
+        let mut pool = FramePool::default();
+        let cells = actor_cells(input.actors);
         let step = input.dt / FADE_SECONDS;
-        let actor_limit = self.config.actor_lights;
-        let keep_limit = match actor_limit {
-            0 => 0,
-            n => n + ACTOR_SHADOW_MARGIN,
-        };
-        let mut shadow_rank = 0;
         for &id in visible {
             let tracked = self.tracked.get_mut(&id).unwrap();
-            let mut desc = tracked.desc;
+            let desc = tracked.desc;
             let tiles = desc.needs_shadow().then(|| self.atlas.tiles(id)).flatten();
             let usable = tiles.is_some() && self.atlas.ready(id);
-            let unshadowed = self.over_budget == OverBudget::Unshadowed && tiles.is_none();
-            let wanted = if !desc.needs_shadow() || usable || unshadowed {
+            let wanted = if !desc.needs_shadow() || usable {
                 1.0
             } else {
                 0.0
@@ -434,49 +480,41 @@ impl LightSet {
                 }
                 packed
             });
-            let mut slots = None;
+            let mut frame_refs = None;
             if refs.is_some() {
                 stats.shadowed += 1;
                 stats.tiles_used += desc.face_count();
-                if desc.shadow == ShadowMode::Static {
-                    let limit = if tracked.actor_shadow {
-                        keep_limit
-                    } else {
-                        actor_limit
-                    };
-                    tracked.actor_shadow = shadow_rank < limit;
-                    if tracked.actor_shadow {
-                        desc.shadow = ShadowMode::Dynamic;
-                    }
-                }
-                shadow_rank += 1;
                 if desc.shadow == ShadowMode::Dynamic {
-                    stats.actor_shadowed += 1;
-                    slots = assign_overlay(&desc, input.actors, &mut overlay);
+                    let (class, static_tiles) = tiles.as_ref().unwrap();
+                    frame_refs = assign_frame_tiles(
+                        &desc,
+                        *class,
+                        static_tiles,
+                        &cells,
+                        &mut pool,
+                        &mut frame_jobs,
+                        #[cfg(test)]
+                        id,
+                    );
+                    stats.actor_shadowed += usize::from(frame_refs.is_some());
                 }
-            } else {
-                tracked.actor_shadow = false;
             }
             let center = input.view.view.transform_point3(desc.position);
             lights.push(PlannedLight {
                 #[cfg(test)]
                 id,
-                gpu: desc.packed(tracked.fade, refs, slots),
+                gpu: desc.packed(tracked.fade, refs, frame_refs),
                 view: [center.x, center.y, center.z, cull_radius(desc.range)],
             });
         }
         stats.drawn = lights.len();
-        stats.overlay_tiles = overlay.len();
-        (lights, overlay)
+        (lights, frame_jobs, pool)
     }
 
-    fn page_classes(&self) -> u32 {
-        let mut classes = OVERLAY_CLASS.code() << (2 * self.config.pages);
-        for page in 0..self.config.pages {
-            let code = self.atlas.pool().class(page).map_or(0, TileClass::code);
-            classes |= code << (2 * page);
-        }
-        classes
+    fn page_classes(&self) -> Vec<u32> {
+        (0..self.atlas.pool().pages())
+            .map(|page| self.atlas.pool().class(page).map_or(0, TileClass::code))
+            .collect()
     }
 
     /// Bring tracking in line with this frame's lights and objects.
@@ -507,7 +545,6 @@ impl LightSet {
                             fade: 0.0,
                             seen: frame,
                             edited_at: f64::NEG_INFINITY,
-                            actor_shadow: false,
                         },
                     );
                 }
@@ -552,7 +589,7 @@ impl LightSet {
             .collect();
         stats.visible = visible.len();
         visible.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        visible.truncate(self.config.max_lights);
+        visible.truncate(MAX_LIGHTS_IN_VIEW);
         let ids: Vec<u32> = visible.iter().map(|&(_, id)| id).collect();
         let mut wanting: Vec<(bool, u32)> = ids
             .iter()
@@ -574,7 +611,7 @@ impl LightSet {
 }
 
 /// Pages needed to hold this many tiles of each size.
-fn pages_needed(tiles: [usize; 3]) -> usize {
+fn pages_needed(tiles: [usize; 5]) -> usize {
     TileClass::ALL
         .iter()
         .map(|&class| tiles[class as usize].div_ceil(class.per_page()))
@@ -582,28 +619,55 @@ fn pages_needed(tiles: [usize; 3]) -> usize {
 }
 
 /// The size each light's tiles should have, in importance order, for an atlas
-/// of `pages` pages. Every light that fits at the smallest size is covered
-/// first; the most important then sharpen toward the size they asked for for
-/// as long as the atlas has pages left. Lights past the end get no size.
+/// of `pages` pages. Every light starts at the largest of 128², 64² and 32² at
+/// which all of them fit together. Then, in importance order, each grows to
+/// 64² and again to 128² while the pages hold it, and the most important
+/// sharpen toward the size they asked for. While the atlas has room, every
+/// light gets 128² before any gets more; when it hasn't, the least important
+/// are the ones left small, and none is left out.
 fn grant_classes(faces: &[usize], wanted: &[TileClass], pages: usize) -> Vec<TileClass> {
-    let mut counts = [0; 3];
-    let mut granted = Vec::new();
-    for &f in faces {
-        counts[0] += f;
-        if pages_needed(counts) > pages {
-            counts[0] -= f;
-            break;
-        }
-        granted.push(TileClass::Small);
+    let total: usize = faces.iter().sum();
+    let fits = |class: TileClass| {
+        let mut counts = [0; 5];
+        counts[class as usize] = total;
+        pages_needed(counts) <= pages
+    };
+    let floor = [TileClass::Small, TileClass::Mini]
+        .into_iter()
+        .find(|&class| fits(class))
+        .unwrap_or(TileClass::Tiny);
+    let mut granted: Vec<TileClass> = wanted.iter().map(|&w| w.min(floor)).collect();
+    let mut counts = [0; 5];
+    for (&class, &f) in granted.iter().zip(faces) {
+        counts[class as usize] += f;
     }
-    for (i, grant) in granted.iter_mut().enumerate() {
-        for &class in TileClass::ALL[1..=wanted[i] as usize].iter().rev() {
+    for target in [TileClass::Mini, TileClass::Small] {
+        for (i, grant) in granted.iter_mut().enumerate() {
+            if *grant >= target || wanted[i] < target {
+                continue;
+            }
             let mut trial = counts;
-            trial[0] -= faces[i];
-            trial[class as usize] += faces[i];
+            trial[*grant as usize] -= faces[i];
+            trial[target as usize] += faces[i];
             if pages_needed(trial) <= pages {
                 counts = trial;
-                *grant = class;
+                *grant = target;
+            }
+        }
+    }
+    // The most important sharpen as far as they asked for, as far as the
+    // pages go.
+    for (i, grant) in granted.iter_mut().enumerate() {
+        for target in (TileClass::Medium as usize..=wanted[i] as usize)
+            .rev()
+            .map(|c| TileClass::ALL[c])
+        {
+            let mut trial = counts;
+            trial[*grant as usize] -= faces[i];
+            trial[target as usize] += faces[i];
+            if pages_needed(trial) <= pages {
+                counts = trial;
+                *grant = target;
                 break;
             }
         }
@@ -611,24 +675,88 @@ fn grant_classes(faces: &[usize], wanted: &[TileClass], pages: usize) -> Vec<Til
     granted
 }
 
-/// Give each face of a light that shadows actors, and has some in reach, an
-/// overlay tile. Returns the slots to write into the light's record.
-fn assign_overlay(
+/// A frame's per-frame tiles, handed out page by page in the size of each
+/// tile's static tile.
+#[derive(Default)]
+pub struct FramePool {
+    pub classes: Vec<TileClass>,
+    used: Vec<usize>,
+}
+
+impl FramePool {
+    fn alloc(&mut self, class: TileClass) -> TileRef {
+        let page = (0..self.classes.len())
+            .find(|&p| self.classes[p] == class && self.used[p] < class.per_page())
+            .unwrap_or_else(|| {
+                self.classes.push(class);
+                self.used.push(0);
+                self.classes.len() - 1
+            });
+        self.used[page] += 1;
+        TileRef {
+            page: page as u16,
+            slot: (self.used[page] - 1) as u16,
+        }
+    }
+}
+
+/// The centres of the cells, `ACTOR_CELL` metres across, that hold the
+/// vertices of moving shadow casters.
+fn actor_cells(points: &[Vec3]) -> Vec<Vec3> {
+    let cells: HashSet<[i32; 3]> = points
+        .iter()
+        .map(|p| (*p / ACTOR_CELL).floor().as_ivec3().to_array())
+        .collect();
+    let mut centres: Vec<Vec3> = cells
+        .into_iter()
+        .map(|c| (Vec3::from(c.map(|v| v as f32)) + Vec3::splat(0.5)) * ACTOR_CELL)
+        .collect();
+    // A set has no order; sorted, the same actors give the same plan.
+    centres.sort_by(|a, b| a.to_array().partial_cmp(&b.to_array()).unwrap());
+    centres
+}
+
+/// Half the diagonal of an actor cell: how far a vertex can be from its cell's
+/// centre.
+const CELL_REACH: f32 = ACTOR_CELL * 0.866_026;
+
+/// Give each face of a light, that has an actor in reach, a per-frame tile the
+/// size of its static one. Returns the references to write into the light's
+/// record, or `None` when no actor is in reach.
+fn assign_frame_tiles(
     desc: &LightDesc,
-    actors: &[Vec3],
-    jobs: &mut Vec<OverlayJob>,
-) -> Option<[u8; 6]> {
-    let mut slots = [OVERLAY_NONE; 6];
-    for (face, slot) in slots.iter_mut().enumerate().take(desc.face_count()) {
-        if jobs.len() < OVERLAY_SLOTS && FaceReach::new(desc, face).touches_any(actors) {
-            *slot = jobs.len() as u8;
-            jobs.push(OverlayJob {
-                slot: *slot,
-                matrix: desc.tile_projection(face),
+    class: TileClass,
+    static_tiles: &[TileRef],
+    cells: &[Vec3],
+    pool: &mut FramePool,
+    jobs: &mut Vec<FrameJob>,
+    #[cfg(test)] light: u32,
+) -> Option<[u32; 6]> {
+    let reach = desc.range + 1.0 + CELL_REACH;
+    if !cells
+        .iter()
+        .any(|c| c.distance_squared(desc.position) <= reach * reach)
+    {
+        return None;
+    }
+    let mut refs = [NO_TILE; 6];
+    for (face, &source) in static_tiles.iter().enumerate().take(desc.face_count()) {
+        if FaceReach::new(desc, face).touches_any(cells) {
+            let tile = pool.alloc(class);
+            refs[face] = tile.packed();
+            jobs.push(FrameJob {
+                tile,
+                source,
+                class,
+                matrix: desc.tile_projection(face, class.size()),
+                #[cfg(test)]
+                light,
+                #[cfg(test)]
+                face,
             });
         }
     }
-    slots.iter().any(|&s| s != OVERLAY_NONE).then_some(slots)
+    refs.iter().any(|&r| r != NO_TILE).then_some(refs)
 }
 
 /// What a face of a light's tiles can shadow: its guarded frustum, widened so
@@ -651,20 +779,23 @@ impl FaceReach {
             forward,
             right,
             up: right.cross(forward),
-            slope: desc.tile_tan_half() * 1.25,
-            range_squared: (desc.range + 1.0).powi(2),
+            // The smallest tile has the widest guard band.
+            slope: desc.tile_tan_half(32) * 1.25,
+            range_squared: (desc.range + 1.0 + CELL_REACH).powi(2),
         }
     }
 
-    fn touches_any(&self, points: &[Vec3]) -> bool {
-        points.iter().any(|&point| {
+    /// Whether any of the actor cells' centres is in reach, with room for a
+    /// vertex anywhere in the cell.
+    fn touches_any(&self, centres: &[Vec3]) -> bool {
+        centres.iter().any(|&point| {
             let to_point = point - self.origin;
             if to_point.length_squared() > self.range_squared {
                 return false;
             }
             let depth = to_point.dot(self.forward);
-            let reach = self.slope * depth.max(0.0) + 0.5;
-            depth > -0.5
+            let reach = self.slope * depth.max(0.0) + 0.5 + CELL_REACH;
+            depth > -0.5 - CELL_REACH
                 && to_point.dot(self.right).abs() <= reach
                 && to_point.dot(self.up).abs() <= reach
         })
@@ -697,11 +828,7 @@ mod tests {
     impl Scene {
         fn new(positions: &[Vec3]) -> Self {
             Self {
-                set: LightSet::new(
-                    LightConfig::default(),
-                    OverBudget::FadeOut,
-                    ShadowMode::Static,
-                ),
+                set: LightSet::new(LightConfig::default(), ShadowMode::Dynamic),
                 objects: positions
                     .iter()
                     .enumerate()
@@ -756,19 +883,19 @@ mod tests {
     }
 
     #[test]
-    fn lights_are_listed_by_importance_up_to_the_cap() {
+    fn every_light_in_view_is_listed_by_importance_without_a_cap() {
         let mut scene = Scene::new(&[]);
-        for i in 0..300 {
-            let mut light = LightDesc::point(i + 1, Vec3::new(0.0, 2.0, -3.0 - i as f32 * 0.5));
+        for i in 0..1000 {
+            let mut light = LightDesc::point(i + 1, Vec3::new(0.0, 2.0, -3.0 - i as f32 * 0.1));
             light.shadow = ShadowMode::Off;
             scene.extra.push(light);
         }
         scene.frame();
         let plan = scene.frame_dt(1.0);
-        assert_eq!(plan.stats.world_lights, 300);
-        assert_eq!(plan.lights.len(), 256);
+        assert_eq!(plan.stats.world_lights, 1000);
+        assert_eq!(plan.lights.len(), 1000);
         let ids: Vec<u32> = plan.lights.iter().map(|l| l.id).collect();
-        assert_eq!(ids, (1..=256).collect::<Vec<u32>>(), "nearest first");
+        assert_eq!(ids, (1..=1000).collect::<Vec<u32>>(), "nearest first");
         // Lights behind the camera and out of reach are not listed.
         scene.extra = vec![
             LightDesc::point(1, Vec3::new(0.0, 0.0, 100.0)),
@@ -780,13 +907,31 @@ mod tests {
     #[test]
     fn sizes_are_granted_by_importance_without_starving_coverage() {
         use TileClass::*;
-        let granted = grant_classes(&[6; 12], &[Large; 12], 6);
-        assert_eq!(granted[..3], [Large; 3]);
-        assert_eq!(granted[3..], [Small; 9]);
-        // Everything fits at the smallest size before anything sharpens.
+        // Room for everything at 128² and a little more: the most important
+        // sharpen, in order.
+        let granted = grant_classes(&[6; 12], &[Large; 12], 4);
+        assert_eq!(granted[0], Large, "{granted:?}");
+        assert!(granted[1..].iter().all(|&c| c >= Small), "{granted:?}");
+        assert!(pages_needed(counts(&granted, 6)) <= 4);
+        let granted = grant_classes(&[6; 12], &[Large; 12], 12);
+        assert!(granted[..3].iter().all(|&c| c == Large), "{granted:?}");
+        assert!(granted[3..].iter().all(|&c| c >= Small), "{granted:?}");
+        // Short of room, nobody is left out: the least important shrink first.
         let granted = grant_classes(&[6; 100], &[Large; 100], 6);
-        assert_eq!(granted.len(), 64);
-        assert!(granted.iter().all(|&c| c == Small));
+        assert_eq!(granted.len(), 100);
+        assert!(pages_needed(counts(&granted, 6)) <= 6);
+        assert!(granted[0] > granted[99], "{granted:?}");
+        assert_eq!(granted[99], Mini);
+        let granted = grant_classes(&[6; 300], &[Large; 300], 6);
+        assert!(pages_needed(counts(&granted, 6)) <= 6);
+        assert_eq!(granted[299], Tiny);
+        assert_eq!(granted[0], Mini);
+        // Everything at 64² when that is what fits.
+        let granted = grant_classes(&[6; 40], &[Small; 40], 1);
+        assert!(granted.iter().all(|&c| c == Mini), "{granted:?}");
+        // Past the floor, the lights still get the smallest tile.
+        let granted = grant_classes(&[6; 400], &[Small; 400], 1);
+        assert!(granted.iter().all(|&c| c == Tiny));
         // A light asking for less gets less.
         let granted = grant_classes(&[6, 6, 6], &[Medium, Small, Large], 6);
         assert_eq!(granted, [Medium, Small, Large]);
@@ -794,7 +939,17 @@ mod tests {
         let granted = grant_classes(&[1; 20], &[Large; 20], 2);
         assert_eq!(granted.len(), 20);
         assert!(granted[0] == Large);
-        assert!(pages_needed([20, 0, 0]) == 1 && pages_needed([0, 17, 5]) == 4);
+        assert_eq!(pages_needed([1025, 0, 0, 0, 0]), 2);
+        assert_eq!(pages_needed([20, 0, 0, 0, 0]), 1);
+        assert_eq!(pages_needed([0, 0, 0, 17, 5]), 4);
+    }
+
+    fn counts(granted: &[TileClass], faces: usize) -> [usize; 5] {
+        let mut counts = [0; 5];
+        for class in granted {
+            counts[*class as usize] += faces;
+        }
+        counts
     }
 
     #[test]
@@ -871,35 +1026,33 @@ mod tests {
     }
 
     #[test]
-    fn lights_beyond_the_atlas_fade_out_instead_of_leaking() {
-        let limited = LightConfig {
-            max_shadowed: 4,
+    fn no_light_fades_out_for_lack_of_a_tile() {
+        // A bound of 3 pages leaves one for the static atlas at the lowest
+        // grants: a hundred lights' 600 faces take 3 pages even at 32².
+        let tight = LightConfig {
+            bound_pages: 3,
             ..LightConfig::default()
         };
-        let mut scene = Scene::new(&line(10, 1.0));
-        scene.set = LightSet::new(limited, OverBudget::FadeOut, ShadowMode::Static);
-        scene.settle();
+        let mut scene = Scene::new(&line(100, 0.4));
+        scene.set = LightSet::new(tight, ShadowMode::Dynamic);
+        for _ in 0..1200 {
+            if scene.frame().settled {
+                break;
+            }
+        }
         let plan = scene.frame();
-        assert_eq!(plan.stats.shadowed, 4);
-        assert_eq!(plan.lights.len(), 4);
-        assert_eq!(plan.stats.over_budget, 6);
-        // For comparison captures they can stay, unshadowed.
-        let mut scene = Scene::new(&line(10, 1.0));
-        scene.set = LightSet::new(limited, OverBudget::Unshadowed, ShadowMode::Static);
-        scene.settle();
-        let plan = scene.frame();
-        assert_eq!(plan.lights.len(), 10);
-        let unshadowed = plan
-            .lights
-            .iter()
-            .filter(|l| l.gpu.packed[0] >> 1 & 3 == 0)
-            .count();
-        assert_eq!(unshadowed, 6);
+        assert_eq!(plan.stats.drawn, 100);
+        assert_eq!(plan.stats.shadowed, 100);
+        assert_eq!(plan.stats.over_budget, 0);
+        assert!(plan.stats.tiles_resident >= 600);
+        // Tiles shrank rather than lights going dark.
+        let classes: std::collections::HashSet<_> = plan.page_classes.iter().copied().collect();
+        assert!(classes.contains(&0), "{classes:?}");
     }
 
     #[test]
     fn the_largest_shadow_tile_never_changes_which_lights_are_lit_or_shadowed() {
-        // More lights than the atlas holds at any tile size, nearest ahead.
+        // More lights than the lowest level holds at 128², nearest ahead.
         let positions = line(240, 0.5);
         let drawn = |class: TileClass, change_midway: bool| {
             let mut scene = Scene::new(&positions);
@@ -923,7 +1076,7 @@ mod tests {
             (plan.stats.shadowed, plan.stats.over_budget, shadowed)
         };
         let reference = drawn(TileClass::Large, false);
-        assert!(reference.0 > 100 && reference.1 > 0, "{:?}", reference.0);
+        assert!(reference.0 == 240 && reference.1 == 0, "{:?}", reference.0);
         for class in [TileClass::Medium, TileClass::Small] {
             for midway in [false, true] {
                 assert_eq!(drawn(class, midway), reference, "{class:?}, {midway}");
@@ -976,7 +1129,7 @@ mod tests {
         let expected = LightDesc::point(2, scene.objects[1].position);
         assert_eq!(
             plan.jobs[0].matrix,
-            expected.tile_projection(plan.jobs[0].face)
+            expected.tile_projection(plan.jobs[0].face, plan.jobs[0].class.size())
         );
         // A second light moved in the same frame waits its turn behind it.
         scene.objects[1].position.x += 1.0;
@@ -1063,7 +1216,7 @@ mod tests {
             shadowed = plan.stats.shadowed;
             drawn = plan.stats.drawn;
             assert!(plan.jobs.len() <= MAX_TILE_JOBS);
-            assert!(plan.stats.tiles_resident <= scene.set.config.pages * 64);
+            assert_eq!(plan.stats.over_budget, 0);
         }
         assert!(
             total < 1200 * 6,
@@ -1072,10 +1225,18 @@ mod tests {
         assert!(shadowed > 0);
     }
 
+    fn frame_tiles_of(plan: &FramePlan, id: u32) -> [u32; 6] {
+        plan.lights
+            .iter()
+            .find(|l| l.id == id)
+            .unwrap()
+            .gpu
+            .frame_tiles
+    }
+
     #[test]
-    fn dynamic_lights_give_actors_overlay_tiles_only_where_they_are() {
+    fn actors_get_per_frame_tiles_only_where_they_are() {
         let mut scene = Scene::new(&[]);
-        scene.set.config.actor_lights = 0;
         let mut light = LightDesc::point(1, Vec3::new(0.0, 3.0, -8.0));
         light.shadow = ShadowMode::Dynamic;
         scene.extra.push(light);
@@ -1083,28 +1244,44 @@ mod tests {
         stat.shadow = ShadowMode::Static;
         scene.extra.push(stat);
         scene.settle();
-        // No actors: no overlay.
-        assert!(scene.frame().overlay.is_empty());
+        // No actors: no per-frame tiles.
+        let plan = scene.frame();
+        assert!(plan.frame_jobs.is_empty() && plan.frame_page_classes.is_empty());
         // An actor straight below the light and one far beyond its reach.
         scene.actors = vec![Vec3::new(0.0, 1.0, -8.0), Vec3::new(0.0, 1.0, -80.0)];
         let plan = scene.frame();
-        assert_eq!(plan.overlay.len(), 1, "only the downward face has an actor");
-        let record = plan.lights.iter().find(|l| l.id == 1).unwrap().gpu;
-        let slots = record.packed[0] >> 3;
-        // Face 3 is -Y; the others hold the empty value.
-        assert_eq!(slots >> (4 * 3) & 15, 0);
-        assert_eq!(slots & 15, OVERLAY_NONE as u32);
+        assert_eq!(
+            plan.stats.actor_shadowed, 1,
+            "the far actor is out of reach"
+        );
+        let tiles = frame_tiles_of(&plan, 1);
+        // Face 3 is -Y, which looks at the actor; the faces facing away from
+        // it, +Y and the ones beyond the light, have none.
+        assert_ne!(tiles[3], NO_TILE);
+        assert_eq!(tiles[2], NO_TILE);
+        assert_eq!(tiles[5], NO_TILE);
+        assert!(plan.frame_jobs.len() <= 3, "{}", plan.frame_jobs.len());
+        let job = plan.frame_jobs.iter().find(|j| j.face == 3).unwrap();
+        assert_eq!(job.light, 1);
+        assert_eq!(job.tile.packed(), tiles[3]);
+        assert_eq!(
+            Some(job.source),
+            scene.set.atlas.tiles(1).map(|(_, t)| t[3]),
+            "the tile starts from its static tile's"
+        );
+        assert_eq!(plan.frame_page_classes, [job.class.code()]);
+        assert_eq!(frame_tiles_of(&plan, 2), [NO_TILE; 6]);
         let other = plan.lights.iter().find(|l| l.id == 2).unwrap().gpu;
         assert_eq!(other.packed[0] >> 1 & 3, 1, "static lights ignore actors");
         // Actors near an edge between faces reach both.
         scene.actors = vec![Vec3::new(2.0, 1.0, -8.0)];
         let plan = scene.frame();
-        assert!(plan.overlay.len() >= 2, "{}", plan.overlay.len());
+        assert!(plan.frame_jobs.len() >= 2, "{}", plan.frame_jobs.len());
     }
 
     /// Twelve lights at the same distance whose ranges fall one by one, so a
     /// light's importance rank is its index.
-    fn ranked_lights(scene: &mut Scene) {
+    fn ranked(scene: &mut Scene) {
         for i in 0..12 {
             let mut light = LightDesc::point(i + 1, Vec3::new(i as f32 * 0.5 - 3.0, 3.0, -8.0));
             light.range = 24.0 - i as f32;
@@ -1113,30 +1290,31 @@ mod tests {
         scene.settle();
     }
 
-    fn mode_of(plan: &FramePlan, id: u32) -> u32 {
-        plan.lights.iter().find(|l| l.id == id).unwrap().gpu.packed[0] >> 1 & 3
-    }
-
     #[test]
-    fn the_most_important_shadowed_lights_shadow_actors() {
+    fn every_shadowed_light_in_reach_shadows_actors_whatever_its_rank() {
         let mut scene = Scene::new(&[]);
-        ranked_lights(&mut scene);
+        ranked(&mut scene);
         let plan = scene.frame();
         assert_eq!(plan.stats.shadowed, 12);
-        assert_eq!(plan.stats.actor_shadowed, ACTOR_SHADOW_LIGHTS);
-        for id in 1..=12 {
-            let expected = if id as usize <= ACTOR_SHADOW_LIGHTS {
-                2
-            } else {
-                1
-            };
-            assert_eq!(mode_of(&plan, id), expected, "light {id}");
-        }
-        // An actor under the most important light gets an overlay tile...
-        scene.actors = vec![Vec3::new(-3.0, 1.0, -8.0)];
+        assert_eq!(plan.stats.actor_shadowed, 0, "no actor, no tile");
+        // An actor under the middle of them: every light reaches it, the least
+        // important as much as the most.
+        scene.actors = vec![Vec3::new(-1.0, 1.0, -8.0)];
         let plan = scene.frame();
-        assert!(!plan.overlay.is_empty());
-        // ...and one that only a less important light reaches gets none.
+        assert_eq!(plan.stats.actor_shadowed, 12);
+        for id in 1..=12 {
+            assert!(
+                frame_tiles_of(&plan, id).iter().any(|&t| t != NO_TILE),
+                "light {id}"
+            );
+        }
+        // Reshuffling the ranks changes nothing about who shadows the actor.
+        scene.extra[11].range = 60.0;
+        scene.extra[0].range = 9.0;
+        scene.settle();
+        let plan = scene.frame();
+        assert_eq!(plan.stats.actor_shadowed, 12);
+        // One that only a faraway light reaches gets a tile from that light.
         scene.extra.clear();
         scene.extra.push({
             let mut far = LightDesc::point(1, Vec3::new(0.0, 3.0, -60.0));
@@ -1151,34 +1329,11 @@ mod tests {
         scene.settle();
         scene.actors = vec![Vec3::new(0.0, 1.0, -60.0)];
         let plan = scene.frame();
-        assert_eq!(mode_of(&plan, 1), 1);
-        assert!(plan.overlay.is_empty());
+        assert!(frame_tiles_of(&plan, 1).iter().any(|&t| t != NO_TILE));
     }
 
     #[test]
-    fn actor_shadows_stay_until_a_light_falls_past_the_margin() {
-        let mut scene = Scene::new(&[]);
-        ranked_lights(&mut scene);
-        let limit = ACTOR_SHADOW_LIGHTS as u32;
-        assert_eq!(mode_of(&scene.frame(), limit + 1), 1);
-        // Light 9 outranks every other light, which pushes light 8 to ninth.
-        scene.extra[limit as usize].range = 40.0;
-        scene.settle();
-        let plan = scene.frame();
-        assert_eq!(mode_of(&plan, limit + 1), 2);
-        // Light 8 keeps its actor shadows for a while.
-        assert_eq!(mode_of(&plan, limit), 2);
-        assert_eq!(plan.stats.actor_shadowed, ACTOR_SHADOW_LIGHTS + 1);
-        // Dimmed to the end of the list, it loses them.
-        scene.extra[limit as usize - 1].range = 6.0;
-        scene.settle();
-        let plan = scene.frame();
-        assert_eq!(mode_of(&plan, limit), 1);
-        assert_eq!(plan.stats.actor_shadowed, ACTOR_SHADOW_LIGHTS);
-    }
-
-    #[test]
-    fn nodes_shadow_actors_unless_the_limit_is_zero() {
+    fn nodes_shadow_actors_and_a_static_mode_turns_it_off() {
         let positions: Vec<Vec3> = (0..4)
             .map(|i| Vec3::new(i as f32 * 3.0 - 4.5, 4.0, -6.0))
             .collect();
@@ -1187,40 +1342,170 @@ mod tests {
         scene.actors = vec![Vec3::new(-4.5, 1.0, -6.0)];
         assert!(scene.set.shadows_actors());
         let plan = scene.frame();
-        assert_eq!(plan.stats.actor_shadowed, 4);
-        assert!(!plan.overlay.is_empty());
-        scene.set.config.actor_lights = 0;
-        scene.set.invalidate_all();
-        scene.settle();
-        assert!(!scene.set.shadows_actors());
-        let plan = scene.frame();
+        assert!(plan.stats.actor_shadowed >= 1);
+        assert!(!plan.frame_jobs.is_empty());
+        let mut fixed = Scene::new(&positions);
+        fixed.set = LightSet::new(LightConfig::default(), ShadowMode::Static);
+        fixed.actors = scene.actors.clone();
+        fixed.settle();
+        assert!(!fixed.set.shadows_actors());
+        let plan = fixed.frame();
         assert_eq!(plan.stats.actor_shadowed, 0);
-        assert!(plan.overlay.is_empty());
+        assert!(plan.frame_jobs.is_empty());
     }
 
     #[test]
-    fn many_actors_never_use_more_overlay_tiles_than_exist() {
+    fn many_actors_get_a_tile_on_every_face_in_reach_with_no_limit() {
         let mut scene = Scene::new(&[]);
-        for i in 0..8 {
-            let mut light = LightDesc::point(i + 1, Vec3::new(i as f32 * 3.0 - 10.0, 5.0, -8.0));
+        for i in 0..40 {
+            let mut light = LightDesc::point(i + 1, Vec3::new(i as f32 * 1.5 - 30.0, 5.0, -8.0));
             light.shadow = ShadowMode::Dynamic;
             scene.extra.push(light);
         }
-        scene.settle();
+        for _ in 0..400 {
+            if scene.frame().settled {
+                break;
+            }
+        }
         scene.actors = (0..400)
             .map(|i| {
                 Vec3::new(
-                    (i % 20) as f32 - 10.0,
+                    (i % 20) as f32 * 3.0 - 30.0,
                     1.0 + (i / 20) as f32 * 0.5,
                     -8.0 + (i % 7) as f32,
                 )
             })
             .collect();
         let plan = scene.frame();
-        assert_eq!(plan.overlay.len(), OVERLAY_SLOTS);
-        let mut slots: Vec<u8> = plan.overlay.iter().map(|job| job.slot).collect();
-        slots.sort_unstable();
-        slots.dedup();
-        assert_eq!(slots.len(), OVERLAY_SLOTS);
+        assert_eq!(plan.stats.actor_shadowed, 40);
+        assert!(plan.frame_jobs.len() > 40, "{}", plan.frame_jobs.len());
+        // Every tile is a distinct slot of a page of its own size.
+        let mut seen = std::collections::HashSet::new();
+        for job in &plan.frame_jobs {
+            assert!(seen.insert((job.tile.page, job.tile.slot)));
+            assert!((job.tile.slot as usize) < job.class.per_page());
+            assert_eq!(
+                plan.frame_page_classes[usize::from(job.tile.page)],
+                job.class.code()
+            );
+        }
+        assert_eq!(plan.stats.frame_tiles, plan.frame_jobs.len());
+        assert_eq!(plan.stats.frame_pages, plan.frame_page_classes.len());
+        // A frame later, with the actors gone, nothing is left over.
+        scene.actors.clear();
+        let plan = scene.frame();
+        assert!(plan.frame_jobs.is_empty() && plan.frame_page_classes.is_empty());
+    }
+
+    #[test]
+    fn every_tile_reference_names_a_slot_of_a_page_of_the_size_in_the_page_table() {
+        let mut scene = Scene::new(&[]);
+        for i in 0..150 {
+            let (x, z) = ((i % 15) as f32 * 3.0 - 20.0, (i / 15) as f32 * 3.0 - 40.0);
+            scene
+                .extra
+                .push(LightDesc::point(i + 1, Vec3::new(x, 3.0, z)));
+        }
+        scene.settle();
+        scene.actors = vec![Vec3::new(0.0, 1.0, -20.0), Vec3::new(5.0, 1.0, -25.0)];
+        let plan = scene.frame();
+        assert!(!plan.frame_jobs.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for light in &plan.lights {
+            let record = light.gpu;
+            for (tiles, table) in [
+                (record.tiles, &plan.page_classes),
+                (record.frame_tiles, &plan.frame_page_classes),
+            ] {
+                for tile in tiles.into_iter().filter(|&t| t != NO_TILE) {
+                    let (page, slot) = ((tile >> 10) as usize, tile & 1023);
+                    let class = TileClass::ALL[table[page] as usize];
+                    assert!((slot as usize) < class.per_page());
+                    // No two faces share a slot of the same texture.
+                    assert!(seen.insert((std::ptr::eq(table, &plan.page_classes), tile)));
+                }
+            }
+        }
+        assert!(plan.page_classes.len() as u32 <= crate::render::device::MAX_ARRAY_LAYERS);
+    }
+
+    #[test]
+    fn a_thousand_lights_in_view_are_all_lit_and_shadowed_within_the_bound() {
+        let mut scene = Scene::new(&[]);
+        for i in 0..1000 {
+            let (x, z) = ((i % 40) as f32 * 2.0 - 40.0, (i / 40) as f32 * 2.0 - 60.0);
+            scene
+                .extra
+                .push(LightDesc::point(i + 1, Vec3::new(x, 3.0, z - 4.0)));
+        }
+        scene.eye = Vec3::new(0.0, 2.0, 20.0);
+        let mut plan = scene.frame();
+        for _ in 0..3000 {
+            if plan.settled {
+                break;
+            }
+            plan = scene.frame();
+        }
+        assert!(plan.settled);
+        assert_eq!(plan.stats.drawn, 1000);
+        assert_eq!(plan.stats.shadowed, 1000);
+        assert_eq!(plan.stats.over_budget, 0);
+        assert_eq!(plan.stats.tiles_resident, 6000);
+        // At the lowest level's bound: the static atlas stays inside what is
+        // left of 15 pages after the per-frame tiles' reserve.
+        assert!(
+            plan.stats.pages_made <= scene.set.config.static_bound(),
+            "{:?}",
+            plan.stats
+        );
+        assert_eq!(plan.stats.pages_past_bound(), 0, "{:?}", plan.stats);
+    }
+
+    #[test]
+    fn a_lower_bound_shrinks_tiles_and_gives_pages_back_without_losing_a_light() {
+        let mut scene = Scene::new(&[]);
+        let big = LightConfig {
+            bound_pages: 64,
+            ..LightConfig::default()
+        };
+        scene.set = LightSet::new(big, ShadowMode::Dynamic);
+        for i in 0..339 {
+            let (x, z) = ((i % 20) as f32 * 2.5 - 25.0, (i / 20) as f32 * 2.5 - 50.0);
+            scene
+                .extra
+                .push(LightDesc::point(i + 1, Vec3::new(x, 3.0, z)));
+        }
+        scene.eye = Vec3::new(0.0, 2.0, 20.0);
+        let mut plan = scene.frame();
+        for _ in 0..3000 {
+            if plan.settled {
+                break;
+            }
+            plan = scene.frame();
+        }
+        let before = plan.stats;
+        assert_eq!(before.shadowed, 339);
+        // 339 lights at 128² take about 32 pages, which the high bound allows.
+        assert!(
+            before.pages_made > 20 && before.pages_past_bound() == 0,
+            "{before:?}"
+        );
+        scene.set.set_bound_pages(15);
+        let mut fewest = usize::MAX;
+        for _ in 0..4000 {
+            plan = scene.frame();
+            fewest = fewest.min(plan.stats.shadowed);
+            if plan.settled && plan.stats.pages_made <= scene.set.config.static_bound() {
+                break;
+            }
+        }
+        assert_eq!(fewest, 339, "no light lost its shadow while tiles shrank");
+        assert_eq!(plan.stats.drawn, 339);
+        assert!(
+            plan.stats.pages_made <= scene.set.config.static_bound(),
+            "{:?}",
+            plan.stats
+        );
+        assert_eq!(plan.stats.over_budget, 0);
     }
 }

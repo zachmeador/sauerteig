@@ -274,7 +274,7 @@ impl SunShadows {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(64),
+                    min_binding_size: wgpu::BufferSize::new(super::shadows::CAMERA_BYTES),
                 },
                 count: None,
             }],
@@ -287,7 +287,7 @@ impl SunShadows {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &camera_buffer,
                     offset: 0,
-                    size: wgpu::BufferSize::new(64),
+                    size: wgpu::BufferSize::new(super::shadows::CAMERA_BYTES),
                 }),
             }],
         });

@@ -37,16 +37,19 @@ fn cs_cull(@builtin(global_invocation_id) id: vec3<u32>) {
         low = min(low, corner);
         high = max(high, corner);
     }
-    var mask = array<u32, MASK_WORDS>();
-    let count = min(params.grid.w, MASK_WORDS * 32u);
-    for (var i = 0u; i < count; i += 1u) {
-        let light = light_view[i];
-        let offset = clamp(light.xyz, low, high) - light.xyz;
-        if (dot(offset, offset) <= light.w * light.w) {
-            mask[i >> 5u] |= 1u << (i & 31u);
+    let count = min(params.grid.w, MAX_LIGHTS);
+    let words = min(params.mode.y, MAX_LIGHT_WORDS);
+    for (var w = 0u; w < words; w += 1u) {
+        var bits = 0u;
+        let first = w * 32u;
+        let last = min(first + 32u, count);
+        for (var i = first; i < last; i += 1u) {
+            let light = light_view[i];
+            let offset = clamp(light.xyz, low, high) - light.xyz;
+            if (dot(offset, offset) <= light.w * light.w) {
+                bits |= 1u << (i - first);
+            }
         }
-    }
-    for (var w = 0u; w < MASK_WORDS; w += 1u) {
-        masks[cluster * MASK_WORDS + w] = mask[w];
+        masks[cluster * params.mode.y + w] = bits;
     }
 }

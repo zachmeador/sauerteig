@@ -203,10 +203,10 @@ scale, anti-aliasing and shadow detail, and nothing else:
 | Ultra | 100% | 8× | 2048² | 512² |
 
 A count the adapter doesn't support falls to the next lower one it does. Levels
-change detail only: every level lights and shadows the same lights, and the same
-lights shadow players, because the shadow atlas gives every light that fits at
-its smallest tile size a tile before any light gets a larger one, whatever the
-largest size allowed. Changing the scale, the anti-aliasing or the shadow detail
+change detail only: every level lights and shadows the same lights, and every
+light shadows players, because the shadow atlas gives every light a tile and
+shrinks tiles, down to 32², rather than drop a light, whatever the level's
+bound on atlas memory (60 MiB at Low, 256 MiB at the others). Changing the scale, the anti-aliasing or the shadow detail
 by hand makes the quality Custom, which keeps those three choices. Settings
 saved before quality existed load as Auto, or as Custom when they hold a scale
 or an anti-aliasing choice other than the old defaults.
@@ -256,38 +256,65 @@ the same around its position. A cascade whose window moved, or that too many
 changes reached, redraws whole. The cascades use 20 MiB at 1024² (3 working
 layers and 2 cached layers of 32-bit depth), 5 MiB at 512² and 80 MiB at 2048².
 Every light node is a warm omnidirectional point light with a 12 metre range and
-static shadows (`light_from_object` in `lighting.rs`). Spot lights, other
-colors, ranges, and dynamic or no shadows exist in the renderer, but nothing
-places them until object properties do. Moving actors cast shadows from the
-eight most important shadowed lights, whatever their own mode.
+shadows from static geometry and from moving actors (`light_from_object` in
+`lighting.rs`). Spot lights, other colors, ranges, and static-only or no shadows
+exist in the renderer, but nothing places them until object properties do.
 
-Each frame the lights in view, at most 256 by importance, are culled by a
-compute pass into a 16 × 9 × 24 grid of view clusters, and one shared WGSL
-function lights terrain, props, actors, and water and glass from the lights of
-the fragment's cluster: at most 16 per fragment, and 8 for water and glass,
-which take only highlights. Lights too faint to see are skipped, and weak ones
-filter their shadow with one tap instead of four. Light shadows come from a
-paged atlas of 1024² depth pages (fourteen by default, 60 MiB with the overlay
-page), each holding tiles of one size, 512², 256², or 128²: six per point light
-and one per spot light, sized by the light's projected radius with hysteresis,
-and shrunk for the least important lights so that more of them are covered; a
-full atlas of 128² tiles holds 149 point lights. A tile re-renders only when a
-chunk or object edit reaches its light's sphere, or the light changes: at most
-six faces a frame (twelve for three frames after a jump), and fewer where
-measured GPU time says a face costs more than a 1.5 ms budget allows. A new
-light stays off, then fades in, until its shadow has rendered. A light whose
-tiles are stale keeps using them; one that no tile can hold fades out rather
-than leak light through walls. The eight most important shadowed lights (a
-light that has them keeps them down to tenth place) also sample an overlay page
-that is redrawn every frame with the moving actors near them, in at most 15
-tiles; the other lights cast only static shadows.
+Every light in view is lit and every light is shadowed: no rank or distance
+cutoff, and no limit on the lights a fragment shades. Each frame the lights in
+view (by importance, up to 262,144, which the cluster masks and the light buffer
+fit in a 128 MiB storage binding) are culled by a compute pass into a
+16 × 9 × 24 grid of view clusters, with a bit mask a cluster, 32 bits per 32
+lights, in buffers that grow with the lights in view (`render/lights.rs`). One
+shared WGSL function lights terrain, props, actors, and water and glass from the
+lights of the fragment's cluster, all of them that reach it; water and glass
+take only highlights. Lights too faint to see are skipped, and weak ones filter
+their shadow with one tap instead of four.
+
+Light shadows come from a paged atlas of 1024² depth pages of 4 MiB, which grows
+with the lights. Each page holds tiles of one size, 512², 256², 128², 64² or 32²:
+six per point light and one per spot light, sized by the light's projected radius
+with hysteresis. Each level bounds the atlas's memory, static and per-frame tiles
+together: 15 pages (60 MiB) at Low and 64 (256 MiB) at the others, which holds
+the_cube1m's 339 lights at 128² with room for larger tiles near the eye. Within
+the bound every light gets 128² before any gets more. When the lights need more
+than the bound, the least important lights' tiles shrink to 64² and 32²
+(`grant_classes` in `render/lightset.rs`); a light never goes without, and if
+even 32² for every light needs more pages, the atlas grows past its bound by 24
+KiB a point light, and F3 says so. A page table in a storage buffer gives the
+tile size of each page, and the texture gains layers in steps of four, copied
+whole, as pages are made, up to the device's layer limit (2,048 where the adapter
+offers it; the renderer requests it). Pages made empty are given back once a
+dozen layers sit unused, after tiles of the last pages move to earlier ones
+(`compact` in `render/atlas.rs`). A tile re-renders only when a chunk or object
+edit reaches its light's sphere, or the light changes: at most six faces a frame
+(twelve for three frames after a jump), and fewer where measured GPU time says a
+face costs more than a 1.5 ms budget allows. A new light stays off, then fades
+in, until its shadow has rendered; a light whose tiles are stale keeps using
+them. A tile changes size only after a second of use, and at most eight lights
+change at once.
+
+Moving actors shadow every light that reaches them, in tiles of a second
+texture that are drawn afresh each frame (`render_frame` in
+`render/shadows.rs`). A face of a light whose range and view reach an actor
+gets a tile there, the size of its static tile. The tile starts as a copy of the
+static tile, made by drawing a triangle that reads the atlas and writes its
+depth (`fs_copy` in `shadow.wgsl`), and the actors are drawn over it, so shading
+reads that one tile for the face and the static tile for the rest. Nothing
+copies a sub-rectangle of a depth texture, which DirectX 12 does not allow on
+every GPU, and no pass samples the texture it renders into. Per-frame tiles are
+allocated each frame from the actors present, and count against the level's
+bound: at Low they are at most 128², and at the others, where lights near the
+eye have 512² tiles, a room full of actors can take the atlas past its bound,
+which F3 reports.
 
 The renderer asks the adapter for what it uses and no more (`render/device.rs`):
 the Vulkan, DirectX 12 and Metal backends only (`WGPU_BACKEND` and
 `WGPU_DX12_COMPILER` still override them, for testing), compute shaders,
-anisotropic filtering, two storage buffers per shader stage, three bind groups,
-64 array layers, 8192-pixel textures (more for a bigger window), and a
-64-invocation compute workgroup. It also takes `TIMESTAMP_QUERY` for the GPU
+anisotropic filtering, three storage buffers per shader stage, three bind groups,
+256 array layers (up to 2,048 where the adapter has them, for the shadow atlas),
+8192-pixel textures (more for a bigger window), and a 64-invocation compute
+workgroup. It also takes `TIMESTAMP_QUERY` for the GPU
 timings and `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` for 2× and 8× MSAA, each
 only where the adapter has it. An adapter that lacks a required limit or
 ability is refused with a message that names it and the minimum specification.
@@ -297,7 +324,8 @@ in `render/shaders.rs`. On Metal the
 forced bounding makes the compiler keep every loop by reading a volatile flag in
 each iteration, which made the clustered light loop about three times slower (stage
 1's sun filtering sped up as well). Every embedded loop has a bounded trip count,
-the clustered one at most 8 mask words of 32 bits that each lose a set bit per
+the clustered one at most `MAX_LIGHT_WORDS` mask words (clamped in the shader to
+a constant, whatever the frame's count) of 32 bits that each lose a set bit per
 iteration, and runtime bounds checks stay on. Keep both true when changing a shader,
 as the function's `SAFETY` comment says.
 
@@ -348,7 +376,8 @@ They exclude GPU execution and networking. F3 shows the adapter's name with its
 graphics API and driver, rendering counts, CPU edit/remesh timing, effective
 scene resolution/MSAA/present mode, shadow maps rendered, per-pass GPU
 timestamps where supported, and how many lights are drawn, shadowed (and
-shadowing actors), over budget or waiting. It explicitly reports unavailable
+shadowing actors, with tiles in the per-frame texture), waiting, or without a
+page at the device's ceiling, and the atlas's pages against the level's bound. It explicitly reports unavailable
 timestamps otherwise. The asynchronous profiler never waits for a sample during
 play. Pass spans can overlap on Metal, so do not add them to obtain a GPU frame
 time.
@@ -412,8 +441,8 @@ cargo run --release --locked -p sauerteig-client --bin capture -- \
 ```
 
 Each pose names a world file (or a test scene: `arena`, `materials`, and the
-synthetic lighting scenes `lightroom`, `corridor`, `waterglass`, `lamphall`,
-`lightshow` and `shadowtest`), eye, look-at point, fixed animation time and optional guides,
+synthetic lighting scenes `lightroom`, `lightfield` (a 120 × 76 m hall with 1,000
+light nodes), `corridor`, `waterglass`, `lamphall`, `lightshow` and `shadowtest`), eye, look-at point, fixed animation time and optional guides,
 `actors` standing in the scene, `edit_storm` (invalidate every cached shadow each
 frame), or a `path` of waypoints to walk at `speed` metres a second or jump to
 and hold for `dwell` frames. Lights fade in and shadows render over many frames,
@@ -431,9 +460,10 @@ manifest for other worlds. The tool refuses to replace existing PNGs.
 which Custom reads, `bloom`, `exposure` and `vsync`; omitted fields take the
 normal defaults. A file that names `scale` or `msaa` without `quality` is Custom. `--brute-force` evaluates every light
 at every fragment (for comparing with the clusters), `--pages N` sets the shadow
-atlas size, `--over-budget unshadowed` keeps lights that no tile can hold,
-`--actor-lights N` sets how many of the most important shadowed lights shadow
-actors, and `--node-shadows off|static|dynamic` sets what light nodes cast.
+atlas's bound in pages instead of the quality level's, `--light-cap N` stops a
+fragment at N lights, as stage 2 did at 16 (for comparing; the game has no cap),
+and `--node-shadows off|static|dynamic` sets what light nodes cast
+(`static` leaves actors out of the lights' shadows).
 A pose can also name a `block_edit` cell: after the pose's frames the tool
 changes that cell and changes it back six times, and the report's `block_edit`
 gives the GPU time of the sun's static passes (`sun cascade 1` to `3`) and the
@@ -474,7 +504,7 @@ matches a fresh render after edits, moved props, walking and each quality
 level, that clusters built by the compute pass match the CPU's and give the same picture as a
 brute-force render, that every sample count the adapter offers draws the same
 scene, that a wall stops the next corridor's lights, and that spot lights and
-actor overlays draw. Normal workspace tests leave these hardware-dependent
+actor tiles draw with either method. Normal workspace tests leave these hardware-dependent
 tests ignored.
 
 To compare the built-in movement profiles with a literal port of Sauerbraten's

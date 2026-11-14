@@ -94,6 +94,41 @@ pub fn lightroom() -> (World, Vec<WorldObject>) {
     (world, objects)
 }
 
+/// A closed 120 by 76 m hall with rows of pillars and two long walls, lit by
+/// 1,000 light nodes on a 3 m grid, so that every point in it is reached by
+/// dozens of lights. It exists to size and time every-light shading and the
+/// shadow atlas at a scale no hand-built map has.
+pub fn lightfield() -> (World, Vec<WorldObject>) {
+    let mut world = World::empty();
+    fill(&mut world, [-60, 0, -38], [60, 1, 38], 0);
+    fill(&mut world, [-60, 11, -38], [60, 12, 38], 3);
+    fill(&mut world, [-60, 1, -38], [-59, 11, 38], 3);
+    fill(&mut world, [59, 1, -38], [60, 11, 38], 3);
+    fill(&mut world, [-59, 1, -38], [59, 11, -37], 3);
+    fill(&mut world, [-59, 1, 37], [59, 11, 38], 3);
+    for ix in 0..9 {
+        for iz in 0..5 {
+            let (x, z) = (-48 + 12 * ix, -24 + 12 * iz);
+            fill(&mut world, [x - 1, 1, z - 1], [x + 1, 11, z + 1], 2);
+        }
+    }
+    fill(&mut world, [-59, 1, -13], [21, 11, -12], 1);
+    fill(&mut world, [-21, 1, 12], [59, 11, 13], 1);
+    let mut objects = Vec::new();
+    for i in 0..40 {
+        for j in 0..25 {
+            let height = if (i + j) % 2 == 0 { 5.5 } else { 8.0 };
+            objects.push(node(
+                (i * 25 + j) as u32 + 1,
+                -58.5 + 3.0 * i as f32,
+                height,
+                -36.0 + 3.0 * j as f32,
+            ));
+        }
+    }
+    (world, objects)
+}
+
 /// Two parallel 60 m corridors separated by a one-metre wall, each with its own
 /// row of lights. Lights in one must not show through the wall into the other.
 pub fn corridor() -> (World, Vec<WorldObject>) {
@@ -278,6 +313,7 @@ pub fn shadowtest() -> Scene {
 pub fn named(name: &str) -> Option<Scene> {
     match name {
         "lightroom" => Some(lightroom().into()),
+        "lightfield" => Some(lightfield().into()),
         "corridor" => Some(corridor().into()),
         "lamphall" => Some(lamphall().into()),
         "waterglass" => Some(waterglass(false).into()),

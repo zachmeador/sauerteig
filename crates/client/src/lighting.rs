@@ -12,8 +12,8 @@ pub const MIN_SHADOW_RANGE: f32 = 2.0;
 /// Shadow tiles ignore casters closer to the light than this.
 pub const SHADOW_NEAR: f32 = 0.1;
 /// Each tile renders slightly past its nominal field of view, so filter taps
-/// near an edge stay inside the tile: two texels at the smallest (128 px) size.
-pub const TILE_GUARD_SCALE: f32 = 128.0 / 124.0;
+/// near an edge stay inside the tile: this many texels on each side.
+pub const TILE_GUARD_TEXELS: f32 = 2.0;
 const MAX_SPOT_ANGLE: f32 = 75.0 * std::f32::consts::PI / 180.0;
 const MAX_RANGE: f32 = 256.0;
 
@@ -32,11 +32,12 @@ pub enum LightKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShadowMode {
     Off,
-    /// Static geometry only, cached until a chunk edit or light edit. The most
-    /// important shadowed lights also shadow moving actors, as dynamic ones do.
-    #[default]
+    /// Static geometry only, cached until a chunk edit or light edit. For
+    /// comparison captures: nothing the game places has it.
     Static,
-    /// Static geometry plus moving actors, which draw into an overlay.
+    /// Static geometry plus moving actors, which draw into per-frame tiles.
+    /// Every light shadows actors this way.
+    #[default]
     Dynamic,
 }
 
@@ -62,7 +63,7 @@ impl LightDesc {
             intensity: DEFAULT_INTENSITY,
             range: DEFAULT_RANGE,
             kind: LightKind::Point,
-            shadow: ShadowMode::Static,
+            shadow: ShadowMode::Dynamic,
         }
     }
 
@@ -137,20 +138,25 @@ impl LightDesc {
         self.range / self.position.distance(eye).max(0.5)
     }
 
-    /// Tangent of the half field of view of a tile, including the guard band.
-    pub fn tile_tan_half(&self) -> f32 {
-        let tan = match self.kind {
+    /// Tangent of the half field of view of a tile without its guard band.
+    pub fn base_tan_half(&self) -> f32 {
+        match self.kind {
             LightKind::Point => 1.0,
             LightKind::Spot { outer, .. } => outer.tan(),
-        };
-        tan * TILE_GUARD_SCALE
+        }
     }
 
-    /// World to clip transform of one shadow tile: a cube face for point
-    /// lights, or the cone's axis for spot lights.
-    pub fn tile_projection(&self, face: usize) -> Mat4 {
+    /// Tangent of the half field of view of a tile of `size` texels, including
+    /// the guard band.
+    pub fn tile_tan_half(&self, size: u32) -> f32 {
+        self.base_tan_half() * guard_scale(size)
+    }
+
+    /// World to clip transform of one shadow tile of `size` texels: a cube face
+    /// for point lights, or the cone's axis for spot lights.
+    pub fn tile_projection(&self, face: usize, size: u32) -> Mat4 {
         let (forward, up) = self.tile_axes(face);
-        let fov = 2.0 * self.tile_tan_half().atan();
+        let fov = 2.0 * self.tile_tan_half(size).atan();
         Mat4::perspective_rh(fov, 1.0, SHADOW_NEAR, self.range)
             * Mat4::look_to_rh(self.position, forward, up)
     }
@@ -162,12 +168,7 @@ impl LightDesc {
         }
     }
 
-    pub fn packed(
-        &self,
-        fade: f32,
-        shadow: Option<[u16; 6]>,
-        overlay: Option<[u8; 6]>,
-    ) -> GpuLight {
+    pub fn packed(&self, fade: f32, shadow: Option<[u32; 6]>, frame: Option<[u32; 6]>) -> GpuLight {
         let (spot, direction, scale, offset) = match self.kind {
             LightKind::Point => (0, Vec3::ZERO, 0.0, 1.0),
             LightKind::Spot {
@@ -184,20 +185,9 @@ impl LightDesc {
             (ShadowMode::Static, _) => 1,
             (ShadowMode::Dynamic, _) => 2,
         };
-        let mut flags = spot | (mode << 1);
-        if mode == 2 {
-            let mut slots = 0u32;
-            for face in 0..6 {
-                let slot = overlay.map_or(OVERLAY_NONE, |s| s[face]);
-                slots |= u32::from(slot) << (OVERLAY_SHIFT + 4 * face as u32);
-            }
-            flags |= slots;
-        }
-        let refs = shadow.unwrap_or([NO_TILE; 6]);
-        let tile_pair = |i: usize| u32::from(refs[i]) | u32::from(refs[i + 1]) << 16;
-        let mut packed = [flags, tile_pair(0), tile_pair(2), tile_pair(4)];
+        let mut packed = [spot | (mode << 1), 0, 0, 0];
         if self.is_spot() {
-            packed[2] = self.tile_tan_half().to_bits();
+            packed[2] = self.base_tan_half().to_bits();
         }
         let color = self.color * self.intensity * fade;
         GpuLight {
@@ -210,14 +200,24 @@ impl LightDesc {
             color_scale: [color.x, color.y, color.z, scale],
             direction_offset: [direction.x, direction.y, direction.z, offset],
             packed,
+            tiles: shadow.unwrap_or([NO_TILE; 6]),
+            frame_tiles: if mode == 2 {
+                frame.unwrap_or([NO_TILE; 6])
+            } else {
+                [NO_TILE; 6]
+            },
         }
     }
 }
 
-/// Overlay slot value for a face without actor shadows.
-pub const OVERLAY_NONE: u8 = 15;
-const OVERLAY_SHIFT: u32 = 3;
-pub const NO_TILE: u16 = 0xFFFF;
+/// How much wider than its face a tile of `size` texels renders, so that the
+/// guard band is `TILE_GUARD_TEXELS` on each side.
+pub fn guard_scale(size: u32) -> f32 {
+    size as f32 / (size as f32 - 2.0 * TILE_GUARD_TEXELS)
+}
+
+/// Tile reference of a face without a tile.
+pub const NO_TILE: u32 = u32::MAX;
 
 pub fn cube_face_axes(face: usize) -> (Vec3, Vec3) {
     let axis = face / 2;
@@ -234,8 +234,7 @@ pub fn spot_up(direction: Vec3) -> Vec3 {
     }
 }
 
-/// One light as the shaders read it: 64 bytes, laid out for both storage and
-/// uniform buffers.
+/// One light as the shaders read it: 112 bytes in a storage buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable, PartialEq)]
 pub struct GpuLight {
@@ -245,8 +244,13 @@ pub struct GpuLight {
     pub color_scale: [f32; 4],
     /// Spot direction, cone offset.
     pub direction_offset: [f32; 4],
-    /// Flags (spot, shadow mode, overlay slots) and six 16-bit tile references.
+    /// Flags (bit 0 spot, bits 1-2 shadow mode), and a spot light's tile
+    /// tangent as float bits in z.
     pub packed: [u32; 4],
+    /// The static tile of each face, or `NO_TILE`.
+    pub tiles: [u32; 6],
+    /// The per-frame tile of each face that actors can shadow, or `NO_TILE`.
+    pub frame_tiles: [u32; 6],
 }
 
 /// The light a light node places, until the world format stores properties.
@@ -435,7 +439,7 @@ mod tests {
         assert_eq!(light.id, 7);
         assert_eq!(light.position, position);
         assert_eq!(light.kind, LightKind::Point);
-        assert_eq!(light.shadow, ShadowMode::Static);
+        assert_eq!(light.shadow, ShadowMode::Dynamic);
         assert_eq!(light.color.to_array(), DEFAULT_COLOR);
         assert_eq!(light.range, 12.0);
         for kind in [
@@ -484,11 +488,11 @@ mod tests {
     #[test]
     fn cube_faces_cover_the_sphere_and_match_webgpu_clip_space() {
         let light = LightDesc::point(1, Vec3::new(3.0, 9.0, -2.0));
-        let inner = 1.0 / TILE_GUARD_SCALE;
+        let inner = 1.0 / guard_scale(128);
         for face in 0..6 {
             let (forward, up) = cube_face_axes(face);
             assert!((forward.dot(up)).abs() < 1.0e-6);
-            let matrix = light.tile_projection(face);
+            let matrix = light.tile_projection(face, 128);
             for (depth, expected_z) in [(SHADOW_NEAR, 0.0), (light.range, 1.0)] {
                 let p = ndc(matrix, light.position + forward * depth);
                 assert!(p.x.abs() < 1.0e-5 && p.y.abs() < 1.0e-5);
@@ -509,42 +513,64 @@ mod tests {
         let light = LightDesc::spot(1, Vec3::new(0.0, 5.0, 0.0), direction, 0.3, 0.6)
             .sanitized()
             .unwrap();
-        let matrix = light.tile_projection(0);
+        let matrix = light.tile_projection(0, 128);
         let (forward, up) = light.tile_axes(0);
         let right = forward.cross(up).normalize();
         let true_up = right.cross(forward);
         let edge = light.position + (forward + right * 0.6_f32.tan()) * 3.0;
         let p = ndc(matrix, edge);
-        assert!((p.x - 1.0 / TILE_GUARD_SCALE).abs() < 1.0e-5 && p.y.abs() < 1.0e-5);
+        assert!((p.x - 1.0 / guard_scale(128)).abs() < 1.0e-5 && p.y.abs() < 1.0e-5);
         let edge = light.position + (forward + true_up * 0.6_f32.tan()) * 3.0;
         let p = ndc(matrix, edge);
-        assert!((p.y - 1.0 / TILE_GUARD_SCALE).abs() < 1.0e-5 && p.x.abs() < 1.0e-5);
+        assert!((p.y - 1.0 / guard_scale(128)).abs() < 1.0e-5 && p.x.abs() < 1.0e-5);
         assert_eq!(spot_up(Vec3::Y), Vec3::Z);
         assert_eq!(spot_up(Vec3::X), Vec3::Y);
     }
 
     #[test]
-    fn packed_records_hold_cone_shadow_and_overlay_state() {
+    fn guard_bands_hold_two_texels_whatever_the_tile_size() {
+        for size in [32, 64, 128, 256, 512] {
+            // A wedge of half-tangent 1 spans size - 4 texels of a tile.
+            let texels = size as f32 / guard_scale(size);
+            assert!((texels - (size as f32 - 4.0)).abs() < 1.0e-4, "{size}");
+        }
+        assert_eq!(guard_scale(128), 128.0 / 124.0);
+        let light = LightDesc::point(1, Vec3::ZERO);
+        assert_eq!(light.tile_tan_half(32), 32.0 / 28.0);
+        let matrix = light.tile_projection(0, 32);
+        let p = ndc(matrix, Vec3::new(4.0, 0.0, 4.0));
+        assert!((p.x - 28.0 / 32.0).abs() < 1.0e-5, "{p:?}");
+    }
+
+    #[test]
+    fn packed_records_hold_cone_shadow_and_tile_state() {
         let point = LightDesc::point(1, Vec3::new(1.0, 2.0, 3.0));
-        let refs = [0x0001, 0x0102, 0x0203, 0x0304, 0x0405, 0x0506];
+        let refs = [1, 258, 515, 772, 1029, 1286];
         let record = point.packed(0.5, Some(refs), None);
         assert_eq!(record.position_range, [1.0, 2.0, 3.0, 12.0]);
         assert_eq!(
             record.color_scale[0],
             0.5 * DEFAULT_INTENSITY * DEFAULT_COLOR[0]
         );
-        assert_eq!(record.packed[0], 1 << 1);
-        assert_eq!(record.packed[1], 0x0102_0001);
-        assert_eq!(record.packed[3], 0x0506_0405);
-        assert_eq!(point.packed(1.0, None, None).packed[0], 0);
+        assert_eq!(record.packed[0], 2 << 1);
+        assert_eq!(record.tiles, refs);
+        assert_eq!(record.frame_tiles, [NO_TILE; 6]);
+        let unshadowed = point.packed(1.0, None, None);
+        assert_eq!(unshadowed.packed[0], 0);
+        assert_eq!(unshadowed.tiles, [NO_TILE; 6]);
 
         let mut dynamic = point;
         dynamic.shadow = ShadowMode::Dynamic;
-        let record = dynamic.packed(1.0, Some(refs), Some([0, 1, 2, 3, 4, OVERLAY_NONE]));
+        let frame = [0, 1, NO_TILE, 3, 4, NO_TILE];
+        let record = dynamic.packed(1.0, Some(refs), Some(frame));
         assert_eq!(record.packed[0] & 7, 2 << 1);
-        for (face, slot) in [0, 1, 2, 3, 4, 15].into_iter().enumerate() {
-            assert_eq!((record.packed[0] >> (3 + 4 * face)) & 15, slot);
-        }
+        assert_eq!(record.frame_tiles, frame);
+        // A light that only shadows static geometry takes no per-frame tiles.
+        let mut fixed = point;
+        fixed.shadow = ShadowMode::Static;
+        let record = fixed.packed(1.0, Some(refs), Some(frame));
+        assert_eq!(record.packed[0] & 7, 1 << 1);
+        assert_eq!(record.frame_tiles, [NO_TILE; 6]);
 
         let spot = LightDesc::spot(2, Vec3::ZERO, -Vec3::Y, 0.2, 0.5)
             .sanitized()
@@ -552,12 +578,12 @@ mod tests {
         let record = spot.packed(1.0, Some(refs), None);
         assert_eq!(record.packed[0] & 1, 1);
         assert_eq!(record.direction_offset[..3], [0.0, -1.0, 0.0]);
-        assert_eq!(f32::from_bits(record.packed[2]), spot.tile_tan_half());
+        assert_eq!(f32::from_bits(record.packed[2]), 0.5_f32.tan());
         let cone =
             |cos: f32| (cos * record.color_scale[3] + record.direction_offset[3]).clamp(0.0, 1.0);
         assert!((cone(0.5_f32.cos()) - 0.0).abs() < 1.0e-5);
         assert!((cone(0.2_f32.cos()) - 1.0).abs() < 1.0e-5);
-        assert_eq!(std::mem::size_of::<GpuLight>(), 64);
+        assert_eq!(std::mem::size_of::<GpuLight>(), 112);
     }
 
     #[test]

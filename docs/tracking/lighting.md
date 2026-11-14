@@ -18,18 +18,23 @@ remove forced fixtures from Light nodes. Worlds that relied on lamp props alone
 for illumination now need separate Light nodes.
 
 Every Light node in view lights the scene as a warm omnidirectional point light
-with a 12 metre range, 16 units of intensity and static shadows, through the
-clustered renderer ([renderer](renderer.md) stage 2), within three limits: at
-most 256 lights in view, ranked by range over distance; as many as the shadow
-atlas holds, 149 at its smallest tiles; and at most 16 lights per fragment (8 on
-water and glass), most important first. Lights the atlas can't hold fade out
-rather than leak through walls, so the_cube1m draws 149 of its 339 lights. The
-eight most important shadowed lights in view also shadow players. Spot lights
-exist in the renderer but nothing places one yet. Color, intensity, radius,
-direction, and cone are fixed defaults, not editable or imported, which is a
-substantial limitation for imported lights: a dense imported map is lit at the
-same strength everywhere. The sun is also a fixed environment light; no baked
-lighting or global illumination is implemented.
+with a 12 metre range and 16 units of intensity, through the clustered renderer
+([renderer](renderer.md) stage 2 and N2), and every one of them is shadowed: the
+shadow atlas grows with the lights and shrinks tiles, to 64² and 32², rather than
+drop a light, so the_cube1m draws all 339 of its lights, up from 149. Each level
+bounds the atlas's memory, 60 MiB at Low and 256 MiB at the others, and a light
+that no tile can hold within the bound takes pages past it. There is no limit on
+the lights in view or on the lights a fragment shades, and every shadowed light
+shadows players and other moving actors, wherever it ranks. Spot lights exist in
+the renderer but nothing places one yet. Color, intensity, radius, direction,
+and cone are fixed defaults, not editable or imported, which is a substantial
+limitation for imported lights: a dense imported map is lit at the same strength
+everywhere. The sun is also a fixed environment light; no baked lighting or
+global illumination is implemented.
+
+Shading every light is not free: at 4K on an M5 Pro, the densest imported views
+and the lightroom already miss the 6.06 ms budget at the default level, with or
+without N2. The numbers are in [renderer](renderer.md) under N2.
 
 ## Remaining work
 
@@ -50,8 +55,10 @@ lighting or global illumination is implemented.
   no cap on the lights a fragment shades, every light shadowed (339 of 339 on
   the_cube1m instead of 149), and every shadowed light casting player shadows
   instead of the eight most important. Quality settings may vary only detail,
-  never which lights are lit or shadowed (maintainer, 2026-11-11). Planned as
-  [renderer](renderer.md) N2.
+  never which lights are lit or shadowed (maintainer, 2026-11-11). Implemented
+  in [renderer](renderer.md) N2 and checked on the capture tool and the GPU
+  tests on an M5 Pro; the maintainer's look in the running app and a Vulkan and
+  a DirectX 12 GPU are still to do.
 
 ## Evidence
 
