@@ -1,8 +1,8 @@
 # Octree world
 
 State: active. The maintainer chose to rebuild the core around one octree
-before shared-sandbox stage 2's network and save formats (2026-11-13). O1a
-merged on 2026-11-14; O1b and O3 run in wave 1, and O2 follows O1b.
+before shared-sandbox stage 2's network and save formats (2026-11-13). O1a and
+O3 merged on 2026-11-14; O1b runs in wave 1, and O2 follows O1b.
 
 ## Outcome
 
@@ -1034,8 +1034,8 @@ again after session 2.
 
 ## O3: imports straight into the tree
 
-State: running on branch `octree-o3` since 2026-11-14. Medium. It runs beside
-O1b and O2, which keep the functions the importer calls.
+State: merged on 2026-11-14. The library swap and the maintainer's look at
+re-imported maps remain.
 
 - **Scope:**
   - Read the OGZ octree into the tree through O1a's builder. Edges become
@@ -1066,13 +1066,245 @@ O1b and O2, which keep the functions the importer calls.
   and raw texture slots are kept. Implementation sessions never touch the
   library.
 - **Acceptance:**
-  - [ ] Every library map, re-imported, matches its current copy reflected:
+  - [x] Every library map, re-imported, matches its current copy reflected:
     the loaded trees' digests are equal once the current copy is reflected.
+    Checked on copies in the worktree, all 22 library worlds, with the options
+    the record lists (the library itself untouched).
   - [ ] **Maintainer:** a few re-imported maps look the right way round, as
     the maintainer remembers them from Sauerbraten.
-  - [ ] nub1 imports with the stock importer.
+  - [x] nub1 imports with the stock importer (0.37 s, 152 MiB).
 - **Record:** import times and memory, leaf counts, inert-material counts, and
-  the orientation check.
+  the orientation check. See the session record below.
+
+### O3 session record (2026-11-14)
+
+Code, automated checks and measurements, on the M5 Pro with release builds.
+Nothing was opened in the Sauerteig app. What did run: the capture tool on a
+re-imported world (the orientation check), and the standalone server on
+re-imports of nub1, the_cube1m and complex.
+
+- **What changed.** All in `crates/importer`:
+  - `convert.rs` builds the octree through O1a's `OctreeBuilder` and writes it
+    as format 3 (`Octree::to_format3`), so the box path and `World`
+    validation are gone. `convert_to_tree` also returns the tree.
+  - `transform.rs` reflects; `lib.rs` reads level-of-detail nodes' materials
+    into a new `lod_nodes` count in the report; `main.rs` prints the tree's
+    leaves.
+  - New `reflect.rs` (`reflect_x`, a tree's mirror image across X = 0) and
+    `examples/compare_reflected.rs`, which compares a re-import with an older
+    copy reflected, for the library swap. A private test
+    (`private_reimports_equal_the_library_copies_reflected`, in the importer's
+    `private_` tests, `-- --ignored`) does it for complex and ralith1 from
+    `.local/originals/` and `.local/library/`.
+  - `crates/importer/README.md`'s conversion sections and
+    [legacy-import](legacy-import.md).
+- **The fix: reflect X.** Sauerbraten's world is Z-up and left-handed, so
+  `(x, y, z) -> (x, z, -y)`, a rotation, mirrored every map. It is now
+  `(x, y, z) -> (-x, z, -y)`: up stays up, source north (+y) stays
+  Sauerteig's -Z, and only east and west trade places. Any other reflection
+  would be as correct; this one keeps the old placement on two axes and makes
+  a later spawn-heading import a plain turn. Changes: `ImportTransform`
+  (cube bounds, positions, the crop region, bounds), the edge-to-corner
+  mapping (the lattice slot for each source corner), the face order
+  (Sauerteig's -X, +X, -Y, +Y, -Z, +Z take source faces +x, -x, -z, +z, +y,
+  -y) and the diagonals, which are chosen in the source's frame by the
+  original rule (`SOURCE_FACES`) and mapped to slots. A test mirrors the old
+  mapping, which it restates, and compares 20,000 random cubes' vertices and
+  diagonals with the new mapping. The tests that pinned the old mapping
+  (water and glass boxes' places, bounds, the ramp's raycasts, the face
+  slots, entity bounds, crop volumes) now pin the new one.
+- **Orientation check.** The archive holds `complex.png`, the screenshot the
+  original game saved with the map, so it is the engine's own picture and has
+  the right handedness. From a pose I found by eye in the imported complex
+  (eye [-19, 28.4, -4], looking at [-28, 29.2, 12]), the layout matches it:
+  a window opening at the left of the back wall, a stair with railings
+  left of centre, and the loading-bay docks along the wall on the right. The
+  library's old copy of complex, viewed from the same pose mirrored across X,
+  gives the exact mirror image of that picture, with the docks on the left,
+  so the old copy was the mirror image and the new import is not. The map's
+  `sign_loadingbay` mapmodel (source [760, 424, 563], now [-31, 30.4, 11]) is
+  at the dock wall. Limits: the screenshot's own pose isn't known, so this
+  compares layout, not pixels; imported surfaces are neutral, models aren't
+  imported and the sign's text isn't geometry. My reasoning that the engine's
+  axes are left-handed (a comment in Sauerbraten's `rendergl.cpp`, as I
+  remember it) wasn't checked against the source here; the screenshot is the
+  evidence. The pictures are `.local/o3/cap/b2.png` (new) and
+  `old-b2-mirrored-pose.png` in the worktree, not tracked.
+- **The root.** The root is the smallest power-of-two cube holding the bounds
+  among three candidates: one on the source cube's own grid at the root's
+  size; the source cube's ancestors, placed as the bounds need; and, when
+  bounds reach past the source cube on both sides of a grid line (a centre
+  off whole metres), a smaller cube whose origin steps down on the grid of the
+  largest leaf. A whole import at its default centre has the source cube as
+  its root. Leaves off the root's grid or larger than it (a crop) become the
+  part of themselves inside each root node, a shaped one as a `Piece` of its
+  source. An entity that would take the bounds past 8,192 m, or the root past
+  8,192 m where the map itself fits, is left out and listed in the report's
+  `entities_omitted_beyond_world` (none of the 23 maps has one; ralith and
+  ralith1 each still list their one orphan teleport destination under I1's
+  `entities_omitted_out_of_range`).
+- **Crop.** A crop's edges are whole metres, and the tree cuts a big leaf only
+  where its grid allows, so an edge off the one-metre grid costs leaves down to
+  an eighth of a metre: nub1 cropped around its spawn made 713,983 regions
+  (past the 64 MiB file limit; the old importer made 42,132). So a crop moves
+  its centre to the nearest whole metre, at most half a metre, and says so in
+  the report's notes (`center_source_xyz` gives the centre used). With it nub1
+  cropped around its spawn is 75,003 leaves and 5.8 MB, the_cube1m 32,524
+  leaves (old: 8,319 regions) and complex 45,464 leaves, 37,586 written (old: 37,188 regions). This
+  moves today's placement for a cropped import with a centre off the metre
+  grid; whole imports are unaffected. Decide if you'd rather keep the exact
+  centre and refuse such crops.
+- **Materials.** Every leaf keeps its full 16-bit value in the tree, including
+  empty leaves and leaves inside solid geometry; the file keeps water and
+  glass as boxes from the tree's leaves, without variants or flags. A skipped
+  unsupported leaf in water keeps its water. The report's counts are as they
+  were (`unsupported_volume_material_leaves`, `material_flags_not_imported`,
+  `volume_variants_not_imported`, `unmapped_texture_slot_faces`, and the
+  inventory's raw slots). A zero-volume shape is still refused or, with
+  `--skip-unsupported`, omitted and listed: 23 sheets in each of testcube,
+  the_cube, the_cube1m and thecubesunlit, none elsewhere.
+- **Level-of-detail nodes.** The reader takes a node's children and ignores
+  its own shape. Their own material does differ from what is below them: of
+  83,679 nodes in the archive, 1,932 carry a material of their own, and 23,004
+  have some leaf below with another material than theirs (counts per map in the
+  table below). In the first eight examples each report keeps, the node is
+  air over water, glass or lava (cube4, nub1, ralith, ralith1, tubes), or
+  water over a mix of air and water (tubes6). The importer follows the leaves,
+  as the game's own material lookups do: they descend to the leaf at a point
+  (`lookupmaterial` in Sauerbraten's source, from memory, not checked here).
+  Nothing in the maps' look has been compared.
+- **Triangular faces' diagonals.** The tree treats a triangular face's diagonal as
+  meaningful, though both choices draw the same triangle (the canonical form's
+  known gap, with O2's remip). Old imports lost the side diagonals of
+  height-field leaves through `Cell`, so the importer gives a shape whose top
+  is a height field the diagonals `Cell::as_shape` gives, mirrored. That keeps
+  digests equal to the old copies reflected and can go when the canonical
+  form normalizes triangular faces.
+- **Validation.** The importer no longer loads its own file again, which cost
+  300 ms on megacube. It checks the boxes against the format's limits, and the
+  builder checks the tree. The comparison tool and the tests load the files.
+  In review the design lead added a check that the written pieces stay within
+  the server's 786,432-piece limit, which the old 400,000-region cap used to
+  imply, so the importer still refuses a world the server wouldn't open.
+- **Library acceptance,** on worktree copies of the originals and of each
+  library world (deleted afterwards), re-imported with the stock options (the
+  four recovered copies with `--skip-unsupported`; ralith, ralith1 and ralith2
+  read as OCTA 27 directly), loaded as the server loads them, the old copy
+  reflected onto the new one's root: **all 22 library maps equal in digest,
+  objects (bit for bit, X negated) and bounds**: complex, cube4, megacube,
+  megacube1, megacube2, megacube3, nub, ralith, ralith1, ralith2, temp,
+  test_weapon, testcube (recovered), the_cube (recovered), the_cube1m
+  (recovered), thecubesunlit (recovered), tubes1 to tubes6. nub1 isn't in the
+  library. Off-grid centres: `--center spawn` on complex, nub1 and cube4, against
+  the old binary's output, are equal reflected too. The design lead redoes the
+  swap with `compare_reflected`; the options the library needs are those
+  above.
+- **Import times and memory** (best of three, release, `/usr/bin/time -l`,
+  including reading, writing the file and the report; the old importer is
+  main's at `208f63f`):
+
+  | Map | Old time, memory, file | New time, memory, file |
+  | --- | --- | --- |
+  | complex | 0.14 s, 23 MiB, 6.1 MB | 0.09 s, 19 MiB, 4.4 MB |
+  | cube4 | 0.11 s, 53 MiB, 15.0 MB | 0.11 s, 49 MiB, 9.8 MB |
+  | megacube | 0.22 s, 94 MiB, 18.8 MB | 0.17 s, 89 MiB, 11.0 MB |
+  | nub | 0.43 s, 114 MiB, 42.6 MB | 0.31 s, 132 MiB, 35.1 MB |
+  | nub1 | 0.48 s, 178 MiB, 62.2 MB | 0.37 s, 152 MiB, 53.5 MB |
+  | ralith | 0.06 s, 66 MiB, 15.8 MB | 0.05 s, 57 MiB, 4.6 MB |
+  | temp | 0.14 s, 66 MiB, 17.9 MB | 0.10 s, 59 MiB, 10.5 MB |
+  | the_cube1m (recovered) | 0.57 s, 121 MiB, 44.9 MB | 0.44 s, 139 MiB, 30.5 MB |
+  | tubes1 | 0.30 s, 135 MiB, 37.5 MB | 0.26 s, 120 MiB, 25.2 MB |
+
+  The other maps are in between: no import is slower (cube4 and test_weapon
+  tie), and every file is 14% to 71% smaller except test_weapon's, which grew
+  by 165 bytes. Peak memory is up to 18 MiB higher on nub and the four 8 km
+  Cube maps (the_cube1m 121 to 139 MiB) and lower on the rest. nub1's
+  result is 434,233 source leaves, 155 lights, 1,549 water and glass boxes
+  (the old importer's 1,552: merged leaves join a few boxes the other way)
+  and 411,560 written geometry leaves (325,361 regions and 86,199 cells), as
+  against 434,233 regions. The standalone server opens the re-imports of nub1,
+  the_cube1m and complex: nub1 in 0.73 s from launch to the first `/health`
+  answer, 164 MiB and 511,155 leaves (374,236 full, 37,128 shaped, 99,791
+  water or glass); the_cube1m in 0.55 s, 104 MiB and 339,113 leaves, the
+  numbers O1a recorded for the library's copies.
+- **Leaf counts** (source leaves are the file's non-empty leaves; the tree's
+  count includes leaves that hold only a material, water and glass among them,
+  and merges eight equal siblings, so it can be higher or lower; the written
+  count is what the file holds):
+
+  | Map | Root (m) | Source | Tree | Full | Shaped | Pieces | Material only | Written | Boxes |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | complex | 128 | 37,927 | 35,018 | 12,838 | 14,302 | 0 | 7,878 | 27,140 | 0 |
+  | cube4 | 4,096 | 108,062 | 102,284 | 64,363 | 12,073 | 0 | 25,848 | 76,436 | 713 |
+  | megacube | 8,192 | 133,946 | 200,661 | 84,876 | 18,704 | 0 | 97,081 | 103,580 | 1,153 |
+  | megacube1 | 8,192 | 141,719 | 205,166 | 89,852 | 18,505 | 0 | 96,809 | 108,357 | 1,137 |
+  | megacube2 | 8,192 | 150,282 | 206,604 | 92,646 | 17,722 | 0 | 96,236 | 110,368 | 1,002 |
+  | megacube3 | 8,192 | 133,893 | 200,339 | 84,784 | 18,750 | 0 | 96,805 | 103,534 | 1,165 |
+  | nub | 2,048 | 284,824 | 348,375 | 225,408 | 41,804 | 0 | 81,163 | 267,212 | 2,323 |
+  | nub1 | 2,048 | 434,233 | 511,889 | 374,432 | 37,128 | 0 | 100,329 | 411,560 | 1,549 |
+  | ralith | 2,048 | 114,753 | 61,365 | 42,158 | 866 | 0 | 18,341 | 43,024 | 234 |
+  | ralith1 | 2,048 | 41,958 | 56,986 | 31,840 | 3,552 | 0 | 21,594 | 35,392 | 294 |
+  | ralith2 | 8,192 | 43,937 | 71,728 | 35,702 | 4,798 | 0 | 31,228 | 40,500 | 51 |
+  | temp | 8,192 | 133,691 | 151,916 | 107,362 | 10,026 | 0 | 34,528 | 117,388 | 110 |
+  | test_weapon | 128 | 108 | 120 | 88 | 20 | 0 | 12 | 108 | 0 |
+  | testcube | 8,192 | 303,379 | 338,709 | 167,101 | 58,982 | 0 | 112,626 | 226,083 | 4,204 |
+  | the_cube | 8,192 | 306,047 | 339,457 | 167,604 | 58,879 | 0 | 112,974 | 226,483 | 4,212 |
+  | the_cube1m | 8,192 | 306,117 | 339,457 | 167,604 | 58,879 | 0 | 112,974 | 226,483 | 4,212 |
+  | thecubesunlit | 8,192 | 306,047 | 339,457 | 167,604 | 58,879 | 0 | 112,974 | 226,483 | 4,212 |
+  | tubes1 | 4,096 | 269,084 | 272,307 | 163,416 | 29,368 | 0 | 79,523 | 192,784 | 1,709 |
+  | tubes2 | 4,096 | 216,532 | 237,372 | 128,239 | 29,598 | 0 | 79,535 | 157,837 | 1,835 |
+  | tubes3 | 4,096 | 210,100 | 199,939 | 125,766 | 28,047 | 0 | 46,126 | 153,813 | 1,693 |
+  | tubes4 | 4,096 | 214,188 | 203,154 | 127,988 | 28,240 | 0 | 46,926 | 156,228 | 1,695 |
+  | tubes5 | 4,096 | 195,679 | 185,971 | 117,038 | 26,106 | 0 | 42,827 | 143,144 | 1,576 |
+  | tubes6 | 4,096 | 209,747 | 191,940 | 123,081 | 26,032 | 0 | 42,827 | 149,113 | 1,587 |
+
+  No import has a piece: every source leaf is on the root's grid.
+- **Inert materials, raw slots and level-of-detail nodes** (the report's
+  counts; flag values are Sauerbraten's version 33 bits, 32, 64 and 96 for
+  the clip family, 256 for death, 1,024 for alpha; lava is volume value 8, and
+  no map has a variant of water or glass or glass without a clip flag):
+
+  | Map | Lava leaves | Leaves with flags | Flag values (leaves) | Raw slots (faces, distinct) | LOD nodes, own material, differing |
+  | --- | ---: | ---: | --- | --- | --- |
+  | complex | 0 | 18,374 | 32: 3,318; 64: 11,390; 1,056: 170; 1,088: 3,496 | 227,562, 159 | 0, 0, 0 |
+  | cube4 | 0 | 1,937 | 32: 96; 64: 1,841 | 648,372, 56 | 40, 0, 38 |
+  | megacube (the four) | 0 | 8,868 to 10,176 | 64: 8,148 to 9,456; 256: 720 | 803,676 to 901,692, 38–39 | 11, 11, 0 (megacube); 2, 0, 0; 3, 0, 0; 0 |
+  | nub | 137 | 764 | 32: 148; 64: 176; 256: 440 | 1,708,944, 10 | 0, 0, 0 |
+  | nub1 | 150 | 797 | 32: 148; 64: 176; 256: 473 | 2,605,398, 10 | 2,264, 100, 1,169 |
+  | ralith | 1,824 | 1,824 | 256: 1,824 | 688,518, 36 | 54,554, 164, 5,885 |
+  | ralith1 | 872 | 872 | 256: 872 | 251,748, 51 | 9,422, 64, 6,956 |
+  | ralith2 | 0 | 0 | none | 263,622, 13 | 160, 0, 0 |
+  | temp | 0 | 10 | 64: 10 | 802,146, 37 | 0, 0, 0 |
+  | test_weapon | 0 | 12 | 32: 12 | 648, 1 | 0, 0, 0 |
+  | testcube, the_cube, the_cube1m, thecubesunlit | 0 | 855 | 32: 855 | 1.82 to 1.84 million, 143 | 0, 0, 0 |
+  | tubes1 to tubes6 | 1,610 each | 3,100 to 3,243 | 32: 96; 64: 1,351 to 1,438; 256: 1,653 to 1,709 | 1.17 to 1.61 million, 105–107 | tubes1: 11,504, 15, 7,090; tubes4: 1,391, 0, 288; tubes6: 4,328, 1,578, 1,578; the others 0 |
+
+  The raw slots are all unmapped, as the importer has no default
+  `--material-map`.
+- **Checks,** all passing: `cargo fmt --all -- --check`, `cargo clippy
+  --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace
+  --locked` (the importer has 40 tests and one private), and the private tests
+  in release (`cargo test --release -p sauerteig-core --lib private_ --locked
+  -- --ignored --test-threads 1`, 3 tests) plus the importer's private test.
+  New importer tests: the mapping against the old rotation mirrored (20,000
+  random cubes); the transform is a reflection keeping north and up; the face
+  slots; the root equal to the source cube and growing for an entity; far
+  entities left out and reported; an off-metre centre keeps every leaf on the
+  grid; full material values in the tree and water and glass in the file; a
+  skipped leaf in water keeps its water; a crop with leaves larger than its
+  root; a crop's centre moves to a whole metre; a round trip through the file
+  keeps the tree; the slot table; level-of-detail nodes; and `reflect_x`
+  restoring a tree when applied twice.
+- **Not observed:** any import in the Sauerteig app (the in-app import path
+  copies the converted JSON, so it is unchanged); the maintainer's look at the
+  re-imported maps; Windows and Linux; maps other than the 23 in the archive.
+- **Left as is:** shared-sandbox 2e's compact saves keep inert materials and
+  raw slots in the file, and the library is imported again after it (see
+  above); original textures, models and lights wait on the world format and
+  renderer; the tree's gap over triangular faces' diagonals stays O2's; the
+  importer still loads whole maps into one `Vec` of leaves before building,
+  which `nub1` and the 8 km maps do within 210 MiB. The `inspect` command is
+  unchanged.
 
 ## Evidence
 

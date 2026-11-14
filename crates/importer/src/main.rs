@@ -75,13 +75,20 @@ fn run() -> Result<(), String> {
             };
             let (world, report) = convert(&map, &options)?;
             eprintln!(
-                "Imported {} compact regions, {} coarse cells, {} detailed roots, {} material \
-                 volumes ({} water / {} glass source leaves), {} lights, {} spawns. \
+                "Imported an octree of {} leaves ({} full, {} shaped, {} pieces, {} holding only a \
+                 material; root {} m), written as {} regions, {} cells and {} material volumes \
+                 ({} water / {} glass source leaves), {} lights, {} spawns. \
                  Cropped {} geometry / {} volume leaves; clipped {} geometry / {} volume leaves. \
+                 Entities left out: {} without a position, {} beyond the world. \
                  Unsupported geometry omissions: {}.",
+                report.tree.leaves,
+                report.tree.full_leaves,
+                report.tree.shaped_leaves,
+                report.tree.piece_leaves,
+                report.tree.material_leaves,
+                f64::from(report.tree.root_size_eighths) / f64::from(FINE_UNITS),
                 report.imported_regions,
                 report.imported_coarse_cells,
-                report.imported_detailed_roots,
                 report.imported_volume_boxes,
                 report.imported_water_leaves,
                 report.imported_glass_leaves,
@@ -91,6 +98,8 @@ fn run() -> Result<(), String> {
                 report.volume_leaves_outside_region,
                 report.leaves_clipped_at_region,
                 report.volume_leaves_clipped_at_region,
+                report.entities_omitted_out_of_range.len(),
+                report.entities_omitted_beyond_world.len(),
                 report.unsupported_leaves_omitted.len(),
             );
             (
@@ -162,7 +171,8 @@ fn help() {
 
 Conversion options:
   --units-per-metre N     Power of two, default 8 (never automatic shrinking)
-  --center X,Y,Z|spawn    Legacy Z-up point placed at [0,24,0] in Sauerteig
+  --center X,Y,Z|spawn    Legacy Z-up point placed at [0,24,0] in Sauerteig; the map is
+                          mirrored into Sauerteig's right-handed axes
   --crop                 Explicitly retain only the 128×48×128m region
   --skip-unsupported     Explicitly omit unsupported degenerate cube shapes
   --material-map FILE    JSON object mapping legacy slot IDs to material IDs
@@ -172,8 +182,9 @@ Shared options:
   --cfg FILE             Inspect literal references only; never execute scripts
 
 Supported: OCTA versions 27 and 29–33 (28 is refused). Entities with no usable
-position are left out and listed in the report. Originals and existing outputs are never overwritten.
-Without --crop, the complete original-scale world is retained in compact regions.
+position, and entities beyond what the world can hold, are left out and listed in
+the report. Originals and existing outputs are never overwritten.
+Without --crop, the complete original-scale world is retained as one octree.
 World bounds and authored-size limits are validated. Missing textures use neutral material 0.
 Models, gameplay entities, volumes and baked rendering need separate adapters.
 After import, start a separate server with --world WORLD.json to view the result."

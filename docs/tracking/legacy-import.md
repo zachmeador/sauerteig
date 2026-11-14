@@ -22,6 +22,11 @@ the library came through a hand-made shim on 2026-11-11 and convert identically.
 nub1, the one archive map not in the library, converts since octree O1a removed
 the 400,000-region cap, and can now be imported into it.
 
+Imports are built straight into the world's octree: each source leaf is a
+leaf of it with its full material value, and the world file keeps the water and
+glass. The library's copies predate the importer's handedness fix and are mirror
+images of the maps until they are re-imported.
+
 The archive copies use fallback material. Source texture/model references are not
 loaded assets. Original light properties and spawn facing are not applied. These
 copies remain partial recoveries, not restored maps. Water/glass now render and
@@ -48,8 +53,12 @@ Sauerbraten installation without redistributing them.
 - [ ] Offer an OGZ import UI with a preview of omissions and unresolved media
   before creating a saved copy.
 - [ ] Fix mirrored imports: the 2026-11-11 bug audit found imported maps
-  mirrored. [Octree](octree.md) O3 fixes it while it rewrites the importer, and
-  the library is then re-imported from the originals.
+  mirrored. [Octree](octree.md) O3 has the importer reflect (written 2026-11-14,
+  not yet merged): a re-import of each of the 22 library maps equals its
+  current copy reflected, and complex matches the original game's screenshot,
+  which the old copy mirrors. Left: the maintainer's look at re-imported
+  maps, and the library re-imported from the originals, with the same options
+  as before (`--skip-unsupported` for the four recovered maps).
 
 ## I1: the importer reads OCTA version 27
 

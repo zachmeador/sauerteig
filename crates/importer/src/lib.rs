@@ -1,9 +1,11 @@
 //! Non-executing, bounded reader for Cube 2 OCTA map versions 27 and 29 through 33.
 //! Source format references are recorded in README.md; no engine code is linked.
 mod convert;
+pub mod reflect;
 mod transform;
 pub use convert::{
-    convert, GeometryIssue, ImportOptions, ImportReport, ImportedWorld, OmittedEntity,
+    convert, convert_to_tree, GeometryIssue, ImportOptions, ImportReport, ImportedWorld,
+    OmittedEntity, TreeReport,
 };
 
 use flate2::{bufread::DeflateDecoder, read::GzDecoder, Crc};
@@ -89,13 +91,38 @@ impl Cube {
     /// Translate the older byte layout into the version-33 material bit fields.
     /// Volume (bits 2–4), clip (5–7), and flags (8–15) remain independent.
     pub fn normalized_material(&self, version: u32) -> u16 {
-        let material = self.volume_material;
-        if version <= 32 {
-            ((material & 7) << 2) | (((material >> 3) & 3) << 5) | (((material >> 5) & 7) << 8)
-        } else {
-            material
-        }
+        normalize_material(version, self.volume_material)
     }
+}
+
+fn normalize_material(version: u32, material: u16) -> u16 {
+    if version <= 32 {
+        ((material & 7) << 2) | (((material >> 3) & 3) << 5) | (((material >> 5) & 7) << 8)
+    } else {
+        material
+    }
+}
+
+/// A level-of-detail node: a cube that has its own shape and material and
+/// also children. The importer reads the children and ignores the node's own
+/// shape; this records whether its material ever disagrees with theirs.
+#[derive(Clone, Debug, Serialize)]
+pub struct LodExample {
+    pub origin: [i32; 3],
+    pub size: u32,
+    /// Normalized material values (version 33 layout).
+    pub own_material: u16,
+    pub leaf_materials: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LodNodes {
+    pub nodes: usize,
+    pub with_own_material: usize,
+    /// Nodes where some leaf below holds another material than the node.
+    pub material_differs_from_leaves: usize,
+    /// The first few nodes where it differs.
+    pub examples: Vec<LodExample>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Map {
@@ -104,6 +131,7 @@ pub struct Map {
     pub entities: Vec<Entity>,
     pub vslots: Vec<VSlot>,
     pub cubes: Vec<Cube>,
+    pub lod: LodNodes,
     pub decompressed_bytes: usize,
     pub octree_end_offset: usize,
     pub nodes: usize,
@@ -118,6 +146,7 @@ pub struct Inventory {
     pub octree_end_offset: usize,
     pub render_data_bytes_not_imported: usize,
     pub octree_nodes: usize,
+    pub lod_nodes: LodNodes,
     pub nonempty_leaves: usize,
     pub deformed_leaves: usize,
     pub occupied_cube_bounds: Option<[[i32; 3]; 2]>,
@@ -140,6 +169,7 @@ impl Map {
             octree_end_offset: self.octree_end_offset,
             render_data_bytes_not_imported: self.decompressed_bytes - self.octree_end_offset,
             octree_nodes: self.nodes,
+            lod_nodes: self.lod.clone(),
             nonempty_leaves: 0,
             deformed_leaves: 0,
             occupied_cube_bounds: None,
@@ -496,6 +526,7 @@ pub fn read_octa(data: &[u8]) -> Result<Map, String> {
     }
     let mut cubes = Vec::new();
     let mut nodes = 0;
+    let mut lod = LodNodes::default();
     read_children(
         &mut r,
         version,
@@ -503,6 +534,7 @@ pub fn read_octa(data: &[u8]) -> Result<Map, String> {
         header.world_size / 2,
         &mut cubes,
         &mut nodes,
+        &mut lod,
     )?;
     Ok(Map {
         header,
@@ -510,6 +542,7 @@ pub fn read_octa(data: &[u8]) -> Result<Map, String> {
         entities,
         vslots,
         cubes,
+        lod,
         decompressed_bytes: data.len(),
         octree_end_offset: r.pos,
         nodes,
@@ -523,6 +556,7 @@ fn read_children(
     size: u32,
     cubes: &mut Vec<Cube>,
     nodes: &mut usize,
+    lod: &mut LodNodes,
 ) -> Result<(), String> {
     if size == 0 {
         return Err("octree subdivides below one Cube unit".into());
@@ -537,7 +571,7 @@ fn read_children(
         let flags = r.byte()?;
         let kind = flags & 7;
         if kind == 0 {
-            read_children(r, version, origin, size / 2, cubes, nodes)?;
+            read_children(r, version, origin, size / 2, cubes, nodes, lod)?;
             continue;
         }
         if !(1..=4).contains(&kind) {
@@ -646,7 +680,28 @@ fn read_children(
             }
         }
         if kind == 4 {
-            read_children(r, version, origin, size / 2, cubes, nodes)?;
+            let first = cubes.len();
+            read_children(r, version, origin, size / 2, cubes, nodes, lod)?;
+            let own = normalize_material(version, volume_material);
+            lod.nodes += 1;
+            lod.with_own_material += usize::from(own != 0);
+            let mut below: Vec<u16> = cubes[first..]
+                .iter()
+                .map(|cube| cube.normalized_material(version))
+                .collect();
+            below.sort_unstable();
+            below.dedup();
+            if below.iter().any(|&material| material != own) {
+                lod.material_differs_from_leaves += 1;
+                if lod.examples.len() < 8 {
+                    lod.examples.push(LodExample {
+                        origin,
+                        size,
+                        own_material: own,
+                        leaf_materials: below,
+                    });
+                }
+            }
         } else {
             cubes.push(Cube {
                 origin,
@@ -947,6 +1002,42 @@ mod tests {
         }
     }
 
+    fn lod_fixture(own: u16, children: [u16; 8]) -> Vec<u8> {
+        let mut data = fixture(33)[..51].to_vec();
+        let leaf = |data: &mut Vec<u8>, flags: u8, material: u16| {
+            data.push(flags | if material != 0 { 0x40 } else { 0 });
+            for _ in 0..6 {
+                data.extend(7u16.to_le_bytes());
+            }
+            if material != 0 {
+                data.extend(material.to_le_bytes());
+            }
+        };
+        leaf(&mut data, 4, own);
+        for material in children {
+            leaf(&mut data, 1, material);
+        }
+        for _ in 1..8 {
+            leaf(&mut data, 1, 0);
+        }
+        data
+    }
+    #[test]
+    fn level_of_detail_nodes_report_whether_their_material_matches_their_leaves() {
+        let map = read_octa(&lod_fixture(4, [4; 8])).unwrap();
+        assert_eq!(map.cubes.len(), 15);
+        assert_eq!(map.lod.nodes, 1);
+        assert_eq!(map.lod.with_own_material, 1);
+        assert_eq!(map.lod.material_differs_from_leaves, 0);
+        let map = read_octa(&lod_fixture(4, [4, 4, 4, 0, 4, 4, 4, 4])).unwrap();
+        assert_eq!(map.lod.material_differs_from_leaves, 1);
+        assert_eq!(map.lod.examples[0].own_material, 4);
+        assert_eq!(map.lod.examples[0].leaf_materials, [0, 4]);
+        assert_eq!(map.inventory().lod_nodes.nodes, 1);
+        let map = read_octa(&lod_fixture(0, [0, 0, 0, 0, 0, 0, 12, 0])).unwrap();
+        assert_eq!(map.lod.with_own_material, 0);
+        assert_eq!(map.lod.material_differs_from_leaves, 1);
+    }
     #[test]
     fn reads_and_normalizes_materials_in_every_supported_version() {
         for version in 29..=33 {
