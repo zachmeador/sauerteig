@@ -29,8 +29,10 @@ other tracks, as linked.
 7. **Object editing is limited.** It lacks 3D drag, group selection,
    wheel and number-key attributes, and select-in-box. Most of this comes with
    object properties in the [world format](world-format.md).
-8. **Missing volume kinds and no material display.** These come with the
-   [world format](world-format.md).
+8. **Missing volume kinds and no material display.** The
+   [octree](octree.md) keeps Sauerbraten's lava, clip, noclip and death
+   materials on every cube, in saves from shared-sandbox 2e on; switching them
+   on comes with the [world format](world-format.md).
 9. **Edits wait for the server one at a time.** This is
    [shared-sandbox](shared-sandbox.md) stage 3.
 10. **Smaller differences:**
@@ -38,6 +40,11 @@ other tracks, as linked.
     - there is no pass-through aiming;
     - undo drops the selection;
     - V pastes on press instead of on release.
+
+11. **Edits stop at 1 m cubes.** The grid ends at 8 m, and pushing a corner
+    at a large grid moves the corners of many 1 m tiles instead of shaping one
+    cube. [Octree](octree.md) O2 fixes this, and the editor-feel stages after
+    stage 1 wait for it, since O2 rewrites how the editor plans edits.
 
 Not a gap: hover-only extrusion builds a staircase at oblique angles in
 Sauerbraten too. In both editors, pillars grow from an explicit selection.
@@ -63,7 +70,8 @@ State: merged on 2026-10-25. Play-testing in the app is pending.
   mode.
 
 Gaps: fill and Delete share every edit's size limits (16,384 roots, 65,536
-fragments). Extruding also reads the layer behind.
+fragments) until octree O2 removes them. Extruding also reads the layer
+behind.
 
 ## Evidence
 

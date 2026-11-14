@@ -13,7 +13,7 @@ use axum::{
         ConnectInfo, State,
     },
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -33,7 +33,6 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     time::MissedTickBehavior,
 };
-use tower_http::services::ServeDir;
 
 mod transport;
 use transport::{Progress, ProgressListener};
@@ -63,6 +62,9 @@ struct App {
     state: watch::Sender<RunState>,
 }
 
+async fn root() -> &'static str {
+    "Sauerteig server is running. Join it from the Sauerteig desktop app; game connections use /ws.\n"
+}
 async fn health(State(app): State<Arc<App>>) -> Json<Health> {
     Json(app.health.borrow().clone())
 }
@@ -647,19 +649,10 @@ async fn serve_inner(
         state,
     });
     let router = Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
-        .route("/ws", get(upgrade));
-    let router = if app.config.web_dir.join("index.html").is_file() {
-        router.fallback_service(ServeDir::new(&app.config.web_dir))
-    } else {
-        router.fallback(|| async {
-            Html(concat!(
-                "<!doctype html><title>Sauerteig server</title><h1>Sauerteig server is running</h1>",
-                "<p>The web client has not been built. Build it with the repository's web build ",
-                "script, then restart the server. Native clients can connect to /ws now.</p>"
-            ))
-        })
-    }.with_state(app.clone());
+        .route("/ws", get(upgrade))
+        .with_state(app.clone());
     let edit_task = tokio::spawn(edit_worker(app.clone(), jobs, retired));
     let save_task = tokio::spawn(save_worker(app.clone()));
     let log_task = tokio::spawn(log_worker(app.clone()));

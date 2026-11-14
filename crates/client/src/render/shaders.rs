@@ -108,9 +108,7 @@ pub(super) fn trusted(device: &wgpu::Device, label: &str, source: String) -> wgp
     // lights), and the clustered loop over the set bits of a mask word clears its
     // lowest bit each time round, so it ends within 32 iterations, 256 across a
     // cluster's 8 words. `bounds_checks` stays true, so out-of-range reads and
-    // writes are still contained. The WebGPU backend ignores these options and
-    // compiles the shader as `create_shader_module` would; the browser applies
-    // its own limits.
+    // writes are still contained.
     unsafe {
         device.create_shader_module_trusted(
             wgpu::ShaderModuleDescriptor {

@@ -54,7 +54,6 @@ const SHOT_DISTANCE: f32 = 128.0;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub world_path: PathBuf,
-    pub web_dir: PathBuf,
     pub editing_allowed: bool,
 }
 
@@ -62,7 +61,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             world_path: ".local/world.json".into(),
-            web_dir: "web/dist".into(),
             editing_allowed: true,
         }
     }

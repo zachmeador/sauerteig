@@ -1,6 +1,6 @@
 //! Short, original synthesized cues. Audio failure never prevents play.
 
-use web_time::Instant;
+use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub enum Cue {
@@ -68,11 +68,6 @@ impl Audio {
         }
     }
 
-    /// Call directly from a user click so browser autoplay rules permit audio.
-    pub fn unlock(&mut self) {
-        self.backend.unlock();
-    }
-
     pub fn play(&mut self, cue: Cue) {
         let now = Instant::now();
         let previous = &mut self.last_play[cue as usize];
@@ -85,7 +80,6 @@ impl Audio {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{Cue, Wave};
     use rodio::{buffer::SamplesBuffer, OutputStream, OutputStreamHandle};
@@ -114,8 +108,6 @@ mod backend {
                 });
             Self { output }
         }
-
-        pub(super) fn unlock(&mut self) {}
 
         pub(super) fn play(&mut self, cue: Cue) {
             if let Some(output) = &self.output {
@@ -148,120 +140,5 @@ mod backend {
             }
         }
         SamplesBuffer::new(1, SAMPLE_RATE, samples)
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-mod backend {
-    use super::{Cue, Tone, Wave};
-    use wasm_bindgen::JsValue;
-    use wasm_bindgen_futures::{spawn_local, JsFuture};
-    use web_sys::{AudioContext, AudioContextState, GainNode, OscillatorNode, OscillatorType};
-
-    struct Voice {
-        oscillator: OscillatorNode,
-        gain: GainNode,
-        ends: f64,
-    }
-
-    impl Drop for Voice {
-        fn drop(&mut self) {
-            let _ = self.oscillator.stop();
-            let _ = self.oscillator.disconnect();
-            let _ = self.gain.disconnect();
-        }
-    }
-
-    pub(super) struct AudioBackend {
-        context: Option<AudioContext>,
-        voices: Vec<Voice>,
-    }
-
-    impl AudioBackend {
-        pub(super) fn new() -> Self {
-            Self {
-                context: None,
-                voices: Vec::new(),
-            }
-        }
-
-        pub(super) fn unlock(&mut self) {
-            if self.context.is_none() {
-                self.context = AudioContext::new().ok();
-            }
-            if let Some(context) = &self.context {
-                if context.state() == AudioContextState::Suspended {
-                    if let Ok(resumed) = context.resume() {
-                        // A denied resume is an optional-audio failure, not an
-                        // unhandled promise rejection for the game bootstrap.
-                        spawn_local(async move {
-                            let _ = JsFuture::from(resumed).await;
-                        });
-                    }
-                }
-            }
-        }
-
-        pub(super) fn play(&mut self, cue: Cue) {
-            let Some(context) = &self.context else {
-                return;
-            };
-            if context.state() != AudioContextState::Running {
-                return;
-            }
-            let now = context.current_time();
-            self.voices.retain(|voice| voice.ends > now);
-            for tone in cue.tones() {
-                // Keep graph references bounded even during rapid edits/hits.
-                if self.voices.len() >= 16 {
-                    self.voices.remove(0);
-                }
-                if let Ok(voice) = schedule(context, tone, now) {
-                    self.voices.push(voice);
-                }
-            }
-        }
-    }
-
-    impl Drop for AudioBackend {
-        fn drop(&mut self) {
-            self.voices.clear();
-            if let Some(context) = self.context.take() {
-                if let Ok(closed) = context.close() {
-                    spawn_local(async move {
-                        let _ = JsFuture::from(closed).await;
-                    });
-                }
-            }
-        }
-    }
-
-    fn schedule(context: &AudioContext, tone: Tone, now: f64) -> Result<Voice, JsValue> {
-        let oscillator = context.create_oscillator()?;
-        let gain = context.create_gain()?;
-        let ends = now + tone.seconds as f64;
-        // Construct ownership before connecting, so every error path disconnects.
-        let voice = Voice {
-            oscillator,
-            gain,
-            ends,
-        };
-        voice.oscillator.set_type(match tone.wave {
-            Wave::Sine => OscillatorType::Sine,
-            Wave::Triangle => OscillatorType::Triangle,
-        });
-        let frequency = voice.oscillator.frequency();
-        frequency.set_value_at_time(tone.start_hz, now)?;
-        frequency.exponential_ramp_to_value_at_time(tone.end_hz, ends)?;
-        let envelope = voice.gain.gain();
-        envelope.set_value_at_time(0.0, now)?;
-        envelope.linear_ramp_to_value_at_time(tone.level, now + 0.002)?;
-        envelope.exponential_ramp_to_value_at_time(0.0001, ends - 0.004)?;
-        envelope.linear_ramp_to_value_at_time(0.0, ends)?;
-        voice.oscillator.connect_with_audio_node(&voice.gain)?;
-        voice.gain.connect_with_audio_node(&context.destination())?;
-        voice.oscillator.start_with_when(now)?;
-        voice.oscillator.stop_with_when(ends)?;
-        Ok(voice)
     }
 }

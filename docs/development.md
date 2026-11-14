@@ -4,12 +4,11 @@
 
 - `crates/core`: editable geometry, chunk meshes, ray queries, collision,
   player movement, and the shared protocol. No graphics dependencies.
-- `crates/client`: native and WebAssembly clients using wgpu, winit, and egui.
-  Editing, local blueprints, rendering, and client prediction live here.
+- `crates/client`: the desktop client, using wgpu, winit, and egui. Editing,
+  local blueprints, rendering, and client prediction live here.
 - `crates/server`: authoritative room simulation, edit validation and history,
-  WebSocket connections, world persistence, and browser file serving.
+  WebSocket connections, and world persistence.
 - `crates/importer`: bounded legacy OGZ parser and command-line converter.
-- `web`: browser loading and error UI, copied into `web/dist` during a build.
 - `assets`: cooked textures and meshes with source/license manifests.
 
 Run commands from the repository root. Sourcing `scripts/env.sh` selects a
@@ -33,25 +32,17 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --locked -p sauerteig-server -p sauerteig-client
-./scripts/build-web.sh
 ```
 
 Install the checks once with `rustup component add rustfmt clippy`.
 
-The browser build requires `wasm32-unknown-unknown` and `wasm-bindgen-cli`
-0.2.100, matching the pinned Rust dependency. It embeds the cooked assets and
-copies licenses and provenance manifests into `web/dist`. Rebuild after changes
-to client code, assets, or the browser shell. Restart the server if the browser
-files did not exist when it started.
+On macOS, `./scripts/build-macos-app.sh` packages an unsigned development app in
+`.local/Sauerteig.app`. Local hosting is linked into the app. The script honors
+`CARGO_TARGET_DIR`.
 
-On macOS, `./scripts/build-macos-app.sh` builds the browser client and packages an
-unsigned development app in `.local/Sauerteig.app`. Local hosting is linked into
-the native app; browser files are bundled in its Resources directory. Both build
-scripts honor `CARGO_TARGET_DIR`.
-
-GitHub Actions checks formatting and Clippy, tests the workspace, builds native and browser
-clients on Linux, and uploads the browser files. Integration tests bind ephemeral
-loopback ports and use temporary world files.
+GitHub Actions checks formatting and Clippy, tests the workspace, and builds the
+server and native client on Linux. Integration tests bind ephemeral loopback
+ports and use temporary world files.
 
 ## Hosting and saves
 
@@ -76,7 +67,6 @@ The standalone server remains available for dedicated hosting:
 | --- | --- | --- |
 | `--bind IP:port` | `127.0.0.1:3000` | `SAUERTEIG_BIND` |
 | `--world PATH` | `.local/world.json` | `SAUERTEIG_WORLD` |
-| `--web-dir DIR` | `web/dist` | `SAUERTEIG_WEB_DIR` |
 | `--no-edit` | Editing allowed | — |
 
 World changes save after a short delay, on explicit save, and on graceful
@@ -91,18 +81,21 @@ clips, canonicalizes, and compiles replacements on a structurally shared world
 view. The simulation checks current conflicts, budgets, and fighter overlap
 before committing. Movement frames continue while that player's edit prepares;
 mode changes remain barriers and save/sync requests wait for earlier edits.
-Deferred commands are bounded to 32 MiB per peer. Save and join workers expand and serialize cheap authored
-snapshots. Retired edit geometry, and the undo history of a peer that leaves, is
-also freed on the worker. Commands a client sent before its socket closed still
-apply, in order, even without a `Sync`; only their results have nowhere to go.
+Deferred commands are bounded to 32 MiB per peer. Save and join workers expand
+and serialize cheap authored snapshots. Retired edit geometry, and the undo
+history of a peer that leaves, is also freed on the worker. Commands a client
+sent before its socket closed still apply, in order, even without a `Sync`;
+only their results have nowhere to go.
 
 Reliable peer queues have a conservative 128 MiB payload budget, including the
 packet being written. Before an edit commits, every queue must have room for the
 exact patch it will broadcast, sized by the same function as the packet, plus
 64 KiB for the result that follows. Otherwise the commit waits in the edit
 worker, which retries for two seconds and then answers that edit with a "busy"
-error and moves on, so one lagging peer never holds up the others' edits. The
-simulation continues and the joining peer keeps its revision backlog.
+error and moves on. The room has one edit worker, so while a lagging peer's
+queue lacks room, every builder's edits queue behind the waiting one, and each
+that still doesn't fit after two seconds fails as busy. The simulation continues
+and the joining peer keeps its revision backlog.
 Movement snapshots are replaceable. A world transfer times out only after 30
 seconds without a successful TCP write, including transfers longer than a minute.
 Server sockets enable TCP_NODELAY. The native client's locked blocking
@@ -120,16 +113,16 @@ cargo run -p sauerteig-server -- --bind 0.0.0.0:3000 --world .local/session.json
 cargo run -p sauerteig-client -- --name Player --server ws://SERVER:3000/ws
 ```
 
-Browser WebGPU requires a secure context. Localhost works over HTTP; other hosts
-need HTTPS, with `/ws` proxied as a secure WebSocket. The browser accepts `name`
-and `server` query parameters; an alternate server URL must include `/ws`.
-Names are display labels, with no account authentication.
+Opening `http://SERVER:3000/` in a web browser shows one line saying the server
+is running, a quick way to check that the port is reachable. Game clients
+connect to `/ws`. Names are display labels, with no account authentication.
 
-Shared geometry, material volumes, and objects live in the server's JSON save. Blueprints and
-settings are client-local: IndexedDB for the browser's site origin, or the OS
-application-data folder on desktop. Remembered browser session choices use
-localStorage for that origin. On macOS the application-data folder is
-`~/Library/Application Support/Sauerteig`; `SAUERTEIG_DATA_DIR` overrides it.
+Shared geometry, material volumes, and objects live in the server's JSON save.
+Blueprints, settings, and the home screen's remembered choices are client-local,
+in the OS application-data folder: `~/Library/Application Support/Sauerteig`
+on macOS, `%LOCALAPPDATA%\Sauerteig` on Windows, and `$XDG_DATA_HOME/sauerteig`
+(by default `~/.local/share/sauerteig`) on Linux. `SAUERTEIG_DATA_DIR`
+overrides it.
 
 ## Rendering and assets
 
@@ -171,27 +164,32 @@ and dynamic or no shadows exist in the renderer, but nothing places them until
 object properties do. Moving actors cast shadows from the eight most important
 shadowed lights, whatever their own mode.
 
-Each frame the lights in view, at most 256 by importance, are culled by a compute
-pass into a 16 × 9 × 24 grid of view clusters, and one shared WGSL function lights
-terrain, props, actors, and water and glass from the lights of the fragment's
-cluster: at most 16 per fragment, and 8 for water and glass, which take only
-highlights. Lights too faint to see are skipped, and weak ones filter their shadow
-with one tap instead of four. Light shadows come from a paged atlas of 1024² depth
-pages (fourteen by default, 60 MiB with the overlay page), each holding tiles of one
-size, 512², 256², or 128²: six per point light and one per spot light, sized by the
-light's projected radius with hysteresis, and shrunk for the least important lights
-so that more of them are covered; a full atlas of 128² tiles holds 149 point lights.
-A tile re-renders only when a chunk or object edit reaches its light's sphere, or
-the light changes: at most six faces a frame (twelve for three frames after a jump),
-and fewer where measured GPU time says a face costs more than a 1.5 ms budget
-allows. A new light stays off, then fades in, until its shadow has rendered. A light
-whose tiles are stale keeps using them; one that no tile can hold fades out rather
-than leak light through walls. The eight most important shadowed lights (a light
-that has them keeps them down to tenth place) also sample an overlay page that is
-redrawn every frame with the moving actors near them, in at most 15 tiles; the
-other lights cast only static shadows. Adapters without compute shaders or enough storage buffers
-use uniform buffers with CPU-built masks, 64 lights and four shadowed lights; the
-last resort is the nearest eight lights, four shadowed.
+Each frame the lights in view, at most 256 by importance, are culled by a
+compute pass into a 16 × 9 × 24 grid of view clusters, and one shared WGSL
+function lights terrain, props, actors, and water and glass from the lights of
+the fragment's cluster: at most 16 per fragment, and 8 for water and glass,
+which take only highlights. Lights too faint to see are skipped, and weak ones
+filter their shadow with one tap instead of four. Light shadows come from a
+paged atlas of 1024² depth pages (fourteen by default, 60 MiB with the overlay
+page), each holding tiles of one size, 512², 256², or 128²: six per point light
+and one per spot light, sized by the light's projected radius with hysteresis,
+and shrunk for the least important lights so that more of them are covered; a
+full atlas of 128² tiles holds 149 point lights. A tile re-renders only when a
+chunk or object edit reaches its light's sphere, or the light changes: at most
+six faces a frame (twelve for three frames after a jump), and fewer where
+measured GPU time says a face costs more than a 1.5 ms budget allows. A new
+light stays off, then fades in, until its shadow has rendered. A light whose
+tiles are stale keeps using them; one that no tile can hold fades out rather
+than leak light through walls. The eight most important shadowed lights (a
+light that has them keeps them down to tenth place) also sample an overlay page
+that is redrawn every frame with the moving actors near them, in at most 15
+tiles; the other lights cast only static shadows.
+
+The code still holds a uniform-buffer lighting path (CPU-built masks, 64
+lights, four shadowed) and a nearest-eight path (four shadowed), written for
+adapters without compute shaders or enough storage buffers. The device request
+(`Limits::default()` in `Renderer::create`) already turns such adapters away,
+so only the capture tool's `--tier` flag reaches these paths.
 
 Shaders compile without wgpu's forced loop bounding, through the one `unsafe`
 function in the workspace, `shaders::trusted` in `render/shaders.rs`. On Metal the
@@ -200,8 +198,7 @@ each iteration, which made the clustered light loop about three times slower (st
 1's sun filtering sped up as well). Every embedded loop has a bounded trip count,
 the clustered one at most 8 mask words of 32 bits that each lose a set bit per
 iteration, and runtime bounds checks stay on. Keep both true when changing a shader,
-as the function's `SAFETY` comment says. The WebGPU backend ignores the option and
-applies the browser's own limits.
+as the function's `SAFETY` comment says.
 
 Nodes have no visible model in play; their guides do not cast shadows. Lamp props
 are independent decoration, with emissive surfaces but no automatic local light.
@@ -221,10 +218,14 @@ light-range culling. Sources and conversion commands live with the
 
 ## Performance checks
 
-The target is recent ordinary laptops, including integrated graphics. Use a
-representative indoor/outdoor map in both browser and native builds. Include two
-fighters and a builder changing geometry during combat; check save/rejoin and
-frame-time spikes as well as average frame rate.
+The target is the
+[minimum specification](tracking/platforms.md#minimum-specification): 8 GB of
+memory and graphics about as fast as a Steam Deck's, with Vulkan, DirectX 12 or
+Metal. Nobody has measured Sauerteig on such hardware yet; measurements so far
+come from the maintainer's M5 Pro, and older ones from an M3 Pro. Use a
+representative indoor/outdoor map. Include two fighters and a builder changing
+geometry during combat; check save/rejoin and frame-time spikes as well as
+average frame rate.
 
 For repeatable CPU measurements:
 
@@ -242,7 +243,7 @@ rendered, per-pass GPU timestamps where supported, and the lighting path with ho
 many lights are drawn, shadowed (and shadowing actors), over budget or waiting. It
 explicitly reports unavailable timestamps otherwise. The asynchronous profiler
 never waits for a sample during play. Pass spans can overlap on Metal, so do not
-add them to obtain a GPU frame time. Browser timestamps can also be quantized.
+add them to obtain a GPU frame time.
 
 For fixed native renderer comparisons, source `scripts/env.sh`, then run:
 
@@ -276,11 +277,6 @@ median/p95 and individual GPU pass medians. They exclude simulation,
 presentation and PNG readback; they do not prove perceived smoothness on a
 monitor.
 
-`scripts/profile-browser.mjs URL OUTPUT_PREFIX` records five seconds of the
-running browser client's timestamps and frame intervals at a verified 3840×2160,
-plus a screenshot and validation errors. Use Playwright's isolated Chromium;
-`PLAYWRIGHT_MODULE` can point to a temporary installation's `index.mjs`. Restart
-the test server for each comparison so the assigned player/spawn is identical.
 The native GPU regressions run explicitly with
 `cargo test -p sauerteig-client --lib gpu_ -- --ignored --test-threads=1` on a host
 with GPU access. They check that cached shadows match fresh ones after edits, that

@@ -369,9 +369,6 @@ pub struct Game {
     socket: Option<(ewebsock::WsSender, ewebsock::WsReceiver)>,
     pub connected: bool,
     pub captured: bool,
-    pub pointer_locked: bool,
-    drag_look: bool,
-    last_cursor: Option<(f64, f64)>,
     editing_allowed: bool,
     endpoint: String,
     name: String,
@@ -407,7 +404,6 @@ pub struct Game {
     unconfirmed_edits: bool,
     sync: Option<(u64, bool)>,
     wheel_remainder: f32,
-    viewport: [f32; 2],
     show_help: bool,
     show_settings: bool,
     show_blueprints: bool,
@@ -435,8 +431,6 @@ pub struct Game {
     damage_flash: f32,
     show_stats: bool,
     audio: Audio,
-    #[cfg(target_arch = "wasm32")]
-    capture_failed: std::rc::Rc<std::cell::Cell<bool>>,
 }
 impl Game {
     pub fn new(endpoint: String, name: String) -> Self {
@@ -456,9 +450,6 @@ impl Game {
             socket: None,
             connected: false,
             captured: false,
-            pointer_locked: false,
-            drag_look: false,
-            last_cursor: None,
             editing_allowed: true,
             endpoint,
             name,
@@ -494,7 +485,6 @@ impl Game {
             unconfirmed_edits: false,
             sync: None,
             wheel_remainder: 0.0,
-            viewport: [1280.0, 800.0],
             show_help: false,
             show_settings: false,
             show_blueprints: false,
@@ -522,8 +512,6 @@ impl Game {
             damage_flash: 0.0,
             show_stats: false,
             audio: Audio::new(),
-            #[cfg(target_arch = "wasm32")]
-            capture_failed: std::rc::Rc::new(std::cell::Cell::new(false)),
         }
     }
     pub fn close_text_panel(&mut self) {
@@ -638,14 +626,6 @@ impl Game {
     }
     pub fn update(&mut self, dt: f32, renderer: &mut Renderer) {
         self.poll_storage();
-        #[cfg(target_arch = "wasm32")]
-        if self.capture_failed.replace(false) {
-            self.captured = true;
-            self.pointer_locked = false;
-            self.drag_look = false;
-            self.last_cursor = None;
-            self.notify("Mouse lock unavailable. Right-drag to look; left-drag to select.");
-        }
         let dt = dt.clamp(0.0, 0.1);
         self.time += dt;
         if dt > 0.0 {
@@ -854,7 +834,7 @@ impl Game {
                 if revision <= self.revision {
                     return;
                 }
-                let start = web_time::Instant::now();
+                let start = std::time::Instant::now();
                 let chunks = self.world.apply_edits(&edits);
                 self.revision = revision;
                 // World queries and visible meshes change together on this frame boundary.
@@ -869,7 +849,7 @@ impl Game {
                 if revision <= self.revision {
                     return;
                 }
-                let start = web_time::Instant::now();
+                let start = std::time::Instant::now();
                 match self.world.apply_root_edits(&roots) {
                     Ok(chunks) => {
                         self.revision = revision;
@@ -897,7 +877,7 @@ impl Game {
                 if revision <= self.revision {
                     return;
                 }
-                let start = web_time::Instant::now();
+                let start = std::time::Instant::now();
                 if let Some(volumes) = &volumes {
                     if validate_material_volumes(volumes, self.world.bounds().fine_box()).is_err() {
                         self.notify("Server sent invalid material volumes.");
@@ -972,75 +952,29 @@ impl Game {
         let mesh = Geometry::objects(&self.objects);
         renderer.objects(&mesh.vertices, &mesh.indices);
     }
-    #[cfg(target_arch = "wasm32")]
-    pub fn capture_denied(&mut self) {
-        self.capture_failed.set(true);
-    }
     pub fn capture(&mut self, window: &Window) {
         if !self.connected {
             return;
         }
-        self.audio.unlock();
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::{JsCast, JsValue};
-            use winit::platform::web::WindowExtWebSys;
-            self.capture_failed.set(false);
-            let request = (|| -> Result<JsValue, JsValue> {
-                let canvas = window
-                    .canvas()
-                    .ok_or_else(|| JsValue::from_str("Game canvas is unavailable"))?;
-                let method = js_sys::Reflect::get(
-                    canvas.as_ref(),
-                    &JsValue::from_str("requestPointerLock"),
-                )?
-                .dyn_into::<js_sys::Function>()?;
-                method.call0(canvas.as_ref())
-            })();
-            match request {
-                Ok(result) => {
-                    if let Ok(promise) = result.dyn_into::<js_sys::Promise>() {
-                        let failed = self.capture_failed.clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Err(error) = wasm_bindgen_futures::JsFuture::from(promise).await
-                            {
-                                log::warn!("Mouse capture was denied: {error:?}");
-                                failed.set(true);
-                            }
-                        });
-                    }
-                }
-                Err(error) => {
-                    log::warn!("Mouse capture was denied: {error:?}");
-                    self.capture_failed.set(true);
-                }
-            }
-            // Only the document's pointerlockchange event confirms acquisition.
-        }
-        #[cfg(not(target_arch = "wasm32"))]
         if window
             .set_cursor_grab(CursorGrabMode::Locked)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
             .is_ok()
         {
             self.captured = true;
-            self.pointer_locked = true;
             window.set_cursor_visible(false);
         }
     }
     pub fn release(&mut self, window: &Window) {
         self.captured = false;
-        self.pointer_locked = false;
-        self.drag_look = false;
         self.selection_drag = None;
-        self.last_cursor = None;
         self.keys.clear();
         self.firing = false;
         let _ = window.set_cursor_grab(CursorGrabMode::None);
         window.set_cursor_visible(true);
     }
     pub fn motion(&mut self, delta: (f64, f64)) {
-        if self.captured && self.pointer_locked {
+        if self.captured {
             self.look(delta);
         }
     }
@@ -1050,20 +984,8 @@ impl Game {
         self.local.pitch = (self.local.pitch - delta.1 as f32 * 0.0022).clamp(-1.53, 1.53);
     }
     pub fn event(&mut self, event: &WindowEvent, window: &Window, ui_consumed: bool) {
-        let size = window.inner_size();
-        self.viewport = [size.width.max(1) as f32, size.height.max(1) as f32];
         match event {
             WindowEvent::Focused(false) => self.release(window),
-            WindowEvent::CursorMoved { position, .. } => {
-                let next = (position.x, position.y);
-                if self.captured && !self.pointer_locked && self.drag_look {
-                    if let Some(previous) = self.last_cursor {
-                        self.look((next.0 - previous.0, next.1 - previous.1));
-                    }
-                }
-                self.last_cursor = Some(next);
-                self.update_selection();
-            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     if event.state == ElementState::Released {
@@ -1205,11 +1127,6 @@ impl Game {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.captured && !self.pointer_locked && *button == MouseButton::Right {
-                    self.drag_look = *state == ElementState::Pressed;
-                    self.last_cursor = None;
-                    return;
-                }
                 if *state == ElementState::Released {
                     if *button == MouseButton::Left {
                         self.firing = false;
@@ -1290,24 +1207,7 @@ impl Game {
         }
     }
     fn edit_ray(&self) -> (Vec3, Vec3) {
-        let forward = self.direction();
-        if self.captured && !self.pointer_locked && self.local.editing {
-            if let Some((x, y)) = self.last_cursor {
-                let nx = 2.0 * x as f32 / self.viewport[0] - 1.0;
-                let ny = 1.0 - 2.0 * y as f32 / self.viewport[1];
-                let right = forward.cross(Vec3::Y).normalize();
-                let up = right.cross(forward);
-                let scale = 39.0_f32.to_radians().tan();
-                return (
-                    self.eye(),
-                    (forward
-                        + right * nx * scale * self.viewport[0] / self.viewport[1]
-                        + up * ny * scale)
-                        .normalize(),
-                );
-            }
-        }
-        (self.eye(), forward)
+        (self.eye(), self.direction())
     }
     fn update_selection(&mut self) {
         if !self.local.editing || !self.connected {
@@ -2078,7 +1978,7 @@ impl Game {
                 MUTED,
             );
         }
-        if self.connected && (!self.local.editing || self.pointer_locked) {
+        if self.connected && (!self.local.editing || self.captured) {
             let c = screen.center();
             let color = if self.hit_flash > 0.0 { COPPER } else { PAPER };
             painter.line_segment(
@@ -2239,10 +2139,6 @@ impl Game {
                                 );
                             }
                         });
-                    if !self.pointer_locked {
-                        ui.separator();
-                        ui.label("Without mouse lock: right-drag looks; Shift+LMB extends.");
-                    }
                 });
         }
         if self.keys.contains(&KeyCode::Tab) {

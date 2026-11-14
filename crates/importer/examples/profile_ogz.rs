@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "cropped_leaves": report.leaves_outside_region,
             "clipped_leaves": report.leaves_clipped_at_region,
             "unsupported_omissions": report.unsupported_leaves_omitted.len(),
-            "scope": "CPU-only native wall-clock measurements; no GPU uploads, browser frame times, or iGPU performance claim."
+            "scope": "CPU-only native wall-clock measurements; no GPU uploads, frame times, or iGPU performance claim."
         }))?
     );
     Ok(())

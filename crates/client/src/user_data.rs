@@ -53,12 +53,7 @@ impl Default for SessionPreferences {
 }
 impl SessionPreferences {
     pub fn load() -> Result<Self, String> {
-        #[cfg(not(target_arch = "wasm32"))]
         let value = execute_named(&data_directory()?, "session", None)?;
-        #[cfg(target_arch = "wasm32")]
-        let value = browser_preferences()?
-            .get_item("sauerteig-session")
-            .map_err(|e| format!("Cannot read saved session: {e:?}"))?;
         value.map_or_else(
             || Ok(Self::default()),
             |value| {
@@ -69,26 +64,8 @@ impl SessionPreferences {
 
     pub fn save(&self) -> Result<(), String> {
         let value = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            execute_named(&data_directory()?, "session", Some(&value)).map(|_| ())
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            browser_preferences()?
-                .set_item("sauerteig-session", &value)
-                .map_err(|e| format!("Cannot save session choices: {e:?}"))
-        }
+        execute_named(&data_directory()?, "session", Some(&value)).map(|_| ())
     }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn browser_preferences() -> Result<web_sys::Storage, String> {
-    web_sys::window()
-        .ok_or("Browser window unavailable")?
-        .local_storage()
-        .map_err(|e| format!("Local storage unavailable: {e:?}"))?
-        .ok_or_else(|| "Local storage unavailable; session choices will not be remembered".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +98,6 @@ pub struct Storage {
     sender: mpsc::Sender<Completion>,
     receiver: mpsc::Receiver<Completion>,
     pending: [usize; 2],
-    #[cfg(not(target_arch = "wasm32"))]
     directory: Result<std::path::PathBuf, String>,
 }
 impl Storage {
@@ -136,7 +112,6 @@ impl Storage {
             sender,
             receiver,
             pending: [0; 2],
-            #[cfg(not(target_arch = "wasm32"))]
             directory: data_directory(),
         }
     }
@@ -164,10 +139,7 @@ impl Storage {
         if job.value.is_some() {
             PENDING_WRITES.fetch_add(1, Ordering::AcqRel);
         }
-        #[cfg(not(target_arch = "wasm32"))]
         native::enqueue(job, self.sender.clone(), self.directory.clone());
-        #[cfg(target_arch = "wasm32")]
-        browser::enqueue(job, self.sender.clone());
     }
     pub fn poll(&mut self) -> Vec<StorageEvent> {
         let mut events = Vec::new();
@@ -222,7 +194,6 @@ fn complete(job: Job, sender: mpsc::Sender<Completion>, result: Result<Option<St
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn data_directory() -> Result<std::path::PathBuf, String> {
     use std::{env, path::PathBuf};
     if let Some(path) = env::var_os("SAUERTEIG_DATA_DIR") {
@@ -243,12 +214,10 @@ pub(crate) fn data_directory() -> Result<std::path::PathBuf, String> {
 
 /// Wait for all earlier local jobs and take any unreported write failures.
 /// Normal UI shutdown can first wait for `pending_writes()` to clear.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn flush_pending() -> Result<(), String> {
     native::flush_pending()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::*;
     use std::{path::PathBuf, sync::OnceLock};
@@ -355,12 +324,10 @@ mod native {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn execute(directory: &std::path::Path, job: &Job) -> Result<Option<String>, String> {
     execute_named(directory, job.document.key(), job.value.as_deref())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn execute_named(
     directory: &std::path::Path,
     key: &str,
@@ -386,103 +353,7 @@ fn execute_named(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-function openSauerteig() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open('sauerteig', 1);
-    request.onupgradeneeded = () => request.result.createObjectStore('documents');
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-    request.onblocked = () => reject(new Error('Close other Sauerteig tabs to update local storage'));
-  });
-}
-export async function readSauerteig(key) {
-  const db = await openSauerteig();
-  try { return await new Promise((resolve, reject) => {
-    const tx = db.transaction('documents', 'readonly');
-    const request = tx.objectStore('documents').get(key);
-    tx.oncomplete = () => resolve(request.result ?? null);
-    tx.onabort = () => reject(tx.error || new Error('Local read failed'));
-    tx.onerror = () => reject(tx.error);
-  }); } finally { db.close(); }
-}
-export async function writeSauerteig(key, value) {
-  const db = await openSauerteig();
-  try { await new Promise((resolve, reject) => {
-    const tx = db.transaction('documents', 'readwrite');
-    tx.objectStore('documents').put(value, key);
-    tx.oncomplete = resolve;
-    tx.onabort = () => reject(tx.error || new Error('Local save failed'));
-    tx.onerror = () => reject(tx.error);
-  }); } finally { db.close(); }
-}
-"#)]
-extern "C" {
-    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = readSauerteig)]
-    async fn read_document(key: &str) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
-    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = writeSauerteig)]
-    async fn write_document(
-        key: &str,
-        value: &str,
-    ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
-}
-#[cfg(target_arch = "wasm32")]
-mod browser {
-    use super::*;
-    use std::{cell::RefCell, collections::VecDeque};
-
-    #[derive(Default)]
-    struct Queue {
-        running: bool,
-        jobs: VecDeque<(Job, mpsc::Sender<Completion>)>,
-    }
-
-    thread_local! {
-        static QUEUE: RefCell<Queue> = RefCell::new(Queue::default());
-    }
-
-    pub(super) fn enqueue(job: Job, sender: mpsc::Sender<Completion>) {
-        let start = QUEUE.with_borrow_mut(|queue| {
-            queue.jobs.push_back((job, sender));
-            if queue.running {
-                false
-            } else {
-                queue.running = true;
-                true
-            }
-        });
-        if !start {
-            return;
-        }
-        wasm_bindgen_futures::spawn_local(async {
-            loop {
-                let next = QUEUE.with_borrow_mut(|queue| {
-                    let next = queue.jobs.pop_front();
-                    if next.is_none() {
-                        queue.running = false;
-                    }
-                    next
-                });
-                let Some((job, sender)) = next else {
-                    break;
-                };
-                let result = if let Some(value) = &job.value {
-                    write_document(job.document.key(), value)
-                        .await
-                        .map(|_| None)
-                } else {
-                    read_document(job.document.key())
-                        .await
-                        .map(|value| value.as_string())
-                };
-                complete(job, sender, result.map_err(|error| format!("{error:?}")));
-            }
-        });
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 

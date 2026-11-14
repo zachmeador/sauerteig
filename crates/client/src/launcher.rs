@@ -12,7 +12,6 @@ pub enum LaunchAction {
         endpoint: String,
         name: String,
     },
-    #[cfg(not(target_arch = "wasm32"))]
     Host {
         path: std::path::PathBuf,
         title: String,
@@ -35,19 +34,12 @@ pub struct Launcher {
     preferences: SessionPreferences,
     pub status: String,
     auto_join: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     saves: Option<crate::world_saves::WorldSaves>,
-    #[cfg(not(target_arch = "wasm32"))]
     worlds: Vec<crate::world_saves::WorldInfo>,
-    #[cfg(not(target_arch = "wasm32"))]
     selected: Option<String>,
-    #[cfg(not(target_arch = "wasm32"))]
     new_name: String,
-    #[cfg(not(target_arch = "wasm32"))]
     import_path: String,
-    #[cfg(not(target_arch = "wasm32"))]
     lan: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     show_join: bool,
 }
 
@@ -66,42 +58,26 @@ impl Launcher {
         if let Some(name) = options.name {
             preferences.player_name = name;
         }
-        #[cfg(not(target_arch = "wasm32"))]
         let (saves, status) = match crate::user_data::data_directory()
             .and_then(crate::world_saves::WorldSaves::new)
         {
             Ok(saves) => (Some(saves), status),
             Err(error) => (None, format!("Saved worlds unavailable: {error}")),
         };
-        let launcher = Self {
-            #[cfg(not(target_arch = "wasm32"))]
+        let mut launcher = Self {
             selected: preferences.last_world.clone(),
             preferences,
             status,
             auto_join,
-            #[cfg(not(target_arch = "wasm32"))]
             saves,
-            #[cfg(not(target_arch = "wasm32"))]
             worlds: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             new_name: "My world".into(),
-            #[cfg(not(target_arch = "wasm32"))]
             import_path: legacy_world_path(),
-            #[cfg(not(target_arch = "wasm32"))]
             lan: false,
-            #[cfg(not(target_arch = "wasm32"))]
             show_join: false,
         };
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut launcher = launcher;
-            launcher.refresh();
-            launcher
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            launcher
-        }
+        launcher.refresh();
+        launcher
     }
 
     pub fn initial_action(&mut self) -> Option<LaunchAction> {
@@ -113,7 +89,6 @@ impl Launcher {
     }
 
     pub fn open(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
         self.refresh();
     }
 
@@ -138,14 +113,6 @@ impl Launcher {
         let name = self.player_name()?;
         match normalize_server(&self.preferences.server) {
             Ok(endpoint) => {
-                #[cfg(target_arch = "wasm32")]
-                if web_sys::window()
-                    .is_some_and(|w| w.location().protocol().ok().as_deref() == Some("https:"))
-                    && endpoint.starts_with("ws:")
-                {
-                    self.status = "This HTTPS page needs a secure wss:// server address.".into();
-                    return None;
-                }
                 self.preferences.server = endpoint.clone();
                 self.remember();
                 Some(LaunchAction::Join { endpoint, name })
@@ -157,7 +124,6 @@ impl Launcher {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn refresh(&mut self) {
         if let Some(saves) = &self.saves {
             match saves.list() {
@@ -167,7 +133,6 @@ impl Launcher {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn host(&mut self, id: &str) -> Option<LaunchAction> {
         let name = self.player_name()?;
         let title = self
@@ -248,37 +213,18 @@ impl Launcher {
                                     self.remember();
                                 }
                                 ui.add_space(14.0);
-                                #[cfg(not(target_arch = "wasm32"))]
-                                {
-                                    ui.horizontal(|ui| {
-                                        ui.selectable_value(
-                                            &mut self.show_join,
-                                            false,
-                                            "Your worlds",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.show_join,
-                                            true,
-                                            "Join server",
-                                        );
-                                    });
-                                    ui.separator();
-                                    let launch = if !self.show_join {
-                                        self.worlds_ui(ui, current.is_some())
-                                    } else {
-                                        self.join_ui(ui)
-                                    };
-                                    if let Some(launch) = launch {
-                                        action = Some(MenuAction::Launch(launch));
-                                    }
-                                }
-                                #[cfg(target_arch = "wasm32")]
-                                {
-                                    if let Some(launch) = self.join_ui(ui) {
-                                        action = Some(MenuAction::Launch(launch));
-                                    }
-                                    ui.add_space(12.0);
-                                    ui.weak("To create a world, open the native Sauerteig app.");
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut self.show_join, false, "Your worlds");
+                                    ui.selectable_value(&mut self.show_join, true, "Join server");
+                                });
+                                ui.separator();
+                                let launch = if !self.show_join {
+                                    self.worlds_ui(ui, current.is_some())
+                                } else {
+                                    self.join_ui(ui)
+                                };
+                                if let Some(launch) = launch {
+                                    action = Some(MenuAction::Launch(launch));
                                 }
                                 if !self.status.is_empty() {
                                     ui.add_space(12.0);
@@ -315,7 +261,6 @@ impl Launcher {
         None
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn worlds_ui(&mut self, ui: &mut egui::Ui, session_active: bool) -> Option<LaunchAction> {
         let mut action = None;
         let last = self
@@ -473,23 +418,9 @@ pub fn normalize_server(input: &str) -> Result<String, String> {
 }
 
 pub fn default_server() -> String {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        "ws://127.0.0.1:3000/ws".into()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let location = web_sys::window().unwrap().location();
-        let scheme = if location.protocol().unwrap_or_default() == "https:" {
-            "wss"
-        } else {
-            "ws"
-        };
-        format!("{scheme}://{}/ws", location.host().unwrap_or_default())
-    }
+    "ws://127.0.0.1:3000/ws".into()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn legacy_world_path() -> String {
     let mut roots = Vec::new();
     if let Ok(path) = std::env::current_dir() {

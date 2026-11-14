@@ -11,6 +11,11 @@ does not require another format overhaul.
 
 ## Decisions so far
 
+- **Geometry is one octree** ([octree world](octree.md), maintainer,
+  2026-11-13). Every cube, of any power-of-two size from an eighth of a metre,
+  carries its shape, six surface materials and a cube material (water and
+  glass now, Sauerbraten's other materials kept for later), as in Sauerbraten.
+  The stages below build on it.
 - **World settings block.** Movement is a world setting, not a code constant: a
   movement style, its numbers (speed, jump, gravity, air control, player size),
   and feature flags. Styles are Sauerbraten's model, where velocity eases toward
@@ -33,9 +38,11 @@ does not require another format overhaul.
   nominal axis, which matches imported maps but stretches on slopes, while
   Sauerteig projects along the actual normal. See the
   [Sauerbraten editor reference](../../research/sauerbraten-editor.md).
-- **Saves move to the compact encoding** chosen in
-  [shared-sandbox](shared-sandbox.md) stage 2, compressed; JSON stays available
-  for export and debugging.
+- **Saves move to the compact binary form** of
+  [shared-sandbox](shared-sandbox.md) stage 2e; JSON stays available for import,
+  export and debugging. New object and material fields enter the format behind
+  its protocol and format numbers, so new releases keep opening old worlds and
+  older releases refuse newer ones clearly (maintainer, 2026-11-13).
 
 ## Sauerbraten movement reference
 
@@ -81,15 +88,24 @@ Sauerbraten profile yet, so it has not been played.
     on the test stairs; the engine's `trystepdown` is not ported.
   - Slope sliding needs floor normals that the support queries don't return.
   - Two trig-heavy golden scenarios are exact only on the recording platform
-    (within 2e-3 elsewhere).
+    (within 2e-3 elsewhere), and even there a release build fails at tick 9 of
+    `turning`. [Platforms](platforms.md) stage 2 makes every scenario exact in
+    every build and on every system.
 
 ## Remaining work
 
 Later stages wire profiles into the world format, protocol, saves, server, and
-client, and add object properties, the material library, and the compact save
-encoding. Plan them after shared-sandbox stage 1 lands, since they touch protocol
-and server types. When the Sauerbraten profile is wired in, verify traversal on
-imported maps.
+client, and add object properties and the material library on top of
+shared-sandbox 2e's compact saves. Plan them once shared-sandbox 2e has merged.
+They change the protocol, saves and server types that 2d and 2e rewrite, so they
+don't run beside those stages, and they share the server's `lib.rs` and the
+client's `game.rs` with 2f. When the Sauerbraten profile is wired in, verify
+traversal on imported maps.
+
+The settings stage also moves the prototype arena out of the core: its spawn
+points are the fallback for every map (`Player::new`, the fall respawn in
+`physics.rs` and the server's `safe_spawn`), and its size is the default
+`WorldBounds`, which the importer places maps in until octree O3.
 
 The wiring stage must also reset `Player::movement` wherever it resets `velocity`
 (server respawn and mode changes, client mode changes), because a stale `falling`
@@ -124,5 +140,6 @@ Stage 1, 2026-10-25:
 - **Native and wasm agree.** A 1,200-tick Sauerbraten run produced identical
   digests natively and as wasm32 under Node. This used a scratch crate, not a
   repository test.
-- **Not observed:** anything in a native or browser client, and the golden test
-  on Linux CI.
+- **Not observed:** anything in the running client. The golden test passed on
+  Linux CI in the dev profile on 2026-10-29, where the two trig scenarios are
+  compared within the tolerance.

@@ -277,7 +277,7 @@ impl ShadowCost {
 
 /// Seconds between frames, for fading lights and timing tile residency.
 struct FrameClock {
-    last: Option<web_time::Instant>,
+    last: Option<std::time::Instant>,
     fixed: Option<f32>,
 }
 impl FrameClock {
@@ -285,7 +285,7 @@ impl FrameClock {
         if let Some(fixed) = self.fixed {
             return fixed;
         }
-        let now = web_time::Instant::now();
+        let now = std::time::Instant::now();
         let dt = self
             .last
             .map_or(1.0 / 60.0, |last| (now - last).as_secs_f32());
@@ -305,7 +305,6 @@ impl Renderer {
         )
         .await
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub async fn headless_with(
         width: u32,
         height: u32,
@@ -335,7 +334,7 @@ impl Renderer {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or("No compatible GPU was found. This build needs WebGPU in the browser.")?;
+            .ok_or("No compatible GPU was found.")?;
         let adapter_name = adapter.get_info().name;
         let (device, queue) = adapter
             .request_device(
@@ -351,7 +350,7 @@ impl Renderer {
             .map_err(|e| e.to_string())?;
         let tier = options.tier.unwrap_or_else(|| lighting_tier(&adapter));
         log::info!("{adapter_name}: {tier:?} lighting");
-        // Browser window sizing can settle while adapter/device creation awaits.
+        // The window size can change while adapter and device creation awaits.
         let [width, height] = window.as_ref().map_or([width, height], |window| {
             let size = window.inner_size();
             [size.width.max(1), size.height.max(1)]
@@ -695,38 +694,31 @@ impl Renderer {
             l.tiles_resident,
         )
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn lighting_stats(&self) -> LightingStats {
         self.lighting
     }
     /// No shadow face is waiting to render and no light is fading.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn lighting_settled(&self) -> bool {
         self.lighting_settled
     }
     /// CPU time spent choosing lights and shadow tiles in the last frame.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn lighting_plan_ms(&self) -> f64 {
         self.lighting_plan_ms
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn lighting_tier(&self) -> LightingTier {
         self.lights.config().tier
     }
     /// How many of the last frame's lights reach each view cluster.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn cluster_counts(&self) -> Vec<u32> {
         self.light_gpu.cluster_counts()
     }
     /// Lights beyond those the world's objects place, for captures and tests.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_extra_lights(&mut self, lights: Vec<LightDesc>) {
         self.extra_lights = lights;
     }
     pub fn gpu_times(&self) -> Option<&BTreeMap<String, f64>> {
         self.timing.supported().then_some(&self.timing.latest)
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn wait_for_capture(&mut self) -> std::time::Instant {
         self.device.poll(wgpu::Maintain::Wait);
         let completed = std::time::Instant::now();
@@ -735,7 +727,6 @@ impl Renderer {
         self.timing.collect(&self.device, &self.queue);
         completed
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_capture(&self, path: &std::path::Path) -> Result<(), String> {
         image::save_buffer(
             path,
@@ -746,7 +737,6 @@ impl Renderer {
         )
         .map_err(|e| e.to_string())
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn capture_pixels(&self) -> Result<Vec<u8>, String> {
         let texture = self
             .capture_target
@@ -822,7 +812,6 @@ impl Renderer {
     }
     /// Treat every cached shadow as stale, as after an edit that touches
     /// everything, without rebuilding any geometry.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn invalidate_shadows(&mut self) {
         self.geometry_revision = self.geometry_revision.wrapping_add(1);
         self.lights.invalidate_all();
@@ -949,7 +938,7 @@ impl Renderer {
         }
         let scene_height = self.post.size[1] as f32;
         self.shadow_cost.observe(&self.timing);
-        let planning = web_time::Instant::now();
+        let planning = std::time::Instant::now();
         let plan = self.lights.plan(&FrameInput {
             objects,
             extra: &self.extra_lights,

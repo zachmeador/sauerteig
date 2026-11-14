@@ -1,8 +1,6 @@
 # Editor controls
 
-Click the arena to capture the mouse. Press **Esc** to release it. In an embedded
-browser that refuses mouse lock, hold **right mouse to look** and use
-**Shift+left click** to extend a selection instead of right click.
+Click the arena to capture the mouse. Press **Esc** to release it.
 
 | Action | Control |
 | --- | --- |
@@ -14,7 +12,7 @@ browser that refuses mouse lock, hold **right mouse to look** and use
 | Fly along the view direction in edit mode | WASD |
 | Fly vertically up / down in edit mode | Page Up / Page Down |
 | Select a persistent face region | Left click and drag |
-| Extend / reorient the selection | Right click; Shift+left click in drag-look mode |
+| Extend / reorient the selection | Right click, or left click while holding the left Shift key |
 | Add / subtract a selection volume | Alt+left drag / Alt+Shift+left drag |
 | Selection mode and numeric volume size | Esc → Selection |
 | Assign normal space, water, or glass | Esc → Selection → Volume material → Apply |
@@ -118,9 +116,9 @@ Older blueprints have normal space throughout their selection. Pasting replaces
 the destination's material assignments, including clearing regions that are normal
 space in the blueprint. Older geometry-only blueprints
 still load. Libraries and settings are local to
-each client, separate from the shared map. Browser data lives in IndexedDB for
-that site origin. Desktop data uses the OS application data folder (on macOS,
-`~/Library/Application Support/Sauerteig`); `SAUERTEIG_DATA_DIR` overrides it.
+each client, separate from the shared map. They live in the OS application data
+folder (on macOS, `~/Library/Application Support/Sauerteig`);
+`SAUERTEIG_DATA_DIR` overrides it.
 
 ## Shared editing
 

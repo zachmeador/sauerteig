@@ -225,7 +225,6 @@ async fn material_geometry_and_objects_share_multiplayer_history_and_saved_reope
     let temporary = TemporaryWorld::new();
     let config = Config {
         world_path: temporary.0.join("world.json"),
-        web_dir: temporary.0.join("web"),
         editing_allowed: true,
     };
     std::fs::write(
@@ -369,7 +368,6 @@ async fn mixed_edits_are_atomic_conflict_safe_and_persist_through_rejoin() {
     let temporary = TemporaryWorld::new();
     let config = Config {
         world_path: temporary.0.join("world.json"),
-        web_dir: temporary.0.join("web"),
         editing_allowed: true,
     };
     let mut expected_world = World::empty();
@@ -565,7 +563,6 @@ async fn compact_base_empty_override_and_objects_survive_save_and_rejoin() {
     let temporary = TemporaryWorld::new();
     let config = Config {
         world_path: temporary.0.join("world.json"),
-        web_dir: temporary.0.join("web"),
         editing_allowed: true,
     };
     let bounds = WorldBounds {

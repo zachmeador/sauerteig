@@ -67,9 +67,9 @@ The photographic surfaces and five prop models are from Poly Haven, under
 asset URLs, download checksums, modifications and cooked measurements are recorded
 in [the material manifest](assets/materials/manifest.json) and
 [the prop manifest](assets/props/manifest.json). Copies of
-these manifests ship in `asset-provenance/` in the browser build and in the
-native app's Resources. The authored hazard/amber utility surfaces are also
-released under CC0. Sauerteig's MIT code license does not replace those records.
+these manifests ship in `asset-provenance/` in the native app's Resources. The
+authored hazard/amber utility surfaces are also released under CC0. Sauerteig's
+MIT code license does not replace those records.
 
 The optional offline conversion tools use Pillow, NumPy and meshoptimizer;
 these tools are not shipped as game dependencies. No source Blender scripts,

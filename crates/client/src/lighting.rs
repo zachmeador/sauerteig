@@ -22,7 +22,6 @@ pub enum LightKind {
     Point,
     /// A cone along `direction` (unit length) with half-angles in radians. Only
     /// captures and tests make these until object properties can.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Spot {
         direction: Vec3,
         inner: f32,
@@ -67,7 +66,6 @@ impl LightDesc {
         }
     }
 
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn spot(id: u32, position: Vec3, direction: Vec3, inner: f32, outer: f32) -> Self {
         Self {
             kind: LightKind::Spot {

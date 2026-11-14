@@ -74,9 +74,7 @@ pub(super) struct LightGpu {
     cpu_masks: Vec<u32>,
     pub count: usize,
     /// View-space spheres and projection scale of the last upload.
-    #[cfg(any(test, not(target_arch = "wasm32")))]
     pub last_views: Vec<[f32; 4]>,
-    #[cfg(not(target_arch = "wasm32"))]
     last_scale: Vec2,
 }
 
@@ -211,9 +209,7 @@ impl LightGpu {
             cull,
             cpu_masks: Vec::new(),
             count: 0,
-            #[cfg(any(test, not(target_arch = "wasm32")))]
             last_views: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             last_scale: Vec2::ONE,
         }
     }
@@ -247,18 +243,11 @@ impl LightGpu {
                 .resize(self.layout.mask_vectors as usize * 4, 0);
             queue.write_buffer(&self.masks, 0, bytemuck::cast_slice(&self.cpu_masks));
         }
-        #[cfg(any(test, not(target_arch = "wasm32")))]
-        {
-            self.last_views = views;
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.last_scale = view.scale;
-        }
+        self.last_views = views;
+        self.last_scale = view.scale;
     }
 
     /// How many of the last frame's lights reach each cluster.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn cluster_counts(&self) -> Vec<u32> {
         let Some(grid) = self.config.grid else {
             return Vec::new();

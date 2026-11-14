@@ -246,5 +246,5 @@ fn main() {
     println!();
     println!("Ray fixture: {hit_count} hits / {} rays; edit invalidation rebuilds the touched chunk plus six neighbors.", rays.len());
     println!("Times are wall-clock samples on this machine. They are not GPU frame times,");
-    println!("browser/WASM results, network measurements, or proof of a laptop FPS budget.");
+    println!("network measurements, or proof of a laptop FPS budget.");
 }

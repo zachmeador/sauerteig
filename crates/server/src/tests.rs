@@ -1062,12 +1062,52 @@ async fn receive_where(
 }
 
 #[tokio::test]
+async fn plain_http_root_says_the_server_is_running() {
+    let dir = temporary_directory("http-root");
+    let config = Config {
+        world_path: dir.join("world.json"),
+        editing_allowed: true,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve(listener, config, async {
+        let _ = stopped.await;
+    }));
+    let response = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    })
+    .await
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("text/plain"), "{response}");
+    assert!(response.contains("game connections use /ws"), "{response}");
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn websocket_large_arena_joins_and_edit_results_correlate_with_requests() {
     use futures_util::StreamExt;
     let dir = temporary_directory("large-arena-edit-results");
     let config = Config {
         world_path: dir.join("world.json"),
-        web_dir: dir.join("web"),
         editing_allowed: true,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1243,7 +1283,6 @@ async fn websocket_clients_share_edits_reject_bad_inputs_and_rejoin_saved_world(
     let dir = temporary_directory("websocket");
     let config = Config {
         world_path: dir.join("world.json"),
-        web_dir: dir.join("web"),
         editing_allowed: true,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1409,7 +1448,6 @@ async fn websocket_combat_produces_authoritative_damage_score_and_respawn() {
     let dir = temporary_directory("combat");
     let config = Config {
         world_path: dir.join("world.json"),
-        web_dir: dir.join("web"),
         editing_allowed: true,
     };
     let mut saved = room().saved();

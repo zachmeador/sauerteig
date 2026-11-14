@@ -1,10 +1,8 @@
 mod audio;
 mod blueprints;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod capture;
 mod editor;
 mod game;
-#[cfg(not(target_arch = "wasm32"))]
 mod hosting;
 mod launcher;
 mod lighting;
@@ -15,16 +13,12 @@ mod regions;
 mod render;
 mod scene;
 mod user_data;
-#[cfg(any(target_arch = "wasm32", test))]
-mod web_text;
-#[cfg(not(target_arch = "wasm32"))]
 mod world_saves;
 
 use game::Game;
 use launcher::{ActiveSession, LaunchAction, LaunchOptions, Launcher, MenuAction};
 use render::Renderer;
-use std::sync::Arc;
-use web_time::Instant;
+use std::{sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -43,13 +37,10 @@ struct Runtime {
     menu_open: bool,
     change: Option<SessionChange>,
     exit_requested: bool,
-    #[cfg(not(target_arch = "wasm32"))]
     host: Option<hosting::HostedServer>,
     context: egui::Context,
     egui: egui_winit::State,
     last_frame: Instant,
-    #[cfg(target_arch = "wasm32")]
-    web_text: web_text::WebText,
 }
 struct Session {
     title: String,
@@ -165,7 +156,6 @@ enum ChangeAction {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.game.release(&self.window);
-        #[cfg(not(target_arch = "wasm32"))]
         if let Err(error) = user_data::flush_pending() {
             log::error!("Local changes could not be saved during shutdown: {error}");
         }
@@ -206,13 +196,10 @@ impl Runtime {
             menu_open: true,
             change: None,
             exit_requested: false,
-            #[cfg(not(target_arch = "wasm32"))]
             host: None,
             context,
             egui,
             last_frame: Instant::now(),
-            #[cfg(target_arch = "wasm32")]
-            web_text: web_text::WebText::new()?,
         };
         if let Some(action) = initial_action {
             runtime.launch(action);
@@ -242,7 +229,6 @@ impl Runtime {
                 hosting: false,
                 lan_port: None,
             },
-            #[cfg(not(target_arch = "wasm32"))]
             LaunchAction::Host {
                 path,
                 title,
@@ -329,7 +315,6 @@ impl Runtime {
         // active connections and the final world save.
         self.replace_game(String::new(), String::new());
         self.session = None;
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(host) = &mut self.host {
             host.stop();
             return;
@@ -361,7 +346,6 @@ impl Runtime {
     }
 
     fn poll_host(&mut self) {
-        #[cfg(not(target_arch = "wasm32"))]
         if let Some(result) = self.host.as_mut().and_then(hosting::HostedServer::poll) {
             self.host = None;
             if self
@@ -426,11 +410,6 @@ impl Runtime {
                 } else if session.hosting {
                     ui.weak("Local hosting · only this computer can connect.");
                 }
-                if session.hosting {
-                    let browser_url = session.endpoint.replacen("ws://", "http://", 1);
-                    let browser_url = format!("{}/", browser_url.trim_end_matches("/ws"));
-                    ui.hyperlink_to("Open browser client", browser_url);
-                }
                 if !self.launcher.status.is_empty() {
                     ui.label(&self.launcher.status);
                 }
@@ -454,14 +433,6 @@ impl Runtime {
         }
         self.poll_change();
         let raw = self.egui.take_egui_input(&self.window);
-        #[cfg(target_arch = "wasm32")]
-        let raw = {
-            let mut raw = raw;
-            if self.web_text.drain(&mut raw) {
-                self.game.close_text_panel();
-            }
-            raw
-        };
         let mut menu_action = None;
         let mut session_action = None;
         let mut change_action = None;
@@ -562,19 +533,6 @@ impl Runtime {
             self.egui
                 .handle_platform_output(&self.window, output.platform_output.clone());
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            use winit::platform::web::WindowExtWebSys;
-            if let Some(canvas) = self.window.canvas() {
-                self.web_text.sync(
-                    &output.platform_output,
-                    !self.game.captured,
-                    &canvas,
-                    output.pixels_per_point,
-                    self.window.scale_factor(),
-                );
-            }
-        }
         self.renderer.apply_settings(self.game.render_settings());
         let mesh = self.game.geometry();
         match self.renderer.draw(
@@ -602,11 +560,6 @@ impl Runtime {
 }
 enum UserEvent {
     Ready(Result<Box<Runtime>, String>),
-    #[cfg(target_arch = "wasm32")]
-    PointerLock {
-        locked: bool,
-        failed: bool,
-    },
 }
 struct App {
     runtime: Option<Box<Runtime>>,
@@ -630,91 +583,19 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::{closure::Closure, JsCast};
-            use winit::platform::web::WindowExtWebSys;
-            let document = web_sys::window().unwrap().document().unwrap();
-            // Lock acquisition is asynchronous in browsers. Only a real change or
-            // error event should resolve capture; an early redraw is not failure.
-            for event_name in ["pointerlockchange", "pointerlockerror"] {
-                let proxy = self.proxy.clone();
-                let document = document.clone();
-                let observed = document.clone();
-                let listener = Closure::<dyn Fn()>::new(move || {
-                    let locked = observed
-                        .pointer_lock_element()
-                        .is_some_and(|element| element.id() == "game-canvas");
-                    let _ = proxy.send_event(UserEvent::PointerLock {
-                        locked,
-                        failed: event_name == "pointerlockerror",
-                    });
-                });
-                document
-                    .add_event_listener_with_callback(event_name, listener.as_ref().unchecked_ref())
-                    .expect("pointer lock listener");
-                listener.forget(); // One window owns these listeners for the app lifetime.
-            }
-            let canvas = window.canvas().expect("winit canvas");
-            canvas.set_id("game-canvas");
-            let _ =
-                canvas.set_attribute("style", "display:block;width:100%;height:100%;outline:none");
-            let _ = canvas.set_attribute("tabindex", "0");
-            let _=canvas.set_attribute("aria-label","Sauerteig multiplayer arena. Click to enter, WASD to move, E to edit, Escape to release the mouse.");
-            document
-                .get_element_by_id("game-container")
-                .unwrap_or_else(|| document.body().unwrap().into())
-                .append_child(&canvas)
-                .expect("append game canvas");
-            let browser = web_sys::window().unwrap();
-            let _ = window.request_inner_size(LogicalSize::new(
-                browser.inner_width().unwrap().as_f64().unwrap_or(1280.0),
-                browser.inner_height().unwrap().as_f64().unwrap_or(800.0),
-            ));
-        }
         self.window = Some(window.clone());
         let options = self.options.take().unwrap_or_default();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let ready = pollster::block_on(Runtime::new(window, options)).map(Box::new);
-            let _ = self.proxy.send_event(UserEvent::Ready(ready));
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let proxy = self.proxy.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let ready = Runtime::new(window, options).await.map(Box::new);
-                let _ = proxy.send_event(UserEvent::Ready(ready));
-            });
-        }
+        let ready = pollster::block_on(Runtime::new(window, options)).map(Box::new);
+        let _ = self.proxy.send_event(UserEvent::Ready(ready));
     }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Ready(Ok(runtime)) => {
                 self.runtime = Some(runtime);
-                #[cfg(target_arch = "wasm32")]
-                if let Ok(event) = web_sys::CustomEvent::new("sauerteig-ready") {
-                    let _ = web_sys::window().unwrap().dispatch_event(&event);
-                }
             }
             UserEvent::Ready(Err(error)) => {
                 report_error(&error);
                 event_loop.exit();
-            }
-            #[cfg(target_arch = "wasm32")]
-            UserEvent::PointerLock { locked, failed } => {
-                if let Some(runtime) = &mut self.runtime {
-                    if !runtime.accepts_game_input() {
-                        runtime.game.release(&runtime.window);
-                    } else if locked {
-                        runtime.game.captured = true;
-                        runtime.game.pointer_locked = true;
-                    } else if failed {
-                        runtime.game.capture_denied();
-                    } else if runtime.game.pointer_locked {
-                        runtime.game.release(&runtime.window);
-                    }
-                }
             }
         }
     }
@@ -733,12 +614,6 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(runtime) = &mut self.runtime else {
             return;
         };
-        #[cfg(target_arch = "wasm32")]
-        if matches!(event, WindowEvent::Focused(false)) && runtime.web_text.owns_focus() {
-            // Moving keyboard focus from canvas to its text-input helper does
-            // not mean the user has left the application.
-            return;
-        }
         let response = runtime.egui.on_window_event(&runtime.window, &event);
         let menu_escape = runtime.menu_open
             && runtime.session.is_some()
@@ -789,91 +664,46 @@ impl ApplicationHandler<UserEvent> for App {
 }
 fn report_error(error: &str) {
     log::error!("{error}");
-    #[cfg(target_arch = "wasm32")]
-    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-        if let Some(panel) = document.get_element_by_id("loading-panel") {
-            let _ = panel.set_attribute("hidden", "");
-        }
-        if let Some(panel) = document.get_element_by_id("error-panel") {
-            let _ = panel.remove_attribute("hidden");
-        }
-        if let Some(message) = document.get_element_by_id("error-message") {
-            message.set_text_content(Some(error));
-        }
-    }
 }
 fn options() -> LaunchOptions {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut options = LaunchOptions::default();
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--server" => {
-                    if let Some(value) = args.next() {
-                        options.server = Some(value);
-                    }
+    let mut options = LaunchOptions::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--server" => {
+                if let Some(value) = args.next() {
+                    options.server = Some(value);
                 }
-                "--name" => {
-                    if let Some(value) = args.next() {
-                        options.name = Some(value);
-                    }
-                }
-                "--help" | "-h" => {
-                    println!("Sauerteig\n  Open without arguments to create or continue a saved world.\n  --server ws://127.0.0.1:3000/ws  Join directly\n  --name Player\n\nWASD move · Space jump · E edit · Esc release mouse");
-                    std::process::exit(0);
-                }
-                _ => {}
             }
+            "--name" => {
+                if let Some(value) = args.next() {
+                    options.name = Some(value);
+                }
+            }
+            "--help" | "-h" => {
+                println!("Sauerteig\n  Open without arguments to create or continue a saved world.\n  --server ws://127.0.0.1:3000/ws  Join directly\n  --name Player\n\nWASD move · Space jump · E edit · Esc release mouse");
+                std::process::exit(0);
+            }
+            _ => {}
         }
-        options
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let location = web_sys::window().unwrap().location();
-        let params =
-            web_sys::UrlSearchParams::new_with_str(&location.search().unwrap_or_default()).unwrap();
-        let name = params.get("name");
-        let server = params
-            .get("server")
-            .or_else(|| name.as_ref().map(|_| launcher::default_server()));
-        LaunchOptions { server, name }
-    }
+    options
 }
 pub fn run() {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-            .try_init();
-    }
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
     let options = options();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let app = App {
+    let mut app = App {
         runtime: None,
         window: None,
         proxy: event_loop.create_proxy(),
         options: Some(options),
     };
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut app = app;
-        event_loop.run_app(&mut app).expect("run game");
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        use winit::platform::web::EventLoopExtWebSys;
-        event_loop.spawn_app(app);
-    }
-}
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn start() {
-    console_error_panic_hook::set_once();
-    let _ = console_log::init_with_level(log::Level::Warn);
-    run();
+    event_loop.run_app(&mut app).expect("run game");
 }
 
 #[cfg(test)]

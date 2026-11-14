@@ -147,7 +147,6 @@ async fn two_builders_share_a_large_sparse_paste_with_a_live_fighter_and_reload_
     let temporary = TemporaryWorld::new();
     let config = Config {
         world_path: temporary.0.join("world.json"),
-        web_dir: temporary.0.join("web"),
         editing_allowed: true,
     };
     let mut expected_world = World::empty();

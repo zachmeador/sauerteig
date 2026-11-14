@@ -1,4 +1,4 @@
-//! Embedded, offline material library shared by native and WebGPU builds.
+//! Embedded, offline material library.
 use sauerteig_core::MATERIAL_NAMES;
 use wgpu::util::DeviceExt;
 

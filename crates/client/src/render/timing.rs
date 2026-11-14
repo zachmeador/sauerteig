@@ -90,7 +90,6 @@ impl GpuTiming {
         self.latest_serial
     }
     pub fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        #[cfg(not(target_arch = "wasm32"))]
         device.poll(wgpu::Maintain::Poll);
         for slot in &mut self.slots {
             if slot.rendered.swap(false, Ordering::AcqRel) {
@@ -193,16 +192,7 @@ impl GpuTiming {
             slot.serial = self.serial;
             slot.labels.clone_from(&self.labels);
             let rendered = slot.rendered.clone();
-            #[cfg(not(target_arch = "wasm32"))]
             queue.on_submitted_work_done(move || rendered.store(true, Ordering::Release));
-            // wgpu 24's WebGPU backend has no completion callback implementation.
-            // Resolve on the next frame's queue submission; WebGPU orders query
-            // writes and resolution, and map_async handles readback completion.
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = queue;
-                rendered.store(true, Ordering::Release);
-            }
         }
     }
 }

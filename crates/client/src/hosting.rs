@@ -41,7 +41,6 @@ impl HostedServer {
         let (shutdown, stopped) = oneshot::channel();
         let config = sauerteig_server::Config {
             world_path,
-            web_dir: web_directory(),
             ..Default::default()
         };
         let thread = thread::Builder::new()
@@ -123,25 +122,6 @@ impl Drop for HostedServer {
             }
         }
     }
-}
-
-fn web_directory() -> PathBuf {
-    if let Some(path) = std::env::var_os("SAUERTEIG_WEB_DIR") {
-        return path.into();
-    }
-    if let Some(resources) = std::env::current_exe()
-        .ok()
-        .and_then(|executable| {
-            executable
-                .parent()?
-                .parent()
-                .map(|p| p.join("Resources/web"))
-        })
-        .filter(|path| path.join("index.html").is_file())
-    {
-        return resources;
-    }
-    PathBuf::from("web/dist")
 }
 
 #[cfg(test)]

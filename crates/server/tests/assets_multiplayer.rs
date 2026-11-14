@@ -214,7 +214,6 @@ async fn textured_geometry_and_props_survive_combat_delayed_clients_and_reload()
     let temporary = TemporaryWorld::new();
     let config = Config {
         world_path: temporary.0.join("world.json"),
-        web_dir: temporary.0.join("web"),
         editing_allowed: true,
     };
     let mut expected_world = World::empty();
