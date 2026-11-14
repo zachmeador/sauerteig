@@ -16,18 +16,19 @@ fi
 
 cargo build --release --locked -p sauerteig-client --bin sauerteig-client
 
+# Each build is a fresh bundle, so nothing carries over from an older copy,
+# such as the quarantine flag of one that was downloaded or sent by AirDrop.
 sauerteig_app="$SAUERTEIG_ROOT/.local/Sauerteig.app"
-mkdir -p "$sauerteig_app/Contents/MacOS"
-mkdir -p "$sauerteig_app/Contents/Resources"
-rm -rf "$sauerteig_app/Contents/Resources/web"
-cp LICENSE THIRD_PARTY_NOTICES.md "$sauerteig_app/Contents/Resources/"
-mkdir -p "$sauerteig_app/Contents/Resources/asset-provenance"
-cp assets/materials/manifest.json "$sauerteig_app/Contents/Resources/asset-provenance/materials.json"
-cp assets/props/manifest.json "$sauerteig_app/Contents/Resources/asset-provenance/props.json"
-cp "${CARGO_TARGET_DIR:-target}/release/sauerteig-client" "$sauerteig_app/Contents/MacOS/sauerteig-client.next"
-mv "$sauerteig_app/Contents/MacOS/sauerteig-client.next" "$sauerteig_app/Contents/MacOS/sauerteig-client"
-chmod +x "$sauerteig_app/Contents/MacOS/sauerteig-client"
-cat > "$sauerteig_app/Contents/Info.plist" <<'PLIST'
+staging="$SAUERTEIG_ROOT/.local/Sauerteig.app.next"
+rm -rf "$staging"
+mkdir -p "$staging/Contents/MacOS"
+mkdir -p "$staging/Contents/Resources/asset-provenance"
+cp LICENSE THIRD_PARTY_NOTICES.md "$staging/Contents/Resources/"
+cp assets/materials/manifest.json "$staging/Contents/Resources/asset-provenance/materials.json"
+cp assets/props/manifest.json "$staging/Contents/Resources/asset-provenance/props.json"
+cp "${CARGO_TARGET_DIR:-target}/release/sauerteig-client" "$staging/Contents/MacOS/sauerteig-client"
+chmod +x "$staging/Contents/MacOS/sauerteig-client"
+cat > "$staging/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -60,5 +61,12 @@ cat > "$sauerteig_app/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# An ad hoc signature covers the bundle's Info.plist and resources. The linker
+# signs only the executable, and macOS calls such a bundle damaged once it is
+# quarantined. Ad hoc signing needs no Apple developer account.
+codesign --force --sign - "$staging"
+rm -rf "$sauerteig_app"
+mv "$staging" "$sauerteig_app"
+
 echo "Local development app ready: $sauerteig_app"
-echo "The app is unsigned. Open it to continue, create a world, or join a server."
+echo "The app is signed ad hoc, not by a registered developer. Open it to create a world or join a server."

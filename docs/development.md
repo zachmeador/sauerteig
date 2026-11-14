@@ -37,8 +37,9 @@ cargo build --locked -p sauerteig-server -p sauerteig-client
 
 Install the checks once with `rustup component add rustfmt clippy`.
 
-On macOS, `./scripts/build-macos-app.sh` packages an unsigned development app in
-`.local/Sauerteig.app`. Local hosting is linked into the app. The script honors
+On macOS, `./scripts/build-macos-app.sh` packages a development app in
+`.local/Sauerteig.app`, built fresh each time and signed ad hoc, which needs no
+Apple developer account. Local hosting is linked into the app. The script honors
 `CARGO_TARGET_DIR`.
 
 GitHub Actions checks formatting and Clippy, tests the workspace, and builds the
