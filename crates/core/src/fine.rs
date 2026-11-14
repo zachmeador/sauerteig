@@ -1,12 +1,11 @@
-//! Sparse exact subdivision. A fragment retains its authored source cell and
-//! clips that solid to an eighth-metre box; subdivision never resamples a slope.
+//! Format 3's exact subdivision. A fragment retains its authored source cell
+//! and clips that solid to an eighth-metre box; subdivision never resamples a
+//! slope. The tree stores such a clip as exact pieces.
 use crate::{Cell, CellEdit, CellPos, ChunkKey, Vec3, World};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 pub const FINE_UNITS: i32 = 8;
-pub const MAX_ROOT_FRAGMENTS: usize = 512;
 /// Legacy octree leaves may author a large slope once and clip it into many
 /// one-metre roots. Bound the source to 8 km so coordinate math stays precise.
 pub const MAX_FRAGMENT_SOURCE_SIZE: u32 = 65_536;
@@ -124,27 +123,14 @@ pub struct RootEdit {
     pub fragments: Vec<CellFragment>,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct FineTriangle {
-    pub points: [Vec3; 3],
-    pub face: u8,
-    pub fragment: usize,
-}
-#[derive(Clone, Debug)]
-pub(crate) struct FineRoot {
-    pub fragments: Arc<Vec<CellFragment>>,
-    pub triangles: Vec<FineTriangle>,
-}
-
 pub fn validate_root_edits(edits: &[RootEdit]) -> Result<(), String> {
     let mut roots = BTreeSet::new();
     for edit in edits {
         if !World::is_valid_pos(edit.pos) || !roots.insert(edit.pos) {
             return Err("Invalid or repeated detailed root.".into());
         }
-        if edit.fragments.len() > MAX_ROOT_FRAGMENTS {
-            return Err("A root has too many fragments; simplify the edit.".into());
-        }
+        // Disjoint fragments inside one metre number at most 512, so this
+        // check ends within the first 513.
         let root = FineBox::root(edit.pos);
         for (i, f) in edit.fragments.iter().enumerate() {
             if !f.is_valid() || !root.contains(f.bounds) {
@@ -254,425 +240,117 @@ impl World {
     pub fn from_parts(cells: &[CellEdit], roots: &[RootEdit]) -> Result<Self, String> {
         Self::from_compact_parts(crate::WorldBounds::default(), &[], cells, roots)
     }
+
+    /// A metre's content in as few fragments as stay exact.
     pub fn root_fragments(&self, pos: CellPos) -> Vec<CellFragment> {
-        if let Some(root) = self.fine.get(&pos) {
-            return root.fragments.as_ref().clone();
-        }
-        if let Some(cell) = self.get(pos) {
-            return vec![CellFragment::from_cell(pos, cell)];
-        }
-        if self.overrides.contains(&pos) || !self.contains_pos(pos) {
-            return Vec::new();
-        }
-        let bounds = FineBox::root(pos);
-        self.compact
-            .query(bounds)
-            .into_iter()
-            .filter_map(|id| self.compact.regions[id].source.clipped(bounds))
-            .filter(|f| fragment_intersects_box(f, bounds.world_min(), bounds.world_max()))
-            .collect()
+        self.tree.root_fragments(pos)
     }
+
+    /// Metres that hold detail below a metre, with their content.
     pub fn detailed_roots(&self) -> Vec<RootEdit> {
-        self.fine
-            .iter()
-            .map(|(&pos, r)| RootEdit {
-                pos,
-                fragments: r.fragments.as_ref().clone(),
-            })
-            .collect()
+        self.tree.detailed_roots()
     }
+
     /// Legacy convenience for bounded selections. Use try_roots_in to report limits.
     pub fn roots_in(&self, bounds: FineBox) -> Vec<RootEdit> {
         self.try_roots_in(bounds, crate::MAX_QUERY_ROOTS)
             .unwrap_or_default()
     }
+
+    /// Replaces the geometry and surface materials of whole metres, keeping
+    /// their cube material, and returns the mesh units to build again. Nothing
+    /// changes unless every edit is valid. A write that changes nothing leaves
+    /// the tree as it was.
     pub fn apply_root_edits(&mut self, edits: &[RootEdit]) -> Result<Vec<ChunkKey>, String> {
+        let before = self.tree.clone();
+        self.write_roots(edits)?;
+        let changes = self.tree.changes_from(&before);
+        if changes.changed.is_empty() {
+            self.tree = before;
+            return Ok(Vec::new());
+        }
+        Ok(self.tree.dirty_units(&changes))
+    }
+
+    /// Writes whole metres into the tree, after validating every edit.
+    pub(crate) fn write_roots(&mut self, edits: &[RootEdit]) -> Result<(), String> {
         validate_root_edits(edits)?;
         if edits.iter().any(|e| !self.contains_pos(e.pos)) {
             return Err("Edit lies outside this world.".into());
         }
-        // Compile every replacement before mutating anything; clipping failures
-        // cannot leave a half-applied collaborative operation.
-        enum Prepared {
-            Coarse(Cell),
-            Detailed(FineRoot),
-        }
-        let mut prepared = Vec::with_capacity(edits.len());
+        let mut shapes = crate::octree::ShapeCache::default();
+        let mut writes = Vec::with_capacity(edits.len());
         for edit in edits {
-            let normalized = canonical_root_fragments(edit.pos, &edit.fragments);
-            if let [fragment] = normalized.as_slice() {
-                if fragment.bounds == FineBox::root(edit.pos)
-                    && fragment.origin == fragment.bounds.min
-                    && fragment.size == 8
-                {
-                    prepared.push((edit.pos, Prepared::Coarse(fragment.cell)));
-                    continue;
-                }
+            let mut fragments = Vec::with_capacity(edit.fragments.len());
+            for f in &edit.fragments {
+                let (source, visible) =
+                    shapes.source(crate::octree::source_of(f.origin, f.size, &f.cell))?;
+                let faces =
+                    crate::octree::lattice::fill_faces(visible, crate::octree::faces_of(&f.cell));
+                fragments.push((f.bounds, source, faces));
             }
-            let mut fragments = Vec::new();
-            let mut triangles = Vec::new();
-            for fragment in &normalized {
-                if !fragment_intersects_box(
-                    fragment,
-                    fragment.bounds.world_min(),
-                    fragment.bounds.world_max(),
-                ) {
-                    continue;
-                }
-                let source = clip_fragment(fragment)?;
-                let index = fragments.len();
-                for (points, face) in source {
-                    triangles.push(FineTriangle {
-                        points,
-                        face,
-                        fragment: index,
-                    });
-                }
-                fragments.push(fragment.clone());
-            }
-            prepared.push((
-                edit.pos,
-                Prepared::Detailed(FineRoot {
-                    fragments: Arc::new(fragments),
-                    triangles,
-                }),
-            ));
+            writes.push((FineBox::root(edit.pos), fragments));
         }
-        let changed: BTreeSet<_> = prepared
-            .iter()
-            .zip(edits)
-            .filter_map(|((pos, value), edit)| {
-                let previous = self.root_fragments(*pos);
-                if previous == edit.fragments {
-                    return None;
-                }
-                let same = match value {
-                    Prepared::Coarse(cell) => {
-                        previous == vec![CellFragment::from_cell(*pos, *cell)]
-                    }
-                    Prepared::Detailed(root) => previous == *root.fragments,
-                };
-                (!same).then_some(*pos)
-            })
-            .collect();
-        let positions: Vec<_> = changed.iter().copied().collect();
-        let masks = self.compact.prepare_masks(&positions)?;
-        let mut dirty = self.dirty_region_keys(&positions);
-        self.compact.apply_masks(masks);
-        for (pos, prepared) in prepared {
-            if !changed.contains(&pos) {
-                continue;
+        for (metre, fragments) in writes {
+            self.tree.clear_geometry(metre);
+            for &(bounds, source, faces) in &fragments {
+                self.tree.insert_source(bounds, source, faces);
             }
-            match prepared {
-                Prepared::Coarse(cell) => {
-                    if self.get(pos) == Some(cell) && !self.fine.contains_key(&pos) {
-                        continue;
-                    }
-                    self.set_storage(pos, Some(cell));
-                }
-                Prepared::Detailed(root) => {
-                    self.set_storage(pos, None);
-                    if !root.fragments.is_empty() {
-                        self.authored_roots.insert(pos, root.fragments.clone());
-                        self.fine.insert(pos, Arc::new(root));
-                    }
-                }
-            }
-            if self.has_regions() {
-                self.overrides.insert(pos);
-            }
-            let key = Self::cell_chunk(pos);
-            dirty.insert(key);
-            for a in 0..3 {
-                for step in [-1, 1] {
-                    let mut next = key;
-                    next[a] += step;
-                    dirty.insert(next);
+            for &(_, source, faces) in &fragments {
+                if source.size > 8 && !crate::octree::lattice::is_solid(source.shape) {
+                    self.tree.remerge(source, faces, metre);
                 }
             }
         }
-        Ok(dirty.into_iter().collect())
+        Ok(())
     }
-}
-
-pub(crate) fn fragment_intersects_box(fragment: &CellFragment, min: Vec3, max: Vec3) -> bool {
-    let min = min.max(fragment.bounds.world_min());
-    let max = max.min(fragment.bounds.world_max());
-    min.cmplt(max).all()
-        && crate::geometry::cell_intersects_box_scaled(
-            fragment.world_origin(),
-            fragment.world_size(),
-            fragment.cell,
-            min,
-            max,
-        )
-}
-
-pub(crate) fn clip_fragment(fragment: &CellFragment) -> Result<Vec<([Vec3; 3], u8)>, String> {
-    // The common fine floor/wall/box needs no polygon clipping or cap solving.
-    if fragment.cell.is_full() {
-        let min = fragment.bounds.world_min();
-        let span = fragment.bounds.world_max() - min;
-        return Ok(
-            crate::geometry::shape_triangles(crate::Shape::solid(), Vec3::ZERO, 1.0)
-                .into_iter()
-                .flatten()
-                .map(|(t, face)| (t.map(|p| min + p * span), face))
-                .collect(),
-        );
-    }
-    let origin = glam::DVec3::from_array(fragment.origin.map(|v| v as f64 / 8.0));
-    let size = fragment.size as f64 / 8.0;
-    let mut triangles: Vec<_> =
-        crate::geometry::shape_triangles(fragment.cell.as_shape(), Vec3::ZERO, 1.0)
-            .into_iter()
-            .flatten()
-            .map(|(t, f)| (t.map(|p| origin + p.as_dvec3() * size), f))
-            .collect();
-    for axis in 0..3 {
-        for (plane, keep_sign, face) in [
-            (
-                fragment.bounds.min[axis] as f64 / 8.0,
-                1.0,
-                (axis * 2) as u8,
-            ),
-            (
-                fragment.bounds.max[axis] as f64 / 8.0,
-                -1.0,
-                (axis * 2 + 1) as u8,
-            ),
-        ] {
-            triangles = clip_plane(triangles, axis, plane, keep_sign, face)?;
-        }
-    }
-    Ok(triangles
-        .into_iter()
-        .map(|(t, f)| (t.map(|p| p.as_vec3()), f))
-        .collect())
-}
-
-const CLIP_EPS: f64 = 1.0e-9;
-type DTriangle = ([glam::DVec3; 3], u8);
-fn same_point(a: glam::DVec3, b: glam::DVec3) -> bool {
-    a.distance_squared(b) < CLIP_EPS * CLIP_EPS
-}
-
-fn clip_plane(
-    triangles: Vec<DTriangle>,
-    axis: usize,
-    plane: f64,
-    keep_sign: f64,
-    cap_face: u8,
-) -> Result<Vec<DTriangle>, String> {
-    let mut result = Vec::new();
-    let mut edges = Vec::new();
-    for (triangle, face) in triangles {
-        let distances = triangle.map(|p| (p[axis] - plane) * keep_sign);
-        if distances.iter().all(|&d| d >= -CLIP_EPS) {
-            for i in 0..3 {
-                let a = triangle[i];
-                let b = triangle[(i + 1) % 3];
-                if (a[axis] - plane).abs() < CLIP_EPS
-                    && (b[axis] - plane).abs() < CLIP_EPS
-                    && !same_point(a, b)
-                {
-                    edges.push((b, a));
-                }
-            }
-            result.push((triangle, face));
-            continue;
-        }
-        if distances.iter().all(|&d| d <= CLIP_EPS) {
-            continue;
-        }
-        let mut polygon = Vec::with_capacity(4);
-        for i in 0..3 {
-            let j = (i + 1) % 3;
-            let a = triangle[i];
-            let b = triangle[j];
-            let da = distances[i];
-            let db = distances[j];
-            if da >= -CLIP_EPS {
-                polygon.push(a);
-            }
-            if (da > CLIP_EPS && db < -CLIP_EPS) || (da < -CLIP_EPS && db > CLIP_EPS) {
-                let mut p = a.lerp(b, da / (da - db));
-                p[axis] = plane;
-                polygon.push(p);
-            }
-        }
-        if polygon.len() < 3 {
-            continue;
-        }
-        for i in 0..polygon.len() {
-            let a = polygon[i];
-            let b = polygon[(i + 1) % polygon.len()];
-            if (a[axis] - plane).abs() < CLIP_EPS
-                && (b[axis] - plane).abs() < CLIP_EPS
-                && !same_point(a, b)
-            {
-                edges.push((b, a));
-            }
-        }
-        for i in 1..polygon.len() - 1 {
-            let t = [polygon[0], polygon[i], polygon[i + 1]];
-            if (t[1] - t[0]).cross(t[2] - t[0]).length_squared()
-                > (CLIP_EPS * CLIP_EPS) * (CLIP_EPS * CLIP_EPS)
-            {
-                result.push((t, face));
-            }
-        }
-    }
-    // Split collinear segments at every endpoint before cancelling opposite
-    // copies. Existing triangulation can put a T junction on a cut plane.
-    let endpoints: Vec<_> = edges.iter().flat_map(|&(a, b)| [a, b]).collect();
-    let mut pieces = Vec::new();
-    for (a, b) in edges {
-        let d = b - a;
-        let length = d.length_squared();
-        let mut cuts = vec![0.0, 1.0];
-        for &p in &endpoints {
-            let t = (p - a).dot(d) / length;
-            if t > CLIP_EPS && t < 1.0 - CLIP_EPS && same_point(a + d * t, p) {
-                cuts.push(t);
-            }
-        }
-        cuts.sort_by(f64::total_cmp);
-        cuts.dedup_by(|a, b| (*a - *b).abs() < CLIP_EPS);
-        for pair in cuts.windows(2) {
-            pieces.push((a + d * pair[0], a + d * pair[1]));
-        }
-    }
-    let mut edges: Vec<(glam::DVec3, glam::DVec3)> = Vec::new();
-    for (a, b) in pieces {
-        if let Some(index) = edges
-            .iter()
-            .position(|&(c, d)| same_point(a, d) && same_point(b, c))
-        {
-            edges.swap_remove(index);
-        } else {
-            edges.push((a, b));
-        }
-    }
-    if edges.is_empty() {
-        return Ok(result);
-    }
-    let u = (axis + 1) % 3;
-    let v = (axis + 2) % 3;
-    let mut loops: Vec<Vec<glam::DVec3>> = Vec::new();
-    while let Some((start, mut end)) = edges.pop() {
-        let mut points = vec![start];
-        let mut previous = start;
-        let mut guard = 0;
-        while !same_point(end, start) {
-            points.push(end);
-            guard += 1;
-            if guard > 256 {
-                return Err("Subdivision cap exceeded its boundary budget.".into());
-            }
-            let incoming = end - previous;
-            let candidates: Vec<_> = edges
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| same_point(e.0, end))
-                .collect();
-            let chosen = candidates
-                .into_iter()
-                .max_by(|(_, a), (_, b)| {
-                    let turn = |to: glam::DVec3| {
-                        let outgoing = to - end;
-                        let cross = incoming[u] * outgoing[v] - incoming[v] * outgoing[u];
-                        libm::atan2(
-                            -keep_sign * cross,
-                            incoming[u] * outgoing[u] + incoming[v] * outgoing[v],
-                        )
-                    };
-                    turn(a.1).total_cmp(&turn(b.1))
-                })
-                .map(|(index, _)| index)
-                .ok_or_else(|| "Subdivision cap boundary did not close.".to_string())?;
-            let next = edges.swap_remove(chosen);
-            previous = end;
-            end = next.1;
-        }
-        if points.len() >= 3 {
-            loops.push(points);
-        }
-    }
-    let area = |points: &[glam::DVec3]| {
-        points
-            .iter()
-            .zip(points.iter().cycle().skip(1))
-            .take(points.len())
-            .map(|(a, b)| a[u] * b[v] - b[u] * a[v])
-            .sum::<f64>()
-            * 0.5
-    };
-    let areas: Vec<_> = loops.iter().map(|p| area(p)).collect();
-    let outer: Vec<_> = (0..loops.len())
-        .filter(|&i| areas[i] * (-keep_sign) > CLIP_EPS * CLIP_EPS)
-        .collect();
-    let holes: Vec<_> = (0..loops.len())
-        .filter(|&i| areas[i] * (-keep_sign) < -CLIP_EPS * CLIP_EPS)
-        .collect();
-    if outer.is_empty() {
-        return Err("Subdivision cap has no exterior boundary.".into());
-    }
-    let contains = |ring: &[glam::DVec3], point: glam::DVec3| {
-        let mut inside = false;
-        for i in 0..ring.len() {
-            let a = ring[i];
-            let b = ring[(i + 1) % ring.len()];
-            if (a[v] > point[v]) != (b[v] > point[v])
-                && point[u] < (b[u] - a[u]) * (point[v] - a[v]) / (b[v] - a[v]) + a[u]
-            {
-                inside = !inside;
-            }
-        }
-        inside
-    };
-    let mut assignments = vec![Vec::new(); loops.len()];
-    for h in holes {
-        let owner = outer
-            .iter()
-            .copied()
-            .filter(|&o| contains(&loops[o], loops[h][0]))
-            .min_by(|&a, &b| areas[a].abs().total_cmp(&areas[b].abs()))
-            .ok_or_else(|| "Subdivision cap hole has no exterior.".to_string())?;
-        assignments[owner].push(h);
-    }
-    for o in outer {
-        let mut points = loops[o].clone();
-        let mut hole_indices = Vec::new();
-        let mut expected_area = areas[o].abs();
-        for &h in &assignments[o] {
-            hole_indices.push(points.len());
-            points.extend_from_slice(&loops[h]);
-            expected_area -= areas[h].abs();
-        }
-        let coordinates: Vec<_> = points.iter().flat_map(|p| [p[u], p[v]]).collect();
-        let indices = earcutr::earcut(&coordinates, &hole_indices, 2)
-            .map_err(|e| format!("Subdivision cap triangulation failed: {e:?}"))?;
-        let mut actual_area = 0.0;
-        for ids in indices.as_chunks::<3>().0 {
-            let mut t = [points[ids[0]], points[ids[1]], points[ids[2]]];
-            let cross = (t[1] - t[0]).cross(t[2] - t[0]);
-            actual_area += cross[axis].abs() * 0.5;
-            if cross[axis] * (-keep_sign) < 0.0 {
-                t.swap(1, 2);
-            }
-            result.push((t, cap_face));
-        }
-        if (actual_area - expected_area).abs() > 1.0e-8_f64.max(expected_area * 1.0e-7) {
-            return Err("Subdivision cap triangulation did not preserve its area.".into());
-        }
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LeafGeometry, Shape};
+
+    /// The volume of a world's solid geometry, from its leaves.
+    fn solid_volume(world: &World) -> f32 {
+        let signed = |triangles: Vec<[Vec3; 3]>| {
+            triangles
+                .iter()
+                .map(|t| t[0].dot(t[1].cross(t[2])) / 6.0)
+                .sum::<f32>()
+        };
+        let mut volume = 0.0;
+        world.tree.for_each_leaf(|at, leaf| {
+            let lattice = |shape: Shape, origin: [i32; 3], size: u32| -> Vec<[Vec3; 3]> {
+                crate::octree::lattice::triangles(shape)
+                    .as_slice()
+                    .iter()
+                    .map(|(t, _)| {
+                        t.map(|p| {
+                            Vec3::from_array(std::array::from_fn(|a| {
+                                (origin[a] * 8 + p[a] * size as i32) as f32 / 64.0
+                            }))
+                        })
+                    })
+                    .collect()
+            };
+            volume += match leaf.geometry {
+                LeafGeometry::Empty => 0.0,
+                LeafGeometry::Full => {
+                    let edge = at.size as f32 / 8.0;
+                    edge * edge * edge
+                }
+                LeafGeometry::Shaped(shape) => signed(lattice(shape, at.min, at.size)),
+                LeafGeometry::Piece(source) => signed(
+                    crate::octree::mesh::piece_triangles(&source, at.fine_box())
+                        .into_iter()
+                        .map(|(t, _, _)| t.map(|p| p.as_vec3()))
+                        .collect(),
+                ),
+            };
+        });
+        volume
+    }
 
     fn refined(cell: Cell, step: i32) -> RootEdit {
         let source = CellFragment::from_cell([0, 0, 0], cell);
@@ -752,17 +430,14 @@ mod tests {
                 let mut direction = Vec3::ZERO;
                 direction[axis] = -1.0;
                 let hit = world.raycast(origin, direction, 4.0).unwrap();
-                assert_eq!(hit.bounds, fragment.bounds);
+                // The hit's bounds are the leaf it struck, inside the fragment.
+                assert!(fragment.bounds.contains(hit.bounds));
                 assert_eq!(hit.face, (axis * 2 + 1) as u8);
                 assert!((hit.point[axis] - fragment.bounds.world_max()[axis]).abs() < 1.0e-5);
             }
             assert!(world.intersects_box(center - Vec3::splat(0.01), center + Vec3::splat(0.01)));
             assert!(!world.intersects_box(Vec3::splat(0.001), Vec3::splat(0.1)));
-            let volume = world.fine[&[0, 0, 0]]
-                .triangles
-                .iter()
-                .map(|t| t.points[0].dot(t.points[1].cross(t.points[2])) / 6.0)
-                .sum::<f32>();
+            let volume = solid_volume(&world);
             assert!(
                 (volume - {
                     let edge = size as f32 / 8.0;
@@ -831,7 +506,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(world.root_fragments([0, 0, 0]), vec![expected.clone()]);
-        assert_eq!(world.fine[&[0, 0, 0]].triangles.len(), 12);
         half.reverse();
         assert!(world
             .apply_root_edits(&[RootEdit {
@@ -1023,13 +697,7 @@ mod tests {
                     .map(|(t, _)| t)
                     .collect(),
             );
-            let after = volume(
-                fine.fine[&[0, 0, 0]]
-                    .triangles
-                    .iter()
-                    .map(|t| t.points)
-                    .collect(),
-            );
+            let after = solid_volume(&fine);
             assert!(
                 (before - after).abs() < 2.0e-5,
                 "volume {before} != {after}"
@@ -1142,8 +810,15 @@ mod tests {
             .is_err());
         assert_eq!(world.cells(), before.cells());
         assert_eq!(world.detailed_roots(), before.detailed_roots());
-        let json = serde_json::to_string(&world).unwrap();
-        let restored: World = serde_json::from_str(&json).unwrap();
+        let snapshot = world.snapshot();
+        let restored = World::from_compact_parts(
+            snapshot.bounds(),
+            snapshot.regions(),
+            &snapshot.cells(),
+            &snapshot.root_overrides(),
+        )
+        .unwrap();
+        assert_eq!(restored.digest(), world.digest());
         assert_eq!(restored.cells(), world.cells());
         assert_eq!(restored.detailed_roots(), world.detailed_roots());
         assert_eq!(
@@ -1234,7 +909,11 @@ mod tests {
                     fragments: vec![fragment.clone()],
                 }])
                 .unwrap();
-            assert_eq!(world.root_fragments([0, 1, 0]), vec![fragment]);
+            // Deep inside its source's solid, the clip is a full eighth.
+            let kept = world.root_fragments([0, 1, 0]);
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].bounds, fragment.bounds);
+            assert!(kept[0].cell.is_full());
             assert!(world.intersects_box(Vec3::new(0.02, 1.02, 0.02), Vec3::new(0.04, 1.04, 0.04)));
             let hit = world
                 .raycast(Vec3::new(0.0625, 3.0, 0.0625), -Vec3::Y, 4.0)

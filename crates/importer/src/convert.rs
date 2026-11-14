@@ -350,15 +350,16 @@ pub fn convert(
         );
     }
     let volumes = coalesce_material_volumes(volumes);
+    // The world validates the result; the file keeps the regions read from
+    // the map, as before the tree, until the importer builds the tree itself.
     let mut world = World::from_compact_parts(bounds, &regions, &[], &[])
         .map_err(|e| format!("imported geometry validation failed: {e}"))?;
     world
         .replace_volumes(&volumes)
         .map_err(|e| format!("imported material-volume validation failed: {e}"))?;
     report.imported_volume_boxes = volumes.len();
-    let regions = world.regions();
-    let cells = world.cells();
-    let roots = world.root_overrides();
+    let cells: Vec<CellEdit> = Vec::new();
+    let roots: Vec<RootEdit> = Vec::new();
     report.imported_coarse_cells = cells.len();
     report.imported_detailed_roots = roots.len();
     report.imported_regions = regions.len();

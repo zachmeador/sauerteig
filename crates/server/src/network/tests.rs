@@ -3,7 +3,9 @@ use crate::{
     bots::Bot,
     persistence::{write_world, SavedWorld},
 };
-use sauerteig_core::{Cell, CellEdit, WorldBounds, WORLD_FORMAT_VERSION};
+use sauerteig_core::{
+    canonical_root_fragments, Cell, CellEdit, World, WorldBounds, WORLD_FORMAT_VERSION,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct TestRoom {
@@ -33,10 +35,15 @@ impl TestRoom {
                 max: [128, 128, 128],
             },
             regions: vec![],
+            // A checkerboard, so equal cubes cannot merge and the world keeps
+            // its size on the wire.
             cells: (0..cells)
-                .map(|i| CellEdit {
-                    pos: [(i % 64) as i32, (i / 4096) as i32, (i / 64 % 64) as i32],
-                    cell: Some(Cell::solid(0)),
+                .map(|i| {
+                    let pos = [(i % 64) as i32, (i / 4096) as i32, (i / 64 % 64) as i32];
+                    CellEdit {
+                        pos,
+                        cell: Some(Cell::solid(((pos[0] + pos[1] + pos[2]) % 2) as u8)),
+                    }
                 })
                 .collect(),
             roots: vec![],
@@ -447,6 +454,17 @@ fn blueprint(bot: &Bot, roots: usize) -> Vec<sauerteig_core::RootEdit> {
         .take(roots)
         .collect()
 }
+/// The roots `blueprint` sends in a `TestRoom`.
+fn blueprint_roots(roots: usize) -> Vec<sauerteig_core::RootEdit> {
+    let bounds = WorldBounds {
+        min: [0, 0, 0],
+        max: [128, 128, 128],
+    };
+    crate::bots::largest_blueprint(bounds, 1)
+        .into_iter()
+        .take(roots)
+        .collect()
+}
 async fn saved(room: &TestRoom) -> SavedWorld {
     room.simulation
         .request(|reply| Command::Save { force: true, reply })
@@ -586,7 +604,15 @@ async fn an_edit_in_flight_when_its_client_leaves_without_sync_still_commits() {
     builder.socket.close(None).await.unwrap();
     drop(builder);
     wait_for_revision(&room, 1).await;
-    assert_eq!(saved(&room).await.roots.len(), 2048);
+    let saved = saved(&room).await;
+    let world = World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)
+        .unwrap();
+    for root in blueprint_roots(2048) {
+        assert_eq!(
+            world.root_fragments(root.pos),
+            canonical_root_fragments(root.pos, &root.fragments)
+        );
+    }
     // The connection lingers only until its work is done.
     wait_for_players(&room, 0).await;
     room.finish().await;

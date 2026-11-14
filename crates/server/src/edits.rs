@@ -59,7 +59,10 @@ pub(crate) struct PreparedEdit {
     before: Arc<Vec<RootEdit>>,
     history_after: Arc<Vec<RootEdit>>,
     retired_history: Vec<UndoEntry>,
-    costs: Vec<RootCost>,
+    /// The format 3 pieces and bytes the edit adds, from every leaf it
+    /// changed, including leaves split outside the metres it names.
+    size: Size,
+    stats: TreeStats,
     volume_bytes: usize,
     volumes_before: Option<Vec<MaterialVolume>>,
     volumes_after: Option<Vec<MaterialVolume>>,
@@ -73,6 +76,7 @@ impl EditPlan {
         if let EditAction::Raw(message) = self.action {
             self.action = transaction(message)?;
         }
+        let start = self.world.clone();
         let old_volumes = self.world.volumes().to_vec();
         let (roots, charge) = match &self.action {
             EditAction::Transaction {
@@ -160,10 +164,8 @@ impl EditPlan {
                     .into(),
             );
         }
-        let costs = after
-            .iter()
-            .map(|root| RootCost::new(root, self.world.has_regions()))
-            .collect();
+        let size = Size::change(&self.world.piece_changes(&start));
+        let stats = self.world.stats();
         let volumes_before = (old_volumes != self.world.volumes()).then_some(old_volumes);
         let volumes_after = volumes_before
             .as_ref()
@@ -178,7 +180,8 @@ impl EditPlan {
             retired_history: Vec::new(),
             roots: after,
             before: Arc::new(before),
-            costs,
+            size,
+            stats,
             volume_bytes,
             volumes_before,
             volumes_after,
@@ -451,22 +454,24 @@ impl Session {
         if let Some(volumes) = &edit.volumes_after {
             self.validate_volume_fighter_overlap(volumes)?;
         }
-        let mut fragments = self.geometry_fragments;
-        let mut bytes = self.geometry_bytes;
-        for (root, added) in edit.roots.iter().zip(&edit.costs) {
-            let old = self
-                .geometry_root_costs
-                .get(&root.pos)
-                .copied()
-                .unwrap_or_default();
-            fragments = fragments - old.fragments + added.fragments;
-            bytes = bytes - old.bytes + added.bytes;
-        }
-        if fragments > MAX_WORLD_FRAGMENTS {
+        // The world's file must still open: its pieces within the guard and
+        // its geometry within the snapshot's bytes. An edit that adds nothing
+        // is never refused for size.
+        let fragments = (self.geometry_fragments as isize + edit.size.pieces).max(0) as usize;
+        let bytes = (self.geometry_bytes as isize + edit.size.bytes).max(0) as usize;
+        if fragments > MAX_WORLD_FRAGMENTS && edit.size.pieces > 0 {
             return Err("The room has reached its detailed geometry limit.".into());
         }
-        if bytes + edit.volume_bytes > MAX_GEOMETRY_BYTES {
+        let growth = edit.size.bytes + edit.volume_bytes as isize - self.volume_bytes as isize;
+        if bytes + edit.volume_bytes > MAX_GEOMETRY_BYTES && growth > 0 {
             return Err(SNAPSHOT_LIMIT_ERROR.into());
+        }
+        // The tree's own guard counts every leaf, water and glass included,
+        // exactly. An edit that adds no leaves passes, even in a world loaded
+        // over the guard.
+        let leaves = edit.stats.leaves();
+        if leaves > MAX_WORLD_PIECES && leaves > self.world_stats.leaves() {
+            return Err(WORLD_GUARD_ERROR.into());
         }
         if edit.roots.is_empty() && objects_after.is_empty() && edit.volumes_after.is_none() {
             return Ok(());
@@ -509,12 +514,8 @@ impl Session {
         self.geometry_fragments = fragments;
         self.geometry_bytes = bytes;
         self.volume_bytes = edit.volume_bytes;
-        for (root, cost) in edit.roots.iter().zip(edit.costs.iter().copied()) {
-            if cost.fragments == 0 {
-                self.geometry_root_costs.remove(&root.pos);
-            } else {
-                self.geometry_root_costs.insert(root.pos, cost);
-            }
+        self.world_stats = edit.stats;
+        for root in &edit.roots {
             self.cell_revisions.insert(root.pos, self.revision);
             self.root_changed_at.insert(root.pos, self.revision);
         }

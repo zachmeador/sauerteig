@@ -83,12 +83,15 @@ async fn root_patch(socket: &mut Socket, revision: u64, roots: &[RootEdit]) {
     }
 }
 
+/// The metres as the server's world gives them back.
 fn canonical_roots(roots: &[RootEdit]) -> Vec<RootEdit> {
+    let mut world = World::empty();
+    world.apply_root_edits(roots).unwrap();
     roots
         .iter()
         .map(|root| RootEdit {
             pos: root.pos,
-            fragments: sauerteig_core::canonical_root_fragments(root.pos, &root.fragments),
+            fragments: world.root_fragments(root.pos),
         })
         .collect()
 }
@@ -114,6 +117,7 @@ fn coarse_root(edit: CellEdit) -> RootEdit {
 }
 
 fn assert_world(actual: &World, expected: &World) {
+    assert_eq!(actual.digest(), expected.digest());
     assert_eq!(actual.cells(), expected.cells());
     assert_eq!(actual.detailed_roots(), expected.detailed_roots());
 }
@@ -456,9 +460,17 @@ async fn two_builders_share_a_large_sparse_paste_with_a_live_fighter_and_reload_
             let bytes = std::fs::read(&config.world_path).unwrap();
             let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             if saved["revision"] == 4 {
-                let cells: Vec<CellEdit> = serde_json::from_value(saved["cells"].clone()).unwrap();
-                let roots: Vec<RootEdit> = serde_json::from_value(saved["roots"].clone()).unwrap();
-                assert_world(&World::from_parts(&cells, &roots).unwrap(), &expected_world);
+                let part = |name: &str| saved.get(name).cloned().unwrap_or_default();
+                let regions: Vec<CellFragment> =
+                    serde_json::from_value(part("regions")).unwrap_or_default();
+                let cells: Vec<CellEdit> = serde_json::from_value(part("cells")).unwrap();
+                let roots: Vec<RootEdit> =
+                    serde_json::from_value(part("roots")).unwrap_or_default();
+                let bounds = serde_json::from_value(part("bounds")).unwrap();
+                assert_world(
+                    &World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap(),
+                    &expected_world,
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -505,20 +517,26 @@ async fn two_builders_share_a_large_sparse_paste_with_a_live_fighter_and_reload_
     .await;
     if let ServerMessage::Welcome {
         revision,
+        bounds,
+        regions,
         cells,
         roots,
         ..
     } = welcome
     {
         assert_eq!(revision, 4, "rejected overlap did not change the revision");
-        assert_world(&World::from_parts(&cells, &roots).unwrap(), &expected_world);
+        let world = World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap();
+        assert_world(&world, &expected_world);
+        // The tree needs no roots; the detailed metre keeps its two fragments.
+        assert!(roots.is_empty());
+        let detailed = expected_world.detailed_roots();
+        assert_eq!(detailed.len(), 1);
+        assert_eq!(world.root_fragments(detailed[0].pos), detailed[0].fragments);
+        assert_eq!(detailed[0].fragments.len(), 2);
         assert_eq!(
-            roots.len(),
-            1,
-            "ordinary roots remain coarse in the snapshot"
+            detailed[0].fragments[0].cell.shape.map(|s| s.vertices),
+            Some(shape.vertices)
         );
-        assert_eq!(roots[0].fragments.len(), 2);
-        assert_eq!(roots[0].fragments[0].cell.shape, Some(shape));
     }
     rejoined.close(None).await.unwrap();
     stop.send(()).unwrap();

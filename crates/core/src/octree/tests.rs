@@ -1,9 +1,6 @@
 use super::format3::subtree;
 use super::*;
-use crate::{
-    Cell, CellEdit, CellFragment, InputFrame, MaterialVolume, MovementProfile, Player, RayHit,
-    RootEdit, Vec3, World, FIXED_DT,
-};
+use crate::{Cell, CellEdit, CellFragment, MaterialVolume, RootEdit, Vec3, World};
 
 pub(crate) struct Rng(u64);
 
@@ -25,9 +22,6 @@ impl Rng {
     }
     pub(crate) fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
-    }
-    pub(crate) fn unit(&mut self) -> f32 {
-        (self.next() >> 40) as f32 / (1u64 << 24) as f32
     }
     fn shuffle<T>(&mut self, items: &mut [T]) {
         for i in (1..items.len()).rev() {
@@ -697,10 +691,56 @@ fn random_format3(rng: &mut Rng, regions: bool) -> Format3 {
     out
 }
 
-fn old_world(f: &Format3) -> World {
+/// A world loaded from format 3 as the server and clients load one.
+pub(crate) fn world_of(f: &Format3) -> World {
     let mut world = World::from_compact_parts(f.bounds, &f.regions, &f.cells, &f.roots).unwrap();
     world.replace_volumes(&f.volumes).unwrap();
     world
+}
+
+/// The checks the loader from before the octree made on format 3: at most
+/// 400,000 valid regions inside the bounds that do not overlap, valid cells
+/// and roots, each metre once, and valid boxes. Session 1 opened every
+/// library copy's output in that loader itself.
+pub(crate) fn old_loader_accepts(f: &Format3) -> Result<(), String> {
+    let fine = f.bounds.fine_box();
+    if !f.bounds.is_valid() || f.regions.len() > 400_000 {
+        return Err("bounds or region count".into());
+    }
+    let mut boxes: Vec<FineBox> = Vec::with_capacity(f.regions.len());
+    for region in &f.regions {
+        if !region.is_valid() || !fine.contains(region.bounds) {
+            return Err(format!("invalid region {region:?}"));
+        }
+        boxes.push(region.bounds);
+    }
+    boxes.sort_by_key(|b| b.min[0]);
+    for (i, a) in boxes.iter().enumerate() {
+        for b in &boxes[i + 1..] {
+            if b.min[0] >= a.max[0] {
+                break;
+            }
+            if a.intersection(*b).is_some() {
+                return Err(format!("regions overlap: {a:?} {b:?}"));
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for cell in &f.cells {
+        if !f.bounds.contains_pos(cell.pos)
+            || cell.cell.is_some_and(|c| !c.is_valid())
+            || !seen.insert(cell.pos)
+        {
+            return Err(format!("invalid cell {cell:?}"));
+        }
+    }
+    for root in &f.roots {
+        if !seen.insert(root.pos) || root.fragments.len() > 512 {
+            return Err(format!("invalid root {:?}", root.pos));
+        }
+    }
+    crate::validate_root_edits(&f.roots)?;
+    crate::validate_material_volumes(&f.volumes, fine)
 }
 
 #[test]
@@ -712,8 +752,9 @@ fn random_worlds_convert_to_format3_and_back_with_equal_digests() {
         assert_canonical(tree.root_node(), tree.root_box());
         let written = tree.to_format3();
         assert!(written.roots.is_empty());
-        // The loader from before the octree opens the result.
-        let reopened = old_world(&written);
+        // The loader from before the octree would open the result.
+        old_loader_accepts(&written).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        let reopened = world_of(&written);
         let again = Octree::from_format3(&written).unwrap();
         assert_eq!(again.digest(), tree.digest(), "seed {seed}");
         // Input order does not matter.
@@ -726,18 +767,11 @@ fn random_worlds_convert_to_format3_and_back_with_equal_digests() {
             Octree::from_format3(&shuffled).unwrap().digest(),
             tree.digest()
         );
-        // Today's world normalizes roots its own way; its snapshot holds the
-        // same content, and so does the world reopened from the output.
-        let world = old_world(&f3);
-        assert_eq!(
-            Octree::from_world(&world).unwrap().digest(),
-            tree.digest(),
-            "seed {seed}"
-        );
-        assert_eq!(
-            Octree::from_world(&reopened).unwrap().digest(),
-            tree.digest()
-        );
+        // A world loaded as the server loads one, its boxes written as cube
+        // material, holds the same tree, and so does the world reopened from
+        // the output.
+        assert_eq!(world_of(&f3).digest(), tree.digest(), "seed {seed}");
+        assert_eq!(reopened.digest(), tree.digest());
     }
 }
 
@@ -903,7 +937,7 @@ fn format3_writer_uses_cells_heights_and_boxes() {
     assert_eq!(tree.region_count(), 1);
     assert!(tree.cells().is_empty());
     assert_eq!(tree.get([1, 1, 1]), Some(Cell::solid(4)));
-    let reopened = old_world(&tree.to_format3());
+    let reopened = world_of(&tree.to_format3());
     for x in 0..2 {
         assert!(reopened.intersects_box(
             Vec3::new(x as f32 + 0.2, 0.2, 0.2),
@@ -913,142 +947,7 @@ fn format3_writer_uses_cells_heights_and_boxes() {
 }
 
 // ---------------------------------------------------------------------------
-// Queries against today's world.
-
-fn edge_box(world: &World, min: Vec3, max: Vec3) -> bool {
-    let d = Vec3::splat(2.0e-4);
-    world.intersects_box(min - d, max + d) != world.intersects_box(min + d, max - d)
-}
-
-fn compare_queries(world: &World, tree: &Octree, rng: &mut Rng, queries: usize) -> [usize; 4] {
-    let bounds = world.bounds();
-    let lo = bounds.world_min();
-    let span = bounds.world_max() - lo;
-    let point = |rng: &mut Rng| lo + Vec3::new(rng.unit(), rng.unit(), rng.unit()) * span;
-    let body = crate::physics::Body::new(0.3, 1.75);
-    let mut mismatches = [0; 4];
-    for _ in 0..queries {
-        // Box overlap.
-        let c = point(rng);
-        let h = Vec3::new(rng.unit(), rng.unit(), rng.unit()) * 0.6 + Vec3::splat(0.01);
-        let (min, max) = (c - h, c + h);
-        if world.intersects_box(min, max) != tree.intersects_box(min, max) {
-            assert!(edge_box(world, min, max), "box {min:?} {max:?}");
-            mismatches[0] += 1;
-        }
-        assert_eq!(
-            world.intersects_solid_volume(min, max),
-            tree.intersects_solid_volume(min, max)
-        );
-        // Point material. Today's terrain test, a box shrunk by its contact
-        // tolerance, misses solids near the origin and reports water inside
-        // them; the tree tests the point.
-        let p = point(rng);
-        let (old, new) = (world.volume_material_at(p), tree.volume_material_at(p));
-        if old != new {
-            let e = Vec3::splat(1.0e-3);
-            let inside = new.is_none() && tree.contains_point(p);
-            assert!(inside || edge_box(world, p - e, p + e), "material at {p:?}");
-            mismatches[1] += 1;
-        }
-        // Rays.
-        let d = Vec3::new(rng.unit() - 0.5, rng.unit() - 0.5, rng.unit() - 0.5);
-        let o = point(rng);
-        let a = world.raycast(o, d, 30.0);
-        let b = tree.raycast(o, d, 30.0);
-        match (a, b) {
-            (None, None) => {}
-            (Some(a), Some(b)) if (a.distance - b.distance).abs() < 1.0e-3 => {
-                if a.face != b.face || a.pos != b.pos {
-                    mismatches[2] += 1;
-                }
-            }
-            (a, b) => {
-                // Rays grazing an edge or a face within tolerance may differ,
-                // and today's regions can hold zero-thickness sheets where a
-                // clip box only touches its source's solid.
-                let e = Vec3::splat(2.0e-3);
-                let near = |h: Option<RayHit>| {
-                    h.is_some_and(|h| edge_box(world, h.point - e, h.point + e))
-                };
-                let sheet = a.is_some_and(|h| {
-                    !world.intersects_box(h.point - e, h.point + e)
-                        && b.is_none_or(|b| b.distance > h.distance)
-                });
-                assert!(
-                    near(a) || near(b) || sheet,
-                    "ray {o:?} {d:?}: {a:?} vs {b:?}"
-                );
-                mismatches[2] += 1;
-            }
-        }
-        let a = world.raycast_volumes(o, d, 30.0);
-        let b = tree.raycast_volumes(o, d, 30.0);
-        assert_eq!(
-            a.map(|h| h.distance),
-            b.map(|h| h.distance),
-            "volume ray {o:?} {d:?}"
-        );
-        let a = world.raycast_solid_volumes(o, d, 30.0);
-        let b = tree.raycast_solid_volumes(o, d, 30.0);
-        assert_eq!(a.map(|h| h.distance), b.map(|h| h.distance));
-        // Support and ceiling where a body can stand: inside solid, today's
-        // separate cells and regions report their internal faces, which
-        // merged leaves no longer have.
-        use crate::physics::Space;
-        let feet = point(rng);
-        if !world.free_at(feet, body) {
-            continue;
-        }
-        let s = world.support_between(feet, feet.y - 0.6, feet.y, body);
-        let t = tree.support_between(feet, feet.y - 0.6, feet.y, body);
-        if s != t {
-            assert!(
-                s.zip(t).is_some_and(|(s, t)| (s - t).abs() < 1.0e-4),
-                "support at {feet:?}: {s:?} vs {t:?}"
-            );
-            mismatches[3] += 1;
-        }
-        let s = world.first_ceiling(feet, feet.y + 1.75, feet.y + 2.3, body);
-        let t = tree.first_ceiling(feet, feet.y + 1.75, feet.y + 2.3, body);
-        if s != t {
-            assert!(
-                s.zip(t).is_some_and(|(s, t)| (s - t).abs() < 1.0e-4),
-                "ceiling at {feet:?}: {s:?} vs {t:?}"
-            );
-            mismatches[3] += 1;
-        }
-    }
-    mismatches
-}
-
-#[test]
-fn queries_agree_with_todays_world_on_random_worlds() {
-    let mut totals = [0; 4];
-    for seed in 0..40 {
-        let mut rng = Rng::new(9000 + seed);
-        let f3 = random_format3(&mut rng, seed % 3 != 0);
-        let world = old_world(&f3);
-        let tree = Octree::from_format3(&f3).unwrap();
-        let m = compare_queries(&world, &tree, &mut rng, 300);
-        for i in 0..4 {
-            totals[i] += m[i];
-        }
-    }
-    eprintln!("random worlds: box, material, ray, support mismatches {totals:?}");
-    // Differences are confined to grazing contacts and height-field sides.
-    assert!(totals.iter().all(|&m| m < 60), "{totals:?}");
-}
-
-#[test]
-fn arena_queries_agree_with_todays_world() {
-    let world = World::arena();
-    let tree = Octree::from_world(&world).unwrap();
-    let mut rng = Rng::new(77);
-    let m = compare_queries(&world, &tree, &mut rng, 4000);
-    eprintln!("arena: box, material, ray, support mismatches {m:?}");
-    assert!(m.iter().all(|&m| m < 60), "{m:?}");
-}
+// Queries.
 
 #[test]
 fn empty_override_is_a_hole_and_large_coordinates_keep_detail() {
@@ -1092,8 +991,7 @@ fn empty_override_is_a_hole_and_large_coordinates_keep_detail() {
     assert!(tree.root_fragments([1000, 2000, 1000]).is_empty());
     // The hole costs a few leaves per level, not a world of fragments.
     assert!(tree.stats().leaves() < 200, "{:?}", tree.stats());
-    let world = old_world(&f3);
-    assert_eq!(Octree::from_world(&world).unwrap().digest(), tree.digest());
+    assert_eq!(world_of(&f3).digest(), tree.digest());
     // A whole-world selection is bounded by what is stored.
     assert_eq!(
         tree.fragments_in(bounds.fine_box()).len(),
@@ -1122,229 +1020,22 @@ fn volume_rays_skip_joins_and_report_the_cube_around_a_hit() {
             },
         ])
         .unwrap();
-    let tree = Octree::from_world(&world).unwrap();
     let origin = Vec3::new(-1.0, 1.5, 0.5);
-    let a = world.raycast_volumes(origin, Vec3::X, 10.0).unwrap();
-    let b = tree.raycast_volumes(origin, Vec3::X, 10.0).unwrap();
-    assert_eq!(a.distance, b.distance);
-    assert_eq!(a.face, b.face);
-    assert_eq!(a.pos, b.pos);
-    assert!(a.bounds.contains(b.bounds));
+    let hit = world.raycast_volumes(origin, Vec3::X, 10.0).unwrap();
+    assert!((hit.distance - 1.0).abs() < 1.0e-6);
+    assert_eq!(hit.face, 0);
+    assert_eq!(hit.pos, [0, 1, 0]);
+    // The hit's bounds are the cube around it, inside the water's box.
+    assert!(world.volumes()[0].bounds.contains(hit.bounds));
     // From inside the water the ray reaches the glass, skipping the joins
     // between water cubes.
     let inside = Vec3::new(0.5, 1.5, 0.5);
-    let a = world.raycast_volumes(inside, Vec3::X, 10.0).unwrap();
-    let b = tree.raycast_volumes(inside, Vec3::X, 10.0).unwrap();
-    assert_eq!(a.distance, b.distance);
-    assert_eq!(a.face, b.face);
-    let glass = tree.raycast_solid_volumes(inside, Vec3::X, 10.0).unwrap();
+    let hit = world.raycast_volumes(inside, Vec3::X, 10.0).unwrap();
+    assert!((hit.distance - 2.5).abs() < 1.0e-6);
+    // Water ends where glass begins; the glass's face is reported.
+    assert_eq!(hit.face, 0);
+    let glass = world.raycast_solid_volumes(inside, Vec3::X, 10.0).unwrap();
     assert!((glass.distance - 2.5).abs() < 1.0e-6);
-}
-
-// ---------------------------------------------------------------------------
-// Movement on the tree.
-
-#[derive(Default)]
-struct Track {
-    ticks: usize,
-    exact: usize,
-    largest: f32,
-}
-
-fn run_both(world: &World, start: Vec3, script: &[(InputFrame, usize)], track: &mut Track) {
-    let tree = Octree::from_world(world).unwrap();
-    let profile = MovementProfile::ARENA;
-    let mut a = Player::new(1, "old".into());
-    a.position = start;
-    let mut b = a.clone();
-    let mut seq = 0;
-    for &(input, ticks) in script {
-        for _ in 0..ticks {
-            seq += 1;
-            let input = InputFrame { seq, ..input };
-            crate::simulate_player(world, &mut a, &input, FIXED_DT);
-            crate::physics::simulate_in(&tree, &mut b, &input, FIXED_DT, &profile);
-            track.ticks += 1;
-            if a.position == b.position && a.velocity == b.velocity {
-                track.exact += 1;
-            }
-            let difference = (a.position - b.position)
-                .abs()
-                .max_element()
-                .max((a.velocity - b.velocity).abs().max_element());
-            track.largest = track.largest.max(difference);
-            assert_eq!(a.grounded, b.grounded, "tick {seq} at {:?}", a.position);
-            assert!(difference <= 2.0e-3, "tick {seq}: {a:?} vs {b:?}");
-        }
-    }
-}
-
-#[test]
-fn movement_on_the_tree_stays_within_the_golden_tolerance() {
-    let input = InputFrame::default;
-    let strafe = |v| InputFrame {
-        strafe: v,
-        ..input()
-    };
-    let forward = |v| InputFrame {
-        forward: v,
-        ..input()
-    };
-    let jump = InputFrame {
-        jump: true,
-        ..input()
-    };
-    let mut floor = World::empty();
-    for x in -20..20 {
-        for z in -20..20 {
-            floor.set([x, 0, z], Some(Cell::solid(0)));
-        }
-    }
-    let mut track = Track::default();
-    let start = Vec3::new(0.5, 1.01, 0.5);
-    run_both(
-        &floor,
-        start,
-        &[
-            (input(), 20),
-            (forward(1.0), 45),
-            (strafe(-1.0), 30),
-            (jump, 1),
-            (input(), 70),
-        ],
-        &mut track,
-    );
-    for explicit in [false, true] {
-        let mut ramps = floor.clone();
-        for step in 0..8 {
-            let x = 2 + step;
-            let level = 1 + step / 2;
-            let low = if step % 2 == 0 { 0 } else { 4 };
-            for z in -1..2 {
-                for y in 1..level {
-                    ramps.set([x, y, z], Some(Cell::solid(0)));
-                }
-                let legacy = Cell {
-                    heights: [low, low + 4, low + 4, low],
-                    ..Cell::solid(3)
-                };
-                let cell = if explicit {
-                    Cell {
-                        shape: Some(legacy.as_shape()),
-                        ..legacy
-                    }
-                } else {
-                    legacy
-                };
-                ramps.set([x, level, z], Some(cell));
-            }
-        }
-        run_both(
-            &ramps,
-            start,
-            &[
-                (strafe(1.0), 85),
-                (input(), 20),
-                (strafe(-1.0), 95),
-                (input(), 30),
-            ],
-            &mut track,
-        );
-    }
-    let mut ceiling = floor.clone();
-    for x in -1..2 {
-        for z in -1..2 {
-            ceiling.set(
-                [x, 3, z],
-                Some(Cell {
-                    heights: [1, 4, 8, 4],
-                    ..Cell::solid(0)
-                }),
-            );
-        }
-    }
-    run_both(&ceiling, start, &[(jump, 1), (input(), 70)], &mut track);
-    let mut wall = floor.clone();
-    for y in 1..5 {
-        for z in -20..20 {
-            wall.set([3, y, z], Some(Cell::solid(1)));
-        }
-        wall.set([2, y, -3], Some(Cell::solid(1)));
-    }
-    let diagonal = InputFrame {
-        strafe: 1.0,
-        forward: 1.0,
-        ..input()
-    };
-    run_both(
-        &wall,
-        start,
-        &[(strafe(1.0), 90), (diagonal, 30), (strafe(1.0), 30)],
-        &mut track,
-    );
-    let mut pool = floor.clone();
-    let water = |min: [i32; 3], max: [i32; 3]| MaterialVolume {
-        bounds: FineBox { min, max },
-        material: VolumeMaterial::Water,
-    };
-    pool.replace_volumes(&[
-        water([-64, 8, -64], [0, 32, 64]),
-        water([0, 8, -64], [64, 13, 64]),
-    ])
-    .unwrap();
-    run_both(
-        &pool,
-        Vec3::new(-6.0, 6.0, 0.5),
-        &[
-            (input(), 40),
-            (jump, 40),
-            (strafe(1.0), 90),
-            (jump, 12),
-            (forward(-1.0), 40),
-        ],
-        &mut track,
-    );
-    let mut glass = World::empty();
-    let pane = |min: [i32; 3], max: [i32; 3]| MaterialVolume {
-        bounds: FineBox { min, max },
-        material: VolumeMaterial::Glass,
-    };
-    glass
-        .replace_volumes(&[
-            pane([-64, 0, -64], [64, 8, 64]),
-            pane([16, 8, -16], [17, 48, 16]),
-            pane([-8, 32, -8], [8, 33, 8]),
-        ])
-        .unwrap();
-    run_both(
-        &glass,
-        Vec3::new(0.0, 3.0, 0.0),
-        &[(input(), 60), (jump, 30), (strafe(1.0), 120)],
-        &mut track,
-    );
-    let arena = World::arena();
-    run_both(
-        &arena,
-        Vec3::new(-14.5, 1.01, -17.5),
-        &[(forward(-1.0), 100)],
-        &mut track,
-    );
-    run_both(
-        &arena,
-        Vec3::new(15.0, 1.01, 16.5),
-        &[(forward(1.0), 100)],
-        &mut track,
-    );
-    run_both(
-        &arena,
-        Vec3::new(-14.0, 5.01, 0.0),
-        &[(strafe(1.0), 190)],
-        &mut track,
-    );
-    eprintln!(
-        "movement on the tree: {} of {} ticks bit for bit, largest difference {}",
-        track.exact, track.ticks, track.largest
-    );
 }
 
 /// Builds the content of fragments inside a clip box as a tree, so outputs
@@ -1375,12 +1066,37 @@ fn content(
     tree.digest()
 }
 
+/// The tree's own geometry inside a clip box, built from its leaves without
+/// the queries under test.
+fn stored_content(tree: &Octree, clip: FineBox) -> [u8; 16] {
+    let mut copy = Octree::with_root(tree.bounds(), tree.root_box()).unwrap();
+    tree.for_each_leaf(|at, leaf| {
+        let source = match leaf.geometry {
+            LeafGeometry::Empty => return,
+            LeafGeometry::Full => Source {
+                origin: at.min,
+                size: at.size,
+                shape: Shape::solid(),
+            },
+            LeafGeometry::Shaped(shape) => Source {
+                origin: at.min,
+                size: at.size,
+                shape,
+            },
+            LeafGeometry::Piece(source) => source,
+        };
+        if let Some(b) = at.fine_box().intersection(clip) {
+            copy.insert_source(b, source, leaf.faces);
+        }
+    });
+    copy.digest()
+}
+
 #[test]
-fn fragment_queries_hold_todays_content() {
+fn fragment_queries_hold_the_trees_content() {
     for seed in 0..30 {
         let mut rng = Rng::new(7000 + seed);
         let f3 = random_format3(&mut rng, seed % 3 != 0);
-        let world = old_world(&f3);
         let tree = Octree::from_format3(&f3).unwrap();
         let (bounds, root) = (tree.bounds(), tree.root_box());
         for _ in 0..40 {
@@ -1390,13 +1106,12 @@ fn fragment_queries_hold_todays_content() {
                 rng.range(bounds.min[2], bounds.max[2]),
             ];
             let metre = FineBox::root(pos);
-            let a = world.root_fragments(pos);
             let b = tree.root_fragments(pos);
             assert!(b.iter().all(|f| metre.contains(f.bounds) && f.is_valid()));
             assert_eq!(
-                content(bounds, root, metre, &a),
                 content(bounds, root, metre, &b),
-                "seed {seed} root {pos:?}: {a:?} vs {b:?}"
+                stored_content(&tree, metre),
+                "seed {seed} root {pos:?}: {b:?}"
             );
             // Writing a metre's fragments back changes nothing.
             let mut again = tree.clone();
@@ -1416,26 +1131,34 @@ fn fragment_queries_hold_todays_content() {
                 again.insert_source(f.bounds, source, faces);
             }
             assert_eq!(again.digest(), tree.digest(), "seed {seed} rewrite {pos:?}");
-            let get = tree.get(pos);
-            if let Some(cell) = world.get(pos) {
-                assert_eq!(get.map(|c| c.is_full()), Some(cell.is_full()));
+            if let Some(cell) = tree.get(pos) {
+                assert_eq!(
+                    content(bounds, root, metre, &[CellFragment::from_cell(pos, cell)]),
+                    stored_content(&tree, metre)
+                );
             }
-            // A box of a few metres: the same metres, with the same content.
+            // A box of a few metres: every metre holding geometry, with its
+            // content.
             let mut query = metre;
             for a in 0..3 {
                 query.max[a] += 8 * rng.range(0, 3);
             }
-            let old = world.try_roots_in(query, 64).unwrap();
-            let new = tree.try_roots_in(query, 64).unwrap();
+            let roots = tree.try_roots_in(query, 64).unwrap();
+            let mut expected = Vec::new();
+            for x in query.min[0] / 8..query.max[0] / 8 {
+                for y in query.min[1] / 8..query.max[1] / 8 {
+                    for z in query.min[2] / 8..query.max[2] / 8 {
+                        if !tree.root_fragments([x, y, z]).is_empty() {
+                            expected.push([x, y, z]);
+                        }
+                    }
+                }
+            }
+            expected.sort();
+            assert_eq!(roots.iter().map(|r| r.pos).collect::<Vec<_>>(), expected);
             assert_eq!(
-                old.iter().map(|r| r.pos).collect::<Vec<_>>(),
-                new.iter().map(|r| r.pos).collect::<Vec<_>>()
-            );
-            let fragments_old = world.fragments_in(query);
-            let fragments_new = tree.fragments_in(query);
-            assert_eq!(
-                content(bounds, root, query, &fragments_old),
-                content(bounds, root, query, &fragments_new)
+                content(bounds, root, query, &tree.fragments_in(query)),
+                stored_content(&tree, query)
             );
         }
         // Regions and cells hold the whole world.
@@ -1562,19 +1285,13 @@ fn every_kind_of_saved_part_converts_and_round_trips() {
         assert_eq!(tree.root_box().min, f3.bounds.fine_box().min);
         assert_canonical(tree.root_node(), tree.root_box());
         let written = tree.to_format3();
-        let reopened = old_world(&written);
+        old_loader_accepts(&written).unwrap();
         assert_eq!(
             Octree::from_format3(&written).unwrap().digest(),
             tree.digest()
         );
-        assert_eq!(
-            Octree::from_world(&reopened).unwrap().digest(),
-            tree.digest()
-        );
-        assert_eq!(
-            Octree::from_world(&old_world(&f3)).unwrap().digest(),
-            tree.digest()
-        );
+        assert_eq!(world_of(&written).digest(), tree.digest());
+        assert_eq!(world_of(&f3).digest(), tree.digest());
     }
     assert!(pieces > 0);
 }
@@ -1632,4 +1349,925 @@ fn the_digest_encoding_is_stable() {
     let tree = Octree::from_world(&World::arena()).unwrap();
     let hex: String = tree.digest().iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, "b9eba07a8acb839e6932ca18fe99869c");
+}
+
+// ---------------------------------------------------------------------------
+// `World` on the tree: writes, undo, the water and glass boxes, meshes and
+// format 3 accounting.
+
+/// A random edit of a few metres, as the editor sends them: empty metres,
+/// whole cells, fragments of a metre, or a neighbour's content copied in,
+/// which makes groups that can merge.
+fn random_root_edit(rng: &mut Rng, world: &World) -> Vec<RootEdit> {
+    let bounds = world.bounds();
+    let mut positions = std::collections::BTreeSet::new();
+    let mut edits = Vec::new();
+    for _ in 0..rng.range(1, 5) {
+        let pos = [
+            rng.range(bounds.min[0], bounds.max[0]),
+            rng.range(bounds.min[1], bounds.max[1]),
+            rng.range(bounds.min[2], bounds.max[2]),
+        ];
+        if !positions.insert(pos) {
+            continue;
+        }
+        let root = FineBox::root(pos);
+        let fragments = match rng.below(4) {
+            0 => Vec::new(),
+            1 => vec![CellFragment::from_cell(pos, random_cell(rng))],
+            2 => {
+                let mut neighbour = pos;
+                neighbour[rng.below(3) as usize] += if rng.chance(50) { 1 } else { -1 };
+                if !world.contains_pos(neighbour) {
+                    continue;
+                }
+                let offset: [i32; 3] = std::array::from_fn(|a| (pos[a] - neighbour[a]) * 8);
+                world
+                    .root_fragments(neighbour)
+                    .into_iter()
+                    .filter(|f| f.size == 8 && f.origin == f.bounds.min)
+                    .map(|f| CellFragment {
+                        bounds: FineBox {
+                            min: std::array::from_fn(|a| f.bounds.min[a] + offset[a]),
+                            max: std::array::from_fn(|a| f.bounds.max[a] + offset[a]),
+                        },
+                        origin: std::array::from_fn(|a| f.origin[a] + offset[a]),
+                        ..f
+                    })
+                    .collect()
+            }
+            _ => {
+                let mut fragments: Vec<CellFragment> = Vec::new();
+                for _ in 0..rng.range(1, 4) {
+                    let mut b = root;
+                    for a in 0..3 {
+                        let lo = rng.range(root.min[a], root.max[a]);
+                        b.min[a] = lo;
+                        b.max[a] = rng.range(lo + 1, root.max[a] + 1);
+                    }
+                    if fragments.iter().any(|f| f.bounds.intersection(b).is_some()) {
+                        continue;
+                    }
+                    fragments.push(CellFragment {
+                        bounds: b,
+                        origin: root.min,
+                        size: 8,
+                        cell: random_cell(rng),
+                    });
+                }
+                fragments
+            }
+        };
+        edits.push(RootEdit { pos, fragments });
+    }
+    edits
+}
+
+/// What an undo writes back: each metre's content before the edit.
+fn before_of(world: &World, edits: &[RootEdit]) -> Vec<RootEdit> {
+    edits
+        .iter()
+        .map(|e| RootEdit {
+            pos: e.pos,
+            fragments: world.root_fragments(e.pos),
+        })
+        .collect()
+}
+
+#[test]
+fn world_edits_and_their_undo_restore_identical_trees() {
+    let mut undone = 0;
+    for seed in 0..40 {
+        let mut rng = Rng::new(11_000 + seed);
+        let f3 = random_format3(&mut rng, seed % 4 != 0);
+        let original = world_of(&f3);
+        let mut world = original.clone();
+        let mut history = Vec::new();
+        for _ in 0..12 {
+            if rng.chance(25) {
+                let mut edits = Vec::new();
+                let fine = world.bounds().fine_box();
+                for _ in 0..rng.range(1, 3) {
+                    let mut b = fine;
+                    for a in 0..3 {
+                        let lo = rng.range(fine.min[a], fine.max[a] - 1);
+                        b.min[a] = lo;
+                        b.max[a] = rng.range(lo + 1, (lo + 24).min(fine.max[a]) + 1);
+                    }
+                    let material = [
+                        None,
+                        Some(VolumeMaterial::Water),
+                        Some(VolumeMaterial::Glass),
+                    ][rng.below(3) as usize];
+                    edits.push(crate::VolumeEdit {
+                        bounds: b,
+                        material,
+                    });
+                }
+                let before = world.volumes().to_vec();
+                if world.apply_volume_edits(&edits).is_ok() {
+                    history.push((Vec::new(), Some(before)));
+                }
+                continue;
+            }
+            let edits = random_root_edit(&mut rng, &world);
+            let before = before_of(&world, &edits);
+            world
+                .apply_root_edits(&edits)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            assert_canonical(world.tree.root_node(), world.tree.root_box());
+            history.push((before, None));
+        }
+        let edited = world.digest();
+        for (roots, volumes) in history.iter().rev() {
+            if let Some(volumes) = volumes {
+                world.replace_volumes(volumes).unwrap();
+            } else {
+                world.apply_root_edits(roots).unwrap();
+            }
+            assert_canonical(world.tree.root_node(), world.tree.root_box());
+            undone += 1;
+        }
+        assert_eq!(world.digest(), original.digest(), "seed {seed}");
+        assert_eq!(world.volumes(), original.volumes(), "seed {seed}");
+        assert_ne!(edited, [0; 16]);
+    }
+    assert!(undone > 300);
+}
+
+#[test]
+fn rewriting_a_metre_inside_a_larger_shape_keeps_its_leaf() {
+    // A two-metre slab, half a cube thick: its metres lie wholly inside or
+    // outside it, so no piece shows which shape they belong to.
+    let slab = Cell {
+        heights: [4; 4],
+        ..Cell::solid(2)
+    };
+    let region = CellFragment {
+        bounds: FineBox {
+            min: [0, 0, 0],
+            max: [16, 16, 16],
+        },
+        origin: [0, 0, 0],
+        size: 16,
+        cell: slab,
+    };
+    let original = World::from_compact_parts(WorldBounds::default(), &[region], &[], &[]).unwrap();
+    assert_eq!(original.stats().shaped_leaves, 1);
+    let mut world = original.clone();
+    let pos = [1, 0, 0];
+    let before = world.root_fragments(pos);
+    // Writing a metre's own content back changes nothing.
+    assert!(world
+        .apply_root_edits(&[RootEdit {
+            pos,
+            fragments: before.clone()
+        }])
+        .unwrap()
+        .is_empty());
+    assert_eq!(world.digest(), original.digest());
+    // Carving it and writing it back restores the slab's leaf.
+    world
+        .apply_root_edits(&[RootEdit {
+            pos,
+            fragments: vec![],
+        }])
+        .unwrap();
+    assert_ne!(world.digest(), original.digest());
+    world
+        .apply_root_edits(&[RootEdit {
+            pos,
+            fragments: before,
+        }])
+        .unwrap();
+    assert_eq!(world.digest(), original.digest());
+}
+
+#[test]
+fn water_and_glass_variants_act() {
+    assert_eq!(
+        volume_material_of(MAT_WATER | 2),
+        Some(VolumeMaterial::Water)
+    );
+    assert_eq!(
+        volume_material_of(MAT_GLASS | 1),
+        Some(VolumeMaterial::Glass)
+    );
+    assert_eq!(volume_material_of(2 << 2), None);
+    let bounds = small_bounds();
+    let tree = Octree::new(bounds).unwrap();
+    let mut builder = OctreeBuilder::new(bounds, tree.root_box()).unwrap();
+    let at = NodeBox {
+        min: tree.root_box().min,
+        size: 16,
+    };
+    builder.push(at, Leaf::empty(MAT_WATER | 3)).unwrap();
+    let tree = builder.finish().unwrap();
+    let inside = at.fine_box().world_min() + Vec3::splat(1.0);
+    assert_eq!(tree.volume_material_at(inside), Some(VolumeMaterial::Water));
+    // Format 3 writes the variant as plain water.
+    assert_eq!(tree.to_format3().volumes.len(), 1);
+}
+
+#[test]
+fn replacing_boxes_writes_only_those_that_differ() {
+    let water = |min: [i32; 3], max: [i32; 3]| MaterialVolume {
+        bounds: FineBox { min, max },
+        material: VolumeMaterial::Water,
+    };
+    let glass = |min: [i32; 3], max: [i32; 3]| MaterialVolume {
+        bounds: FineBox { min, max },
+        material: VolumeMaterial::Glass,
+    };
+    let mut world = World::empty();
+    let a = water([0, 8, 0], [24, 16, 8]);
+    let b = glass([40, 8, 0], [41, 40, 48]);
+    let written = world.replace_volumes(&[a, b]).unwrap();
+    assert_eq!(written.len(), 2);
+    let loaded = world.volumes().to_vec();
+    // An unchanged list writes nothing.
+    assert!(world.replace_volumes(&loaded).unwrap().is_empty());
+    // A new box next to the others writes only itself; the loaded boxes stay
+    // as they were, so their glass keeps its edge bands.
+    let c = water([-40, 8, 0], [-32, 16, 8]);
+    let written = world.replace_volumes(&[a, b, c]).unwrap();
+    assert_eq!(written, vec![c.bounds]);
+    assert!(world.volumes().contains(&a) && world.volumes().contains(&b));
+    // Removing a box clears its cube material.
+    let written = world.replace_volumes(&[b, c]).unwrap();
+    assert_eq!(written, vec![a.bounds]);
+    assert_eq!(world.volume_material_at(Vec3::new(1.0, 1.5, 0.5)), None);
+    assert_eq!(
+        world.volume_material_at(Vec3::new(-4.5, 1.5, 0.5)),
+        Some(VolumeMaterial::Water)
+    );
+    // Geometry edits keep the boxes.
+    world.set([-5, 1, 0], Some(Cell::solid(1)));
+    assert_eq!(world.volumes().len(), 2);
+}
+
+#[test]
+fn a_thin_pane_across_a_large_world_is_refused_before_it_is_built() {
+    let bounds = WorldBounds {
+        min: [-4096, 0, -4096],
+        max: [4096, 64, 4096],
+    };
+    let mut world = World::from_compact_parts(bounds, &[], &[], &[]).unwrap();
+    let pane = MaterialVolume {
+        bounds: FineBox {
+            min: [-32765, 3, -32765],
+            max: [32765, 4, 32765],
+        },
+        material: VolumeMaterial::Glass,
+    };
+    let before = world.digest();
+    assert!(world.replace_volumes(&[pane]).is_err());
+    assert!(world
+        .prepare_volume_edits(&[crate::VolumeEdit {
+            bounds: pane.bounds,
+            material: Some(VolumeMaterial::Glass),
+        }])
+        .is_err());
+    assert_eq!(world.digest(), before);
+    assert!(world.volumes().is_empty());
+    // A one-metre floor 64 m across is 4,096 leaves, and goes in.
+    let floor = MaterialVolume {
+        bounds: FineBox {
+            min: [0, 8, 0],
+            max: [512, 16, 512],
+        },
+        material: VolumeMaterial::Glass,
+    };
+    world.replace_volumes(&[floor]).unwrap();
+    assert_eq!(world.stats().leaves(), 4096);
+    // The same floor across the whole world would be 67 million.
+    let whole = MaterialVolume {
+        bounds: FineBox {
+            min: [-32768, 8, -32768],
+            max: [32768, 16, 32768],
+        },
+        material: VolumeMaterial::Glass,
+    };
+    assert!(world.replace_volumes(&[whole]).is_err());
+}
+
+/// Every unit's mesh, by key.
+fn all_meshes(world: &World) -> std::collections::BTreeMap<crate::ChunkKey, Vec<[u32; 7]>> {
+    world
+        .chunk_keys()
+        .into_iter()
+        .map(|key| {
+            let mesh = world.mesh_chunk(key);
+            let vertices = mesh
+                .vertices
+                .iter()
+                .map(|v| {
+                    let p = v.position.map(f32::to_bits);
+                    let n = v.normal.map(f32::to_bits);
+                    [p[0], p[1], p[2], n[0], n[1], n[2], u32::from(v.material)]
+                })
+                .collect();
+            (key, vertices)
+        })
+        .filter(|(_, vertices): &(_, Vec<_>)| !vertices.is_empty())
+        .collect()
+}
+
+#[test]
+fn dirty_units_are_the_only_meshes_an_edit_changes() {
+    let fallbacks = super::mesh::cap_fallbacks();
+    let mut pieces = 0;
+    for seed in 0..25 {
+        let mut rng = Rng::new(13_000 + seed);
+        let f3 = random_format3(&mut rng, seed % 3 != 0);
+        let mut world = world_of(&f3);
+        for _ in 0..6 {
+            pieces += world.stats().piece_leaves;
+            let mut meshes = all_meshes(&world);
+            let edits = random_root_edit(&mut rng, &world);
+            let dirty = world.apply_root_edits(&edits).unwrap();
+            for key in &dirty {
+                meshes.remove(key);
+                let mesh = world.mesh_chunk(*key);
+                if !mesh.vertices.is_empty() {
+                    meshes.insert(*key, all_meshes_of(&world, *key));
+                }
+            }
+            assert_eq!(meshes, all_meshes(&world), "seed {seed}");
+        }
+    }
+    let fallbacks = super::mesh::cap_fallbacks() - fallbacks;
+    println!("pieces meshed {pieces}, drawn without caps {fallbacks}");
+    assert_eq!(fallbacks, 0);
+}
+
+/// A world 128 m wide holding leaves of 64 and 32 m, full and shaped, smaller
+/// regions on and off their grid, and water and glass boxes.
+fn large_leaf_world(rng: &mut Rng) -> Format3 {
+    let bounds = WorldBounds {
+        min: [0, 0, 0],
+        max: [128, 64, 128],
+    };
+    let fine = bounds.fine_box();
+    let mut out = Format3 {
+        bounds,
+        ..Default::default()
+    };
+    let mut taken: Vec<FineBox> = Vec::new();
+    for index in 0..rng.range(6, 16) {
+        let size: u32 = if index == 0 {
+            512
+        } else {
+            [512, 256, 256, 256, 128, 64, 16, 8][rng.below(8) as usize]
+        };
+        let s = size as i32;
+        let mut origin: [i32; 3] = std::array::from_fn(|a| {
+            fine.min[a] + rng.range(0, ((fine.max[a] - fine.min[a]) / s).max(1)) * s
+        });
+        let mut clip = FineBox {
+            min: origin,
+            max: origin.map(|v| v + s),
+        };
+        if size <= 128 && rng.chance(40) {
+            for v in &mut origin {
+                *v += rng.range(-(s - 1).min(7), s.min(8));
+            }
+            for (a, &start) in origin.iter().enumerate() {
+                let lo = rng.range(start, start + s);
+                clip.min[a] = lo;
+                clip.max[a] = rng.range(lo + 1, start + s + 1);
+            }
+        }
+        let Some(clip) = clip.intersection(fine) else {
+            continue;
+        };
+        if taken.iter().any(|t| t.intersection(clip).is_some()) {
+            continue;
+        }
+        taken.push(clip);
+        out.regions.push(CellFragment {
+            bounds: clip,
+            origin,
+            size,
+            cell: random_cell(rng),
+        });
+    }
+    for _ in 0..rng.range(1, 6) {
+        let b = random_box(rng, fine);
+        if !out
+            .volumes
+            .iter()
+            .any(|v| v.bounds.intersection(b).is_some())
+        {
+            out.volumes.push(random_volume(rng, b));
+        }
+    }
+    out
+}
+
+/// A box inside `fine`: whole metres up to 16 m on a side, or eighths up to
+/// two metres.
+fn random_box(rng: &mut Rng, fine: FineBox) -> FineBox {
+    let (step, most) = if rng.chance(50) { (8, 16) } else { (1, 16) };
+    let mut b = fine;
+    for a in 0..3 {
+        let cells = (fine.max[a] - fine.min[a]) / step;
+        let lo = rng.range(0, cells - 1);
+        let hi = rng.range(lo + 1, (lo + most).min(cells) + 1);
+        b.min[a] = fine.min[a] + lo * step;
+        b.max[a] = fine.min[a] + hi * step;
+    }
+    b
+}
+
+fn random_volume(rng: &mut Rng, bounds: FineBox) -> MaterialVolume {
+    MaterialVolume {
+        bounds,
+        material: if rng.chance(50) {
+            VolumeMaterial::Water
+        } else {
+            VolumeMaterial::Glass
+        },
+    }
+}
+
+/// The boxes with one removed and one added, still disjoint.
+fn replaced_boxes(rng: &mut Rng, world: &World) -> Vec<MaterialVolume> {
+    let mut boxes = world.volumes().to_vec();
+    if !boxes.is_empty() && rng.chance(60) {
+        boxes.remove(rng.below(boxes.len() as u64) as usize);
+    }
+    let b = random_box(rng, world.bounds().fine_box());
+    if !boxes.iter().any(|v| v.bounds.intersection(b).is_some()) {
+        boxes.push(random_volume(rng, b));
+    }
+    boxes
+}
+
+#[test]
+fn dirty_units_cover_box_and_root_writes_beside_large_leaves() {
+    let fallbacks = super::mesh::cap_fallbacks();
+    let mut steps = [0; 4];
+    let mut large = 0;
+    let mut pieces = 0;
+    for seed in 0..10 {
+        let mut rng = Rng::new(19_000 + seed);
+        let mut world = world_of(&large_leaf_world(&mut rng));
+        world.tree.for_each_leaf(|at, leaf| {
+            large += usize::from(at.size >= 256 && leaf.geometry != LeafGeometry::Empty);
+        });
+        let mut meshes = all_meshes(&world);
+        for _ in 0..8 {
+            let before = world.clone();
+            let kind = rng.below(4) as usize;
+            let dirty = match kind {
+                0 => {
+                    let edits = random_root_edit(&mut rng, &world);
+                    let dirty = world.apply_root_edits(&edits).unwrap();
+                    assert_eq!(dirty, world.changed_chunks(&before), "seed {seed}");
+                    dirty
+                }
+                1 => {
+                    let fine = world.bounds().fine_box();
+                    let edits: Vec<_> = (0..rng.range(1, 3))
+                        .map(|_| crate::VolumeEdit {
+                            bounds: random_box(&mut rng, fine),
+                            material: [
+                                None,
+                                Some(VolumeMaterial::Water),
+                                Some(VolumeMaterial::Glass),
+                            ][rng.below(3) as usize],
+                        })
+                        .collect();
+                    world.apply_volume_edits(&edits).unwrap();
+                    world.changed_chunks(&before)
+                }
+                2 => {
+                    let boxes = replaced_boxes(&mut rng, &world);
+                    world.replace_volumes(&boxes).unwrap();
+                    world.changed_chunks(&before)
+                }
+                _ => {
+                    let boxes = replaced_boxes(&mut rng, &world);
+                    let edits = random_root_edit(&mut rng, &world);
+                    world.apply_patch(&edits, Some(&boxes)).unwrap()
+                }
+            };
+            if world.digest() != before.digest() {
+                steps[kind] += 1;
+            }
+            for key in &dirty {
+                meshes.remove(key);
+                let mesh = all_meshes_of(&world, *key);
+                if !mesh.is_empty() {
+                    meshes.insert(*key, mesh);
+                }
+            }
+            assert_eq!(meshes, all_meshes(&world), "seed {seed}, step kind {kind}");
+            pieces += world.stats().piece_leaves;
+        }
+    }
+    let fallbacks = super::mesh::cap_fallbacks() - fallbacks;
+    println!(
+        "changing steps by kind {steps:?}, leaves of 32 m or more {large}, pieces meshed {pieces}, drawn without caps {fallbacks}"
+    );
+    assert!(steps.iter().all(|&n| n >= 5), "{steps:?}");
+    assert!(large >= 10, "{large}");
+    assert_eq!(fallbacks, 0);
+}
+
+#[test]
+fn splitting_a_shaped_leaf_into_pieces_rebuilds_the_unit_beside_it() {
+    // A 64 m wedge, full on its -X side, and a metre cube against that side
+    // at the top, in the unit beside the wedge's. The wedge covers the cube's
+    // face exactly; its pieces are judged conservatively and do not.
+    let bounds = WorldBounds {
+        min: [-16, 0, 0],
+        max: [64, 64, 64],
+    };
+    let wedge = CellFragment {
+        bounds: FineBox {
+            min: [0, 0, 0],
+            max: [512, 512, 512],
+        },
+        origin: [0, 0, 0],
+        size: 512,
+        cell: Cell {
+            heights: [8, 0, 0, 8],
+            ..Cell::solid(1)
+        },
+    };
+    let cube = CellEdit {
+        pos: [-1, 62, 10],
+        cell: Some(Cell::solid(2)),
+    };
+    let mut world = world_of(&Format3 {
+        bounds,
+        regions: vec![wedge],
+        cells: vec![cube],
+        ..Default::default()
+    });
+    let mut meshes = all_meshes(&world);
+    let before = world.clone();
+    // Water over the wedge's far quarter splits it into pieces; no surface
+    // changes.
+    world
+        .apply_volume_edits(&[crate::VolumeEdit {
+            bounds: FineBox {
+                min: [384, 0, 0],
+                max: [512, 512, 512],
+            },
+            material: Some(VolumeMaterial::Water),
+        }])
+        .unwrap();
+    assert!(world.stats().piece_leaves > 0);
+    let dirty = world.changed_chunks(&before);
+    assert!(dirty.contains(&world.tree.unit_key([-8, 496, 80])));
+    for key in &dirty {
+        meshes.remove(key);
+        let mesh = all_meshes_of(&world, *key);
+        if !mesh.is_empty() {
+            meshes.insert(*key, mesh);
+        }
+    }
+    assert_eq!(meshes, all_meshes(&world));
+}
+
+/// A tree's content rebuilt on another root, so trees on different roots
+/// compare by digest.
+fn content_on(tree: &Octree, root: NodeBox) -> [u8; 16] {
+    let mut copy = Octree::with_root(tree.bounds(), root).unwrap();
+    tree.for_each_leaf(|at, leaf| {
+        let source = match leaf.geometry {
+            LeafGeometry::Empty => return,
+            LeafGeometry::Full => Source {
+                origin: at.min,
+                size: at.size,
+                shape: Shape::solid(),
+            },
+            LeafGeometry::Shaped(shape) => Source {
+                origin: at.min,
+                size: at.size,
+                shape,
+            },
+            LeafGeometry::Piece(source) => source,
+        };
+        copy.insert_source(at.fine_box(), source, leaf.faces);
+    });
+    copy.digest()
+}
+
+#[test]
+fn pieces_keep_their_grid_on_reload_when_their_whole_region_is_cut() {
+    // A 64 m slab a quarter of its cube thick, on a map grid 24 m off the
+    // bounds' minimum corner, and a two-metre shape elsewhere.
+    let bounds = WorldBounds {
+        min: [-65, -40, -64],
+        max: [64, 88, 64],
+    };
+    let mut slab = Shape::solid();
+    for vertex in &mut slab.vertices[4..] {
+        vertex[1] = 2;
+    }
+    let slab = Cell {
+        shape: Some(slab),
+        ..Cell::solid(1)
+    };
+    let wedge = Cell {
+        heights: [8, 8, 0, 0],
+        ..Cell::solid(2)
+    };
+    let regions = [
+        CellFragment {
+            bounds: FineBox {
+                min: [-512, -320, -512],
+                max: [0, 192, 0],
+            },
+            origin: [-512, -320, -512],
+            size: 512,
+            cell: slab,
+        },
+        CellFragment {
+            bounds: FineBox {
+                min: [16, 0, 16],
+                max: [32, 16, 32],
+            },
+            origin: [16, 0, 16],
+            size: 16,
+            cell: wedge,
+        },
+    ];
+    let mut world = World::from_compact_parts(bounds, &regions, &[], &[]).unwrap();
+    assert_eq!(world.tree.root_box().min, [-1024, -320, -512]);
+    // Cutting a metre out of the slab leaves pieces of it 32 m on a side,
+    // larger than any whole region left, which are 16 m.
+    world
+        .apply_root_edits(&[RootEdit {
+            pos: [-30, -38, -30],
+            fragments: Vec::new(),
+        }])
+        .unwrap();
+    let saved = world.tree.to_format3();
+    let side = |r: &CellFragment| r.bounds.max[0] - r.bounds.min[0];
+    let whole = saved
+        .regions
+        .iter()
+        .filter(|r| r.source_bounds() == Some(r.bounds))
+        .map(side)
+        .max();
+    let piece = saved
+        .regions
+        .iter()
+        .filter(|r| r.source_bounds() != Some(r.bounds))
+        .map(side)
+        .max();
+    assert_eq!((whole, piece), (Some(128), Some(256)));
+    let size = |f: &Format3| {
+        (
+            f.regions.len() + f.cells.len(),
+            serde_json::to_vec(&f.regions).unwrap().len()
+                + serde_json::to_vec(&f.cells).unwrap().len(),
+        )
+    };
+    let reopened = world_of(&saved);
+    let again = reopened.tree.to_format3();
+    assert_eq!(size(&again), size(&saved));
+    let root = reopened.tree.root_box();
+    assert_eq!(
+        content_on(&reopened.tree, root),
+        content_on(&world.tree, root)
+    );
+    // The root still moves, keeping the pieces' grid, until shared-sandbox
+    // 2e stores it.
+    assert_eq!(root.min, [-768, -320, -512]);
+    assert_eq!(again.regions.len(), saved.regions.len());
+}
+
+fn all_meshes_of(world: &World, key: crate::ChunkKey) -> Vec<[u32; 7]> {
+    world
+        .mesh_chunk(key)
+        .vertices
+        .iter()
+        .map(|v| {
+            let p = v.position.map(f32::to_bits);
+            let n = v.normal.map(f32::to_bits);
+            [p[0], p[1], p[2], n[0], n[1], n[2], u32::from(v.material)]
+        })
+        .collect()
+}
+
+fn triangles(world: &World) -> Vec<[Vec3; 3]> {
+    let mut out = Vec::new();
+    for key in world.chunk_keys() {
+        let mesh = world.mesh_chunk(key);
+        for t in mesh.indices.as_chunks::<3>().0 {
+            out.push(t.map(|i| Vec3::from_array(mesh.vertices[i as usize].position)));
+        }
+    }
+    out
+}
+
+#[test]
+fn hidden_faces_are_left_out_and_partly_covered_faces_are_drawn_whole() {
+    let mut world = World::empty();
+    // A two-metre cube with a one-metre cube on its +X side, above the
+    // root's floor.
+    world
+        .apply_root_edits(
+            &(0..8)
+                .map(|i| {
+                    let pos = [i & 1, 2 + (i >> 1 & 1), i >> 2 & 1];
+                    RootEdit {
+                        pos,
+                        fragments: vec![CellFragment::from_cell(pos, Cell::solid(1))],
+                    }
+                })
+                .chain([RootEdit {
+                    pos: [2, 2, 0],
+                    fragments: vec![CellFragment::from_cell([2, 2, 0], Cell::solid(1))],
+                }])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert_eq!(world.stats().leaves(), 2);
+    let tris = triangles(&world);
+    // The small cube's -X face lies wholly against the large one and is
+    // left out; the large cube's +X face is partly covered and drawn whole.
+    let on_plane = |t: &[Vec3; 3]| t.iter().all(|p| p.x == 2.0);
+    let facing = |t: &[Vec3; 3]| (t[1] - t[0]).cross(t[2] - t[0]).x;
+    assert_eq!(
+        tris.iter()
+            .filter(|t| on_plane(t) && facing(t) < 0.0)
+            .count(),
+        0
+    );
+    assert_eq!(
+        tris.iter()
+            .filter(|t| on_plane(t) && facing(t) > 0.0)
+            .count(),
+        2
+    );
+    assert_eq!(tris.len(), 6 * 2 + 5 * 2);
+    // Faces on the root's floor are left out.
+    let mut floor = World::empty();
+    floor.set([0, 0, 0], Some(Cell::solid(2)));
+    assert_eq!(triangles(&floor).len(), 5 * 2);
+    // Two wedges meeting side to side cover each other's triangular faces.
+    let mut wedges = World::empty();
+    let wedge = Cell {
+        heights: [0, 8, 8, 0],
+        ..Cell::solid(3)
+    };
+    wedges.set([0, 1, 0], Some(wedge));
+    wedges.set([0, 1, 1], Some(wedge));
+    let alone = {
+        let mut one = World::empty();
+        one.set([0, 1, 0], Some(wedge));
+        triangles(&one).len()
+    };
+    assert_eq!(triangles(&wedges).len(), 2 * alone - 2);
+}
+
+#[test]
+fn caps_where_pieces_of_one_source_meet_cancel() {
+    // A four-metre ramp with one metre carved from it: the pieces' cut faces
+    // between each other are left out; only those facing the hole are drawn.
+    let ramp = Cell {
+        heights: [0, 8, 8, 0],
+        ..Cell::solid(1)
+    };
+    let region = CellFragment {
+        bounds: FineBox {
+            min: [0, 8, 0],
+            max: [32, 40, 32],
+        },
+        origin: [0, 8, 0],
+        size: 32,
+        cell: ramp,
+    };
+    let mut world = World::from_compact_parts(
+        WorldBounds::default(),
+        std::slice::from_ref(&region),
+        &[],
+        &[],
+    )
+    .unwrap();
+    let whole = triangles(&world).len();
+    world
+        .apply_root_edits(&[RootEdit {
+            pos: [2, 2, 1],
+            fragments: vec![],
+        }])
+        .unwrap();
+    assert!(world.stats().piece_leaves > 0);
+    let tris = triangles(&world);
+    // No triangle lies on a plane between pieces away from the hole.
+    let hole = FineBox::root([2, 2, 1]);
+    for t in &tris {
+        for axis in 0..3 {
+            let plane = t[0][axis];
+            if t.iter().all(|p| p[axis] == plane) && (plane * 8.0).fract() == 0.0 {
+                let p = (plane * 8.0) as i32;
+                let inside_ramp = p > region.bounds.min[axis] && p < region.bounds.max[axis];
+                if inside_ramp {
+                    // A cut face drawn whole may reach past the hole it faces.
+                    let touches_hole = (0..3).all(|a| {
+                        let lo = t.iter().map(|p| p[a] * 8.0).fold(f32::MAX, f32::min);
+                        let hi = t.iter().map(|p| p[a] * 8.0).fold(f32::MIN, f32::max);
+                        lo <= hole.max[a] as f32 + 0.01 && hi >= hole.min[a] as f32 - 0.01
+                    });
+                    assert!(touches_hole, "a cap between pieces is drawn: {t:?}");
+                }
+            }
+        }
+    }
+    assert!(tris.len() > whole);
+}
+
+#[test]
+fn a_leaf_larger_than_a_unit_is_drawn_whole_by_the_unit_at_its_corner() {
+    let size = (MESH_UNIT_SIZE * 8 * 4) as u32;
+    let region = CellFragment {
+        bounds: FineBox {
+            min: [0, 8, 0],
+            max: [size as i32, 8 + size as i32, size as i32],
+        },
+        origin: [0, 8, 0],
+        size,
+        cell: Cell::solid(1),
+    };
+    let metres = size as i32 / 8;
+    let bounds = WorldBounds {
+        min: [0, 0, 0],
+        max: [metres, metres + 2, metres],
+    };
+    // The root sits on the region's grid below the bounds.
+    let world = World::from_compact_parts(bounds, &[region], &[], &[]).unwrap();
+    let keys = world.chunk_keys();
+    assert_eq!(keys.len(), 1);
+    let mesh = world.mesh_chunk(keys[0]);
+    let far = mesh
+        .vertices
+        .iter()
+        .map(|v| v.position[0])
+        .fold(f32::MIN, f32::max);
+    assert_eq!(far, size as f32 / 8.0);
+}
+
+#[test]
+fn piece_changes_are_the_difference_of_the_written_parts() {
+    let pieces = |world: &World| -> Vec<Format3Piece> {
+        let mut out: Vec<_> = world
+            .regions()
+            .into_iter()
+            .map(Format3Piece::Region)
+            .collect();
+        out.extend(world.cells().into_iter().map(Format3Piece::Cell));
+        out
+    };
+    let key = |p: &Format3Piece| format!("{p:?}");
+    for seed in 0..25 {
+        let mut rng = Rng::new(17_000 + seed);
+        let f3 = random_format3(&mut rng, seed % 2 == 0);
+        let mut world = world_of(&f3);
+        for _ in 0..5 {
+            let before = world.clone();
+            if rng.chance(30) {
+                let fine = world.bounds().fine_box();
+                let mut b = fine;
+                for a in 0..3 {
+                    let lo = rng.range(fine.min[a], fine.max[a] - 1);
+                    b.min[a] = lo;
+                    b.max[a] = rng.range(lo + 1, fine.max[a] + 1);
+                }
+                let _ = world.apply_volume_edits(&[crate::VolumeEdit {
+                    bounds: b,
+                    material: Some(VolumeMaterial::Water),
+                }]);
+            } else {
+                let edits = random_root_edit(&mut rng, &world);
+                world.apply_root_edits(&edits).unwrap();
+            }
+            let changes = world.piece_changes(&before);
+            let mut old: Vec<_> = pieces(&before).iter().map(key).collect();
+            let mut new: Vec<_> = pieces(&world).iter().map(key).collect();
+            for p in &changes.removed {
+                let at = old
+                    .iter()
+                    .position(|o| *o == key(p))
+                    .expect("a removed piece");
+                old.swap_remove(at);
+            }
+            for p in &changes.added {
+                let at = new
+                    .iter()
+                    .position(|o| *o == key(p))
+                    .expect("an added piece");
+                new.swap_remove(at);
+            }
+            old.sort();
+            new.sort();
+            assert_eq!(old, new, "seed {seed}");
+        }
+    }
 }

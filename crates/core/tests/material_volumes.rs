@@ -194,15 +194,17 @@ fn crossing_strips(count: i32, opposite_material: VolumeMaterial) -> Vec<Materia
     let mut volumes = Vec::new();
     for i in 0..count {
         // Gaps prevent coalescing. Each front Y strip meets every rear Z strip
-        // over a positive-area rectangle on the shared X plane.
+        // over a positive-area rectangle on the shared X plane. Whole-metre
+        // strips keep the tree within its piece guard: an eighth-thick strip
+        // 64 m long is 4,096 leaves.
         volumes.push(volume(
-            [0, i * 2, 0],
-            [8, i * 2 + 1, count * 2],
+            [0, i * 16, 0],
+            [8, i * 16 + 8, count * 16],
             VolumeMaterial::Water,
         ));
         volumes.push(volume(
-            [8, 0, i * 2],
-            [16, count * 2, i * 2 + 1],
+            [8, 0, i * 16],
+            [16, count * 16, i * 16 + 8],
             opposite_material,
         ));
     }
@@ -214,7 +216,7 @@ fn shared_face_budget_rejects_crossing_strip_mesh_growth_atomically() {
     let mut world = World::from_compact_parts(
         WorldBounds {
             min: [0, 0, 0],
-            max: [128, 128, 128],
+            max: [4, 520, 520],
         },
         &[],
         &[],
@@ -311,26 +313,24 @@ fn bounded_paste_can_clear_destination_and_apply_a_maximum_layer() {
 }
 
 #[test]
-fn v3_volume_round_trip_and_legacy_worlds_remain_readable() {
+fn v3_volume_round_trip() {
     let mut world = World::empty();
     world
         .replace_volumes(&[volume([0, 8, 0], [8, 16, 8], VolumeMaterial::Glass)])
         .unwrap();
-    let json = serde_json::to_value(&world).unwrap();
-    assert_eq!(json["format_version"], 3);
-    assert_eq!(json["volumes"][0]["material"], "glass");
-    let restored: World = serde_json::from_value(json).unwrap();
+    let snapshot = world.snapshot();
+    let json = serde_json::to_value(snapshot.volumes()).unwrap();
+    assert_eq!(json[0]["material"], "glass");
+    let mut restored = World::from_compact_parts(
+        snapshot.bounds(),
+        snapshot.regions(),
+        &snapshot.cells(),
+        &snapshot.root_overrides(),
+    )
+    .unwrap();
+    restored.replace_volumes(snapshot.volumes()).unwrap();
     assert_eq!(restored.volumes(), world.volumes());
-    for legacy in [
-        "[]",
-        r#"{"format_version":1,"cells":[],"roots":[]}"#,
-        r#"{"format_version":2,"cells":[],"roots":[],"regions":[]}"#,
-    ] {
-        assert!(serde_json::from_str::<World>(legacy)
-            .unwrap()
-            .volumes()
-            .is_empty());
-    }
+    assert_eq!(restored.digest(), world.digest());
 }
 
 #[test]

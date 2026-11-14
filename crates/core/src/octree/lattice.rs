@@ -498,13 +498,30 @@ mod tests {
         }
     }
 
+    /// The solid-angle containment the queries used before the tree, as an
+    /// oracle away from the boundary.
+    fn solid_angle_contains(shape: Shape, point: Vec3) -> bool {
+        if point.cmplt(Vec3::ZERO).any() || point.cmpgt(Vec3::ONE).any() {
+            return false;
+        }
+        let mut angle = 0.0_f64;
+        for (t, _) in shape_triangles(shape, Vec3::ZERO, 1.0)
+            .into_iter()
+            .flatten()
+        {
+            let [a, b, c] = t.map(|v| (v - point).as_dvec3());
+            let denominator = a.length() * b.length() * c.length()
+                + a.dot(b) * c.length()
+                + b.dot(c) * a.length()
+                + c.dot(a) * b.length();
+            angle += 2.0 * libm::atan2(a.dot(b.cross(c)), denominator);
+        }
+        angle > std::f64::consts::TAU
+    }
+
     #[test]
     fn exact_containment_agrees_with_the_solid_angle_away_from_the_boundary() {
         for shape in shapes(23, 120) {
-            let cell = crate::Cell {
-                shape: Some(shape),
-                ..crate::Cell::solid(0)
-            };
             let tris: Vec<[I3; 3]> = triangles(shape)
                 .as_slice()
                 .iter()
@@ -520,7 +537,7 @@ mod tests {
                     continue;
                 }
                 let point = Vec3::from_array(p.map(|v| v as f32 / 512.0));
-                if crate::geometry::cell_contains(cell, point) != contains(&tris, p) {
+                if solid_angle_contains(shape, point) != contains(&tris, p) {
                     // The solid angle is unreliable within rounding of a face.
                     let near = shape_triangles(shape, Vec3::ZERO, 1.0)
                         .into_iter()

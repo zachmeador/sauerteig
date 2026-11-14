@@ -68,7 +68,7 @@ fn authored_snapshot_and_edit_view_keep_all_layers_consistent_after_mutation() {
         ])
         .unwrap();
     world.replace_volumes(&[]).unwrap();
-    assert_eq!(snapshot.regions(), &[region]);
+    // The snapshot keeps the world as it was when taken.
     assert_eq!(snapshot.cells(), cells);
     assert_eq!(snapshot.root_overrides(), roots);
     assert_eq!(snapshot.volumes(), &[water]);
@@ -87,7 +87,18 @@ fn authored_snapshot_and_edit_view_keep_all_layers_consistent_after_mutation() {
     )
     .unwrap();
     reopened.replace_volumes(snapshot.volumes()).unwrap();
+    assert_eq!(reopened.digest(), view.digest());
+    assert_ne!(reopened.digest(), world.digest());
     assert_eq!(reopened.root_overrides(), view.root_overrides());
     assert_eq!(reopened.cells(), view.cells());
     assert_eq!(reopened.volumes(), view.volumes());
+    // The region keeps its content around the hole.
+    assert!(view.intersects_box(
+        sauerteig_core::Vec3::splat(0.1),
+        sauerteig_core::Vec3::splat(0.9)
+    ));
+    assert!(!view.intersects_box(
+        sauerteig_core::Vec3::splat(1.1),
+        sauerteig_core::Vec3::splat(1.9)
+    ));
 }

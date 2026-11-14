@@ -135,6 +135,8 @@ impl Observed {
             ServerMessage::Welcome {
                 id,
                 revision,
+                bounds,
+                regions,
                 cells,
                 roots,
                 objects,
@@ -143,7 +145,7 @@ impl Observed {
             } => {
                 self.id = *id;
                 self.revision = *revision;
-                self.world = World::from_parts(cells, roots).unwrap();
+                self.world = World::from_compact_parts(*bounds, regions, cells, roots).unwrap();
                 self.objects = objects.clone();
                 self.players = players.clone();
             }
@@ -238,6 +240,8 @@ async fn textured_geometry_and_props_survive_combat_delayed_clients_and_reload()
         &config.world_path,
         serde_json::to_vec(&serde_json::json!({
             "revision": 0,
+            "format_version": sauerteig_core::WORLD_FORMAT_VERSION,
+            "regions": expected_world.regions(),
             "cells": expected_world.cells(),
             "objects": expected_objects,
         }))
@@ -368,6 +372,7 @@ async fn textured_geometry_and_props_survive_combat_delayed_clients_and_reload()
     }
     assert!(build_state.edit_acknowledged);
     for state in [&attack_state, &target_state, &build_state] {
+        assert_eq!(state.world.digest(), expected_world.digest());
         assert_eq!(state.world.cells(), expected_world.cells());
         assert_objects(&state.objects, &expected_objects);
         assert_eq!(state.revisions, (1..=8).collect::<Vec<_>>());
@@ -397,8 +402,14 @@ async fn textured_geometry_and_props_survive_combat_delayed_clients_and_reload()
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&config.world_path).unwrap()).unwrap();
             if saved["revision"] == 8 {
-                let cells: Vec<CellEdit> = serde_json::from_value(saved["cells"].clone()).unwrap();
-                assert_eq!(cells, expected_world.cells());
+                let part = |name: &str| saved.get(name).cloned().unwrap_or_default();
+                let regions: Vec<sauerteig_core::CellFragment> =
+                    serde_json::from_value(part("regions")).unwrap_or_default();
+                let cells: Vec<CellEdit> = serde_json::from_value(part("cells")).unwrap();
+                let reopened =
+                    World::from_compact_parts(expected_world.bounds(), &regions, &cells, &[])
+                        .unwrap();
+                assert_eq!(reopened.digest(), expected_world.digest());
                 let objects: Vec<WorldObject> =
                     serde_json::from_value(saved["objects"].clone()).unwrap();
                 assert_objects(&objects, &expected_objects);
@@ -425,7 +436,7 @@ async fn textured_geometry_and_props_survive_combat_delayed_clients_and_reload()
     }));
     let (rejoined, restored) = joined(&url).await;
     assert_eq!(restored.revision, 8);
-    assert_eq!(restored.world.cells(), expected_world.cells());
+    assert_eq!(restored.world.digest(), expected_world.digest());
     assert_objects(&restored.objects, &expected_objects);
     drop(rejoined);
     stop.send(()).unwrap();

@@ -1,9 +1,9 @@
-use crate::geometry::{cell_intersects_box, max_height, ray_box_interval, shape_support};
+use crate::geometry::ray_box_interval;
 use crate::movement::velocity_steps;
 use crate::{
-    forward, spawn_point, ArenaTuning, Cell, CellPos, InputFrame, JumpLatch, MovementProfile,
-    MovementState, MovementStyle, Octree, Player, SauerbratenTuning, Vec3, VolumeMaterial, World,
-    WorldBounds, PLAYER_HEIGHT, PLAYER_RADIUS,
+    forward, spawn_point, ArenaTuning, Cell, CellFragment, CellPos, InputFrame, JumpLatch,
+    MovementProfile, MovementState, MovementStyle, Octree, Player, SauerbratenTuning, Vec3,
+    VolumeMaterial, World, WorldBounds, PLAYER_HEIGHT, PLAYER_RADIUS,
 };
 
 const SKIN: f32 = 0.0002;
@@ -50,24 +50,6 @@ pub(crate) trait Space {
     fn first_ceiling(&self, feet: Vec3, old_head: f32, new_head: f32, body: Body) -> Option<f32>;
     fn free_at(&self, position: Vec3, body: Body) -> bool;
     fn swim_state(&self, feet: Vec3, probe_height: f32) -> bool;
-}
-
-impl Space for World {
-    fn space_bounds(&self) -> WorldBounds {
-        self.bounds()
-    }
-    fn support_between(&self, feet: Vec3, min_y: f32, max_y: f32, body: Body) -> Option<f32> {
-        support_between(self, feet, min_y, max_y, body)
-    }
-    fn first_ceiling(&self, feet: Vec3, old_head: f32, new_head: f32, body: Body) -> Option<f32> {
-        first_ceiling(self, feet, old_head, new_head, body)
-    }
-    fn free_at(&self, position: Vec3, body: Body) -> bool {
-        free_at(self, position, body)
-    }
-    fn swim_state(&self, feet: Vec3, probe_height: f32) -> bool {
-        swim_state(self, feet, probe_height)
-    }
 }
 
 /// The tree's single path: every leaf kind answers support, ceiling, overlap
@@ -150,13 +132,14 @@ fn body_bounds(feet: Vec3, body: Body) -> (Vec3, Vec3) {
 }
 
 pub fn player_intersects_cell(player: &Player, pos: CellPos, cell: Cell) -> bool {
-    let (min, max) = body_bounds(player.position, Body::HIT);
-    cell_intersects_box(pos, cell, min, max)
+    player_intersects_fragment(player, &CellFragment::from_cell(pos, cell))
 }
 
-pub fn player_intersects_fragment(player: &Player, fragment: &crate::CellFragment) -> bool {
+/// Whether a player's body overlaps a fragment's solid, as a world holding
+/// the fragment would block it.
+pub fn player_intersects_fragment(player: &Player, fragment: &CellFragment) -> bool {
     let (min, max) = body_bounds(player.position, Body::HIT);
-    crate::fine::fragment_intersects_box(fragment, min, max)
+    crate::octree::fragment_overlaps_box(fragment, min, max)
 }
 
 pub fn player_intersects_volume(player: &Player, volume: &crate::MaterialVolume) -> bool {
@@ -184,346 +167,6 @@ pub fn ray_player(
     let (enter, _) = ray_box_interval(origin, direction.normalize(), min, max)?;
     let distance = enter.max(0.0);
     (distance <= max_distance).then_some(distance)
-}
-
-/// Highest surface in the requested vertical interval under the player's box.
-/// Each cell is two triangular prisms, rather than a flat average-height block.
-fn support_between(world: &World, feet: Vec3, min_y: f32, max_y: f32, body: Body) -> Option<f32> {
-    let terrain = terrain_support_between(world, feet, min_y, max_y, body);
-    let glass = volume_support(world, feet, min_y, max_y, false, body);
-    match (terrain, glass) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-fn volume_support(
-    world: &World,
-    feet: Vec3,
-    low: f32,
-    high: f32,
-    ceiling: bool,
-    body: Body,
-) -> Option<f32> {
-    let (mut min, mut max) = body_bounds(feet, body);
-    let skin = contact_skin(feet);
-    min.y = low - skin;
-    max.y = high + skin;
-    world
-        .solid_volumes_in_box(min, max)
-        .into_iter()
-        .filter_map(|volume| {
-            let height = if ceiling {
-                volume.bounds.world_min().y
-            } else {
-                volume.bounds.world_max().y
-            };
-            (height >= low - skin && height <= high + skin).then_some(height)
-        })
-        .reduce(|a, b| if ceiling { a.min(b) } else { a.max(b) })
-}
-
-fn terrain_support_between(
-    world: &World,
-    feet: Vec3,
-    min_y: f32,
-    max_y: f32,
-    body: Body,
-) -> Option<f32> {
-    let (min, max) = body_bounds(feet, body);
-    let skin = contact_skin(feet);
-    if world.has_regions() {
-        return compact_support(world, min, max, min_y - skin, max_y + skin, false);
-    }
-    let bounds = world.bounds();
-    let mut support: Option<f32> = None;
-    let y0 = (min_y.floor() as i32 - 1).max(bounds.min[1]);
-    let y1 = (max_y.floor() as i32).min(bounds.max[1] - 1);
-    for z in min.z.floor() as i32..max.z.ceil() as i32 {
-        for x in min.x.floor() as i32..max.x.ceil() as i32 {
-            for y in y0..=y1 {
-                if let Some(root) = world.fine.get(&[x, y, z]) {
-                    if let Some(height) =
-                        fine_support(root, min, max, min_y - skin, max_y + skin, false)
-                    {
-                        support = Some(support.map_or(height, |previous| previous.max(height)));
-                    }
-                    continue;
-                }
-                let Some(cell) = world.get([x, y, z]) else {
-                    continue;
-                };
-                if let Some(shape) = cell.shape {
-                    if let Some(height) = shape_support(
-                        Vec3::new(x as f32, y as f32, z as f32),
-                        shape,
-                        min,
-                        max,
-                        min_y - skin,
-                        max_y + skin,
-                        false,
-                    ) {
-                        support = Some(support.map_or(height, |previous| previous.max(height)));
-                    }
-                    continue;
-                }
-                let Some(h) = max_height(
-                    cell,
-                    min.x - x as f32,
-                    min.z - z as f32,
-                    max.x - x as f32,
-                    max.z - z as f32,
-                ) else {
-                    continue;
-                };
-                if h <= 1.0e-5 {
-                    continue;
-                }
-                let height = y as f32 + h;
-                if height >= min_y - skin && height <= max_y + skin {
-                    support = Some(support.map_or(height, |previous| previous.max(height)));
-                }
-            }
-        }
-    }
-    support
-}
-
-fn first_ceiling(
-    world: &World,
-    feet: Vec3,
-    old_head: f32,
-    new_head: f32,
-    body: Body,
-) -> Option<f32> {
-    let terrain = terrain_first_ceiling(world, feet, old_head, new_head, body);
-    let glass = volume_support(world, feet, old_head, new_head, true, body);
-    match (terrain, glass) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-fn terrain_first_ceiling(
-    world: &World,
-    feet: Vec3,
-    old_head: f32,
-    new_head: f32,
-    body: Body,
-) -> Option<f32> {
-    let (min, max) = body_bounds(feet, body);
-    let skin = contact_skin(feet);
-    if world.has_regions() {
-        return compact_support(world, min, max, old_head - skin, new_head + skin, true);
-    }
-    let bounds = world.bounds();
-    let mut ceiling: Option<f32> = None;
-    let y0 = (old_head.floor() as i32).max(bounds.min[1]);
-    let y1 = (new_head.ceil() as i32).min(bounds.max[1] - 1);
-    for z in min.z.floor() as i32..max.z.ceil() as i32 {
-        for x in min.x.floor() as i32..max.x.ceil() as i32 {
-            for y in y0..=y1 {
-                if let Some(root) = world.fine.get(&[x, y, z]) {
-                    if let Some(height) =
-                        fine_support(root, min, max, old_head - skin, new_head + skin, true)
-                    {
-                        ceiling = Some(ceiling.map_or(height, |previous| previous.min(height)));
-                    }
-                    continue;
-                }
-                let Some(cell) = world.get([x, y, z]) else {
-                    continue;
-                };
-                if let Some(shape) = cell.shape {
-                    if let Some(height) = shape_support(
-                        Vec3::new(x as f32, y as f32, z as f32),
-                        shape,
-                        min,
-                        max,
-                        old_head - skin,
-                        new_head + skin,
-                        true,
-                    ) {
-                        ceiling = Some(ceiling.map_or(height, |previous| previous.min(height)));
-                    }
-                    continue;
-                }
-                if (y as f32) < old_head - skin || y as f32 > new_head + skin {
-                    continue;
-                }
-                let height = max_height(
-                    cell,
-                    min.x - x as f32,
-                    min.z - z as f32,
-                    max.x - x as f32,
-                    max.z - z as f32,
-                )
-                .unwrap_or(0.0);
-                if height > 1.0e-5 {
-                    ceiling = Some(ceiling.map_or(y as f32, |previous| previous.min(y as f32)));
-                }
-            }
-        }
-    }
-    ceiling
-}
-
-// The query only selects nearby fragments. Their complete active boundaries
-// must be retained: clipping to this scan interval would invent a floor or
-// ceiling at the query's own limits.
-fn compact_support(
-    world: &World,
-    min: Vec3,
-    max: Vec3,
-    low: f32,
-    high: f32,
-    ceiling: bool,
-) -> Option<f32> {
-    let query = crate::FineBox {
-        min: (Vec3::new(min.x, low, min.z) * crate::FINE_UNITS as f32)
-            .floor()
-            .as_ivec3()
-            .to_array(),
-        max: (Vec3::new(max.x, high, max.z) * crate::FINE_UNITS as f32)
-            .ceil()
-            .as_ivec3()
-            .to_array(),
-    };
-    let mut result: Option<f32> = None;
-    for id in world.compact.query(query) {
-        let root = &world.compact.regions[id].active;
-        accumulate_support(
-            root.triangles
-                .iter()
-                .filter(|triangle| {
-                    root.fragments[triangle.fragment]
-                        .bounds
-                        .intersection(query)
-                        .is_some()
-                })
-                .map(|triangle| triangle.points),
-            min,
-            max,
-            low,
-            high,
-            ceiling,
-            &mut result,
-        );
-    }
-    let bounds = world.bounds();
-    let lo = std::array::from_fn::<_, 3, _>(|axis| {
-        query.min[axis]
-            .div_euclid(crate::FINE_UNITS)
-            .max(bounds.min[axis])
-    });
-    let hi = std::array::from_fn::<_, 3, _>(|axis| {
-        ((query.max[axis] - 1).div_euclid(crate::FINE_UNITS) + 1).min(bounds.max[axis])
-    });
-    for x in lo[0]..hi[0] {
-        for y in lo[1]..hi[1] {
-            for z in lo[2]..hi[2] {
-                let pos = [x, y, z];
-                if let Some(root) = world.fine.get(&pos) {
-                    accumulate_support(
-                        root.triangles.iter().map(|triangle| triangle.points),
-                        min,
-                        max,
-                        low,
-                        high,
-                        ceiling,
-                        &mut result,
-                    );
-                } else if let Some(cell) = world.get(pos) {
-                    accumulate_support(
-                        crate::geometry::shape_triangles(
-                            cell.as_shape(),
-                            Vec3::new(x as f32, y as f32, z as f32),
-                            1.0,
-                        )
-                        .into_iter()
-                        .flatten()
-                        .map(|(triangle, _)| triangle),
-                        min,
-                        max,
-                        low,
-                        high,
-                        ceiling,
-                        &mut result,
-                    );
-                }
-            }
-        }
-    }
-    result
-}
-
-fn fine_support(
-    root: &crate::fine::FineRoot,
-    min: Vec3,
-    max: Vec3,
-    low: f32,
-    high: f32,
-    ceiling: bool,
-) -> Option<f32> {
-    let mut result = None;
-    accumulate_support(
-        root.triangles.iter().map(|triangle| triangle.points),
-        min,
-        max,
-        low,
-        high,
-        ceiling,
-        &mut result,
-    );
-    result
-}
-
-fn accumulate_support(
-    triangles: impl Iterator<Item = [Vec3; 3]>,
-    min: Vec3,
-    max: Vec3,
-    low: f32,
-    high: f32,
-    ceiling: bool,
-    result: &mut Option<f32>,
-) {
-    for triangle in triangles {
-        let [a, b, c] = triangle;
-        let normal = (b - a).cross(c - a);
-        if if ceiling {
-            normal.y >= -1.0e-9
-        } else {
-            normal.y <= 1.0e-9
-        } {
-            continue;
-        }
-        // Work near the player rather than at a far-away map origin. This
-        // preserves small height differences during footprint clipping.
-        let origin = Vec3::new(min.x, low, min.z);
-        let Some((bottom, top)) = crate::geometry::triangle_height_interval(
-            triangle.map(|point| point - origin),
-            min - origin,
-            max - origin,
-        ) else {
-            continue;
-        };
-        let height = origin.y + if ceiling { bottom } else { top };
-        if height < low || height > high {
-            continue;
-        }
-        *result = Some(result.map_or(height, |previous| {
-            if ceiling {
-                previous.min(height)
-            } else {
-                previous.max(height)
-            }
-        }));
-    }
-}
-
-fn free_at(world: &World, position: Vec3, body: Body) -> bool {
-    let (min, max) = body_bounds(position, body);
-    !world.intersects_box(min, max) && !world.intersects_solid_volume(min, max)
 }
 
 /// Returns true when an obstacle stopped the move, after zeroing that axis of
@@ -632,7 +275,7 @@ pub fn simulate_player_with(
     dt: f32,
     profile: &MovementProfile,
 ) {
-    simulate_in(world, player, input, dt, profile);
+    simulate_in(&world.tree, player, input, dt, profile);
 }
 
 /// The movement step on any world the step can query.
@@ -748,10 +391,6 @@ pub(crate) fn simulate_in<S: Space + ?Sized>(
         player.grounded = false;
         player.movement = MovementState::default();
     }
-}
-
-fn swim_state(world: &World, feet: Vec3, probe_height: f32) -> bool {
-    world.volume_material_at(feet + Vec3::Y * probe_height) == Some(VolumeMaterial::Water)
 }
 
 /// Updates the velocity for one Arena tick and applies gravity. Ground

@@ -23,14 +23,28 @@ fn large_world() -> World {
     )
     .unwrap()
 }
+/// The world a format 3 snapshot of `world` loads into.
+fn reloaded(world: &World) -> World {
+    let snapshot = world.snapshot();
+    World::from_compact_parts(
+        snapshot.bounds(),
+        snapshot.regions(),
+        &snapshot.cells(),
+        &snapshot.root_overrides(),
+    )
+    .unwrap()
+}
 #[test]
 fn one_large_leaf_remains_compact_and_selection_is_bounded() {
     let world = large_world();
     assert_eq!(world.region_count(), 1);
+    assert_eq!(world.stats().leaves(), 1);
     assert!(world.cells().is_empty());
     assert!(world.detailed_roots().is_empty());
+    // One mesh unit owns the leaf. It fills the root, whose outer faces are
+    // left out, so it draws nothing.
     assert_eq!(world.chunk_keys().len(), 1);
-    assert_eq!(world.mesh_chunk(world.chunk_keys()[0]).indices.len(), 36);
+    assert!(world.mesh_chunk(world.chunk_keys()[0]).indices.is_empty());
     assert!(world.try_roots_in(world.bounds().fine_box(), 512).is_err());
     assert_eq!(
         world
@@ -49,8 +63,9 @@ fn one_large_leaf_remains_compact_and_selection_is_bounded() {
     ));
 }
 #[test]
-fn empty_override_is_a_real_hole_after_save_and_undo() {
-    let mut world = large_world();
+fn an_empty_metre_is_a_real_hole_after_save_and_its_undo_restores_the_tree() {
+    let original = large_world();
+    let mut world = original.clone();
     let pos = [1000, 2000, 1000];
     let before = world.root_fragments(pos);
     let owner = world.chunk_keys()[0];
@@ -61,8 +76,9 @@ fn empty_override_is_a_real_hole_after_save_and_undo() {
         }])
         .unwrap();
     assert!(dirty.contains(&owner));
-    assert_eq!(world.override_count(), 1);
-    assert_eq!(world.region_count(), 1);
+    assert_eq!(world.override_count(), 0);
+    // The leaf splits around the hole: a few leaves a level, not a mask.
+    assert!(world.stats().leaves() < 200, "{:?}", world.stats());
     assert!(world.root_fragments(pos).is_empty());
     assert!(!world.intersects_box(
         Vec3::new(1000.1, 2000.1, 1000.1),
@@ -78,11 +94,9 @@ fn empty_override_is_a_real_hole_after_save_and_undo() {
     assert!((hit.distance - 0.5).abs() < 0.001);
     assert_eq!(hit.face, 0);
     assert_eq!(hit.pos, [1001, 2000, 1000]);
-    let json = serde_json::to_value(&world).unwrap();
-    assert_eq!(json["format_version"], WORLD_FORMAT_VERSION);
-    assert_eq!(json["regions"].as_array().unwrap().len(), 1);
-    assert_eq!(json["roots"].as_array().unwrap().len(), 1);
-    let mut restored: World = serde_json::from_value(json).unwrap();
+    let mut restored = reloaded(&world);
+    assert_eq!(restored.digest(), world.digest());
+    assert!(world.snapshot().root_overrides().is_empty());
     assert!(restored.root_fragments(pos).is_empty());
     restored
         .apply_root_edits(&[RootEdit {
@@ -90,11 +104,9 @@ fn empty_override_is_a_real_hole_after_save_and_undo() {
             fragments: before,
         }])
         .unwrap();
-    assert!(restored.intersects_box(
-        Vec3::new(1000.1, 2000.1, 1000.1),
-        Vec3::new(1000.9, 2000.9, 1000.9)
-    ));
-    // An internal join introduced by local undo cannot become a hit.
+    // An edit and its undo restore the identical tree: no seam remains.
+    assert_eq!(restored.digest(), original.digest());
+    assert_eq!(restored.stats().leaves(), 1);
     assert!(restored
         .raycast(Vec3::new(1000.5, 2000.5, 1000.5), Vec3::X, 4.0)
         .is_none());
@@ -102,7 +114,7 @@ fn empty_override_is_a_real_hole_after_save_and_undo() {
 #[test]
 fn compact_edits_validate_every_replacement_before_mutation() {
     let mut world = large_world();
-    let before = serde_json::to_vec(&world).unwrap();
+    let before = world.digest();
     let invalid = region([8000, 8000, 8000], 8, Cell::solid(9));
     assert!(world
         .apply_root_edits(&[
@@ -116,14 +128,14 @@ fn compact_edits_validate_every_replacement_before_mutation() {
             },
         ])
         .is_err());
-    assert_eq!(serde_json::to_vec(&world).unwrap(), before);
+    assert_eq!(world.digest(), before);
     assert!(world
         .apply_root_edits(&[RootEdit {
             pos: [3000, 1000, 1000],
             fragments: vec![]
         }])
         .is_err());
-    assert_eq!(serde_json::to_vec(&world).unwrap(), before);
+    assert_eq!(world.digest(), before);
 }
 #[test]
 fn overlapping_regions_and_out_of_bounds_data_are_rejected() {
@@ -131,11 +143,9 @@ fn overlapping_regions_and_out_of_bounds_data_are_rejected() {
     assert!(World::from_compact_parts(WorldBounds::default(), &[a.clone(), a], &[], &[]).is_err());
     let a = region([8192 * 8, 0, 0], 8, Cell::solid(1));
     assert!(World::from_compact_parts(WorldBounds::default(), &[a], &[], &[]).is_err());
-    let json = r#"{"format_version":4,"bounds":{"min":[0,0,0],"max":[8,8,8]},"regions":[],"cells":[],"roots":[]}"#;
-    assert!(serde_json::from_str::<World>(json).is_err());
 }
 #[test]
-fn query_index_is_conservative_and_mesh_keys_never_collide_with_local_chunks() {
+fn fragment_queries_are_exact_and_mesh_units_follow_minimum_corners() {
     let regions: Vec<_> = (0..300)
         .map(|x| region([x * 16, 0, 0], 8, Cell::solid((x % 8) as u8)))
         .collect();
@@ -149,7 +159,13 @@ fn query_index_is_conservative_and_mesh_keys_never_collide_with_local_chunks() {
         &[],
     )
     .unwrap();
-    assert_eq!(world.chunk_keys().len(), 3);
+    // One 32 m unit for every 16 regions along the row.
+    let unit = MESH_UNIT_SIZE * 8;
+    let keys = world.chunk_keys();
+    assert_eq!(keys.len(), (300 * 16usize).div_ceil(unit as usize));
+    assert!(keys
+        .iter()
+        .all(|k| k[0] % unit == 0 && k[1] == 0 && k[2] == 0));
     for x in 0..300 {
         let found = world.fragments_in(FineBox::root([x * 2, 0, 0]));
         assert_eq!(found.len(), 1);
@@ -159,14 +175,14 @@ fn query_index_is_conservative_and_mesh_keys_never_collide_with_local_chunks() {
             .is_empty());
     }
     let base_keys = world.chunk_keys();
-    world
+    let dirty = world
         .apply_root_edits(&[RootEdit {
             pos: [1, 0, 0],
             fragments: vec![CellFragment::from_cell([1, 0, 0], Cell::solid(2))],
         }])
         .unwrap();
-    assert!(base_keys.iter().all(|k| *k != World::cell_chunk([1, 0, 0])));
-    assert_eq!(world.chunk_keys().len(), 4);
+    assert_eq!(dirty, vec![[0, 0, 0]]);
+    assert_eq!(world.chunk_keys(), base_keys);
 }
 #[test]
 fn large_coordinate_rays_keep_eighth_metre_details() {
@@ -208,9 +224,11 @@ fn face_materials_survive_coarse_fine_caps_and_compact_meshes() {
             assert_eq!(v.material, face as u8);
         }
     }
+    // Above the root's floor, every face of a lone cube is drawn.
     let mut world = World::empty();
-    world.set([0, 0, 0], Some(cell));
-    let mesh = world.mesh_chunk([0, 0, 0]);
+    world.set([0, 1, 0], Some(cell));
+    let key = world.chunk_keys()[0];
+    let mesh = world.mesh_chunk(key);
     assert_eq!(
         mesh.vertices
             .iter()
@@ -221,25 +239,26 @@ fn face_materials_survive_coarse_fine_caps_and_compact_meshes() {
     );
     let half = CellFragment {
         bounds: FineBox {
-            min: [0, 0, 0],
-            max: [4, 8, 8],
+            min: [0, 8, 0],
+            max: [4, 16, 8],
         },
-        ..CellFragment::from_cell([0, 0, 0], cell)
+        ..CellFragment::from_cell([0, 1, 0], cell)
     };
     world
         .apply_root_edits(&[RootEdit {
-            pos: [0, 0, 0],
+            pos: [0, 1, 0],
             fragments: vec![half],
         }])
         .unwrap();
-    assert!(world
-        .mesh_chunk([0, 0, 0])
+    let cut: Vec<_> = world
+        .mesh_chunk(key)
         .vertices
-        .iter()
+        .into_iter()
         .filter(|v| v.position[0] == 0.5 && v.normal[0] > 0.99)
-        .all(|v| v.material == 1));
+        .collect();
+    assert!(!cut.is_empty() && cut.iter().all(|v| v.material == 1));
     assert_eq!(
-        world.root_fragments([0, 0, 0])[0].cell.face_materials,
+        world.root_fragments([0, 1, 0])[0].cell.face_materials,
         cell.face_materials
     );
 }
@@ -258,10 +277,10 @@ fn old_cells_default_to_fallback_and_bad_face_slots_are_rejected() {
 }
 
 #[test]
-fn compact_noop_keeps_storage_and_other_root_identity_stable() {
+fn a_write_that_changes_nothing_keeps_the_tree_and_other_metres() {
     let f = CellFragment::from_cell([0, 0, 0], Cell::solid(1));
     let mut world = World::from_compact_parts(WorldBounds::default(), &[f], &[], &[]).unwrap();
-    let before = serde_json::to_vec(&world).unwrap();
+    let before = world.digest();
     assert!(world
         .apply_root_edits(&[RootEdit {
             pos: [0, 0, 0],
@@ -269,7 +288,7 @@ fn compact_noop_keeps_storage_and_other_root_identity_stable() {
         }])
         .unwrap()
         .is_empty());
-    assert_eq!(serde_json::to_vec(&world).unwrap(), before);
+    assert_eq!(world.digest(), before);
     let mut world = large_world();
     let before = world.root_fragments([2, 2, 2]);
     assert!(world
@@ -279,7 +298,7 @@ fn compact_noop_keeps_storage_and_other_root_identity_stable() {
         }])
         .unwrap()
         .is_empty());
-    assert_eq!(world.override_count(), 0);
+    assert_eq!(world.digest(), large_world().digest());
     world
         .apply_root_edits(&[RootEdit {
             pos: [1, 1, 1],

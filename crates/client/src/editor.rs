@@ -1279,6 +1279,14 @@ mod tests {
     use sauerteig_core::{ClientMessage, ServerMessage};
     use sauerteig_core::{WorldBounds, WORLD_HEIGHT, WORLD_MAX};
 
+    /// A cell as a world stores it: a planar face's diagonal takes its fixed
+    /// value, and a cell whose six faces all name a material keeps only them.
+    fn stored(cell: Cell) -> Cell {
+        let mut world = World::empty();
+        world.set([0, 0, 0], Some(cell));
+        world.get([0, 0, 0]).expect("a whole-metre cell")
+    }
+
     fn object(id: u32, kind: ObjectKind, position: [f32; 3], rotation: f32) -> WorldObject {
         WorldObject {
             id,
@@ -1358,7 +1366,8 @@ mod tests {
         );
         let paint = selected.plan_paint(&world, 7).unwrap();
         apply(&mut world, &paint);
-        assert_eq!(world.region_count(), 1);
+        // The region splits only around the painted metre.
+        assert!(world.stats().leaves() < 64, "{:?}", world.stats());
         assert_eq!(
             world.root_fragments([200, 15, 200])[0]
                 .cell
@@ -1895,7 +1904,7 @@ mod tests {
         let s = selection([0, 0, 0], [4, 8, 8], 0, -1, 4);
         let clip = Clipboard::copy(&world, &s).unwrap();
         assert_eq!(clip.fragments.len(), 1);
-        assert_eq!(clip.fragments[0].cell, ramp);
+        assert_eq!(clip.fragments[0].cell, stored(ramp));
         assert_eq!(clip.fragments[0].size, 8);
         assert_eq!(
             s.plan_deform(&world, Some(0), 1).unwrap_err(),
@@ -2297,6 +2306,8 @@ mod tests {
                 ..Cell::solid(2)
             }),
         );
+        // The world keeps the shape with its planar faces' diagonals fixed.
+        let shape = world.get([0, 0, 0]).unwrap().as_shape();
         let original = Clipboard::copy_regions(&world, &mask(&[([0, 0, 0], [8, 8, 8])])).unwrap();
         let mut rotated = original.clone();
         rotated.rotate_y().unwrap();
@@ -2369,7 +2380,13 @@ mod tests {
         }
         clip.mirror(0).unwrap();
         clip.mirror(0).unwrap();
-        assert!(clip.fragments.iter().all(|f| f.size == 64));
+        // Metres the slope crosses keep its 8 m source; one wholly under it
+        // is a full metre.
+        assert!(clip
+            .fragments
+            .iter()
+            .all(|f| f.size == 64 || f.cell.is_full()));
+        assert!(clip.fragments.iter().any(|f| f.size == 64));
         let target = selection([32, 0, 0], [48, 16, 8], 0, -1, 8);
         let plan = clip.plan_paste(&world, &target).unwrap();
         apply(&mut world, &plan);
@@ -2416,12 +2433,20 @@ mod tests {
                 apply(&mut world, &first);
                 let mut next = [4, 4, 4];
                 next[axis] += sign;
-                assert_eq!(world.get(next), Some(faces), "axis {axis}, sign {sign}");
+                assert_eq!(
+                    world.get(next),
+                    Some(stored(faces)),
+                    "axis {axis}, sign {sign}"
+                );
                 // The selection follows the new layer, so a pillar keeps its pattern.
                 let second = first.selection_after.plan_extrude(&world, 7).unwrap();
                 apply(&mut world, &second);
                 next[axis] += sign;
-                assert_eq!(world.get(next), Some(faces), "axis {axis}, sign {sign}");
+                assert_eq!(
+                    world.get(next),
+                    Some(stored(faces)),
+                    "axis {axis}, sign {sign}"
+                );
             }
         }
     }
@@ -2497,9 +2522,9 @@ mod tests {
         );
         let plan = strip.plan_extrude(&world, 4).unwrap();
         apply(&mut world, &plan);
-        assert_eq!(world.get([207, 16, 200]), Some(cell));
+        assert_eq!(world.get([207, 16, 200]), Some(stored(cell)));
         assert_eq!(world.get([208, 16, 200]), Some(Cell::solid(4)));
-        assert_eq!(world.region_count(), 1);
+        assert!(world.stats().leaves() < 64, "{:?}", world.stats());
     }
 
     #[test]
@@ -2695,8 +2720,8 @@ mod tests {
                             ..Cell::solid(f.cell.material)
                         });
                         assert_eq!(
-                            fragment_at(&after, p).unwrap().cell,
-                            expected,
+                            stored(fragment_at(&after, p).unwrap().cell),
+                            stored(expected),
                             "round {round}, axis {axis}, sign {sign}, grid {grid}, {p:?}"
                         );
                     }
@@ -2844,13 +2869,16 @@ mod tests {
                 fragments: world.root_fragments(r.pos),
             })
             .collect();
+        let before = world.digest();
         apply(&mut world, &plan);
         assert!((top(&world, 200.5) - 15.0).abs() < 1e-5);
         assert!((top(&world, 201.5) - 16.0).abs() < 1e-5);
-        assert_eq!(world.region_count(), 1);
         world.apply_root_edits(&saved).unwrap();
         assert!((top(&world, 200.5) - 16.0).abs() < 1e-5);
         assert!((top(&world, 201.5) - 16.0).abs() < 1e-5);
+        // Restoring the metres restores the identical tree.
+        assert_eq!(world.digest(), before);
+        assert_eq!(world.region_count(), 1);
     }
 
     #[test]
@@ -2950,6 +2978,7 @@ mod tests {
             "revision": 0,
             "format_version": sauerteig_core::WORLD_FORMAT_VERSION,
             "bounds": wall.bounds(),
+            "regions": wall.regions(),
             "cells": wall.cells(),
             "roots": wall.root_overrides(),
             "volumes": wall.volumes(),
@@ -3004,7 +3033,7 @@ mod tests {
             face_materials: Some([1, 2, 3, 4, 5, 6]),
             ..Cell::solid(5)
         };
-        assert_eq!(wire.world.get([3, 3, 0]), Some(copied));
+        assert_eq!(wire.world.get([3, 3, 0]), Some(stored(copied)));
         assert!(wire.settle(ClientMessage::Undo).is_empty());
         assert_eq!(wire.revision, revision + 2);
         assert_eq!(wire.state(), original);

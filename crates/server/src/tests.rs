@@ -20,6 +20,18 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+/// A cell as a world stores it: a planar face's diagonal takes its fixed
+/// value.
+fn stored(pos: CellPos, cell: Cell) -> Option<Cell> {
+    let stored = World::from_cells(&[CellEdit {
+        pos,
+        cell: Some(cell),
+    }])
+    .get(pos);
+    assert!(stored.is_some_and(|c| c.as_shape().vertices == cell.as_shape().vertices));
+    stored
+}
+
 fn room() -> Session {
     let mut world = World::empty();
     for x in -8..8 {
@@ -32,7 +44,7 @@ fn room() -> Session {
             volumes: Vec::new(),
             format_version: 2,
             bounds: Default::default(),
-            regions: Vec::new(),
+            regions: world.regions(),
             revision: 0,
             cells: world.cells(),
             roots: Vec::new(),
@@ -1009,7 +1021,7 @@ fn persistence_preserves_deformation_objects_and_revision() {
     assert_eq!(loaded.revision, 2);
     assert_eq!(
         World::from_cells(&loaded.cells).get([12, 5, 12]),
-        Some(slope)
+        stored([12, 5, 12], slope)
     );
     assert_eq!(loaded.objects.len(), 1);
     assert!(!path.with_extension("json.tmp").exists());
@@ -1341,7 +1353,10 @@ async fn websocket_clients_share_edits_reject_bad_inputs_and_rejoin_saved_world(
     {
         assert_eq!(revision, 1);
         assert_eq!(players.len(), 2);
-        assert_eq!(World::from_cells(&cells).get([30, 8, 30]), Some(slope));
+        assert_eq!(
+            World::from_cells(&cells).get([30, 8, 30]),
+            stored([30, 8, 30], slope)
+        );
     } else {
         unreachable!();
     }
@@ -2025,10 +2040,15 @@ fn compact_snapshot_accounting_is_small_conservative_and_survives_cuts() {
     )
     .unwrap();
     assert!(session.geometry_bytes > initial_bytes);
+    // The cut splits the cube into the leaves around it; the file holds them
+    // as regions and cells, and the room counts each by its own JSON.
     let saved = session.saved();
-    assert_eq!(saved.regions.len(), 1);
-    assert_eq!(saved.roots.len(), 1);
-    assert!(saved.roots[0].fragments.is_empty());
+    assert!(saved.roots.is_empty());
+    assert!(saved.regions.len() > 1);
+    assert_eq!(
+        session.geometry_fragments,
+        saved.regions.len() + saved.cells.len()
+    );
     crate::validate_snapshot_geometry(&saved.regions, &saved.cells, &saved.roots).unwrap();
     let expected = saved
         .regions
@@ -2036,9 +2056,9 @@ fn compact_snapshot_accounting_is_small_conservative_and_survives_cuts() {
         .map(|fragment| crate::json_bytes(fragment) + 1)
         .sum::<usize>()
         + saved
-            .roots
+            .cells
             .iter()
-            .map(|root| crate::json_bytes(root) + 1)
+            .map(|cell| crate::json_bytes(cell) + 1)
             .sum::<usize>();
     assert_eq!(session.geometry_bytes, expected);
     let (events, _receiver) = crate::outbound::channel();
@@ -2047,6 +2067,10 @@ fn compact_snapshot_accounting_is_small_conservative_and_survives_cuts() {
     let welcome = welcome.expand();
     assert!(crate::json_bytes(&welcome) < session.geometry_bytes + crate::SNAPSHOT_ENVELOPE_BYTES);
     assert_eq!(Session::new(saved, true).geometry_bytes, expected);
+    // Undoing the cut merges the leaves back into one region.
+    session.undo(builder).unwrap();
+    assert_eq!(session.geometry_bytes, initial_bytes);
+    assert_eq!(session.geometry_fragments, 1);
 }
 
 #[test]
@@ -2094,7 +2118,9 @@ fn sync_acknowledges_prior_history_changes_without_requiring_edit_mode() {
 }
 
 #[test]
-fn snapshot_load_budget_counts_canonical_growth_before_accepting_roots() {
+fn a_room_counts_the_pieces_and_bytes_its_save_will_hold() {
+    // A fragment of a distant source, half a metre wide: the tree stores it
+    // as cubes, and the file writes each as a region.
     let root = RootEdit {
         pos: [4000, 4000, 4000],
         fragments: vec![CellFragment {
@@ -2117,21 +2143,24 @@ fn snapshot_load_budget_counts_canonical_growth_before_accepting_roots() {
         },
         regions: vec![],
         cells: vec![],
-        roots: vec![root.clone()],
+        roots: vec![root],
         objects: vec![],
         next_object: 1,
     };
-    let room = Session::new(saved.clone(), true);
-    let authored_bytes = crate::json_bytes(&root) + 1;
-    let projected_bytes =
-        crate::snapshot_geometry_bytes(&saved.regions, &saved.cells, &saved.roots);
-    assert!(
-        room.geometry_bytes > authored_bytes,
-        "normalizing distant source coordinates grows this root"
+    let room = Session::new(saved, true);
+    let written = room.saved();
+    assert!(written.roots.is_empty());
+    assert_eq!(
+        room.geometry_fragments,
+        written.regions.len() + written.cells.len()
     );
     assert_eq!(
-        projected_bytes, room.geometry_bytes,
-        "load must budget the canonical representation"
+        room.geometry_bytes,
+        crate::snapshot_geometry_bytes(&written.regions, &written.cells, &written.roots)
+    );
+    assert_eq!(
+        Session::new(written, true).geometry_bytes,
+        room.geometry_bytes
     );
 }
 
@@ -2459,4 +2488,259 @@ fn replacing_a_world_file_leaves_only_the_new_world() {
     assert_eq!(load_world(&path).unwrap().revision, 7);
     assert!(!path.with_extension("json.tmp").exists());
     std::fs::remove_dir_all(&directory).unwrap();
+}
+
+/// Leaves of the water box in `near_guard`: 64 cubes 16 m on a side.
+const WATER_LEAVES: usize = 64;
+
+/// A world 128 m square whose water and glass hold `WATER_LEAVES + pane`
+/// leaves: 16 m of water across the floor, and above it a glass pane an eighth
+/// thick whose eighths are one leaf each. Its geometry is empty.
+fn near_guard(pane: usize) -> SavedWorld {
+    use sauerteig_core::{MaterialVolume, VolumeMaterial, WorldBounds};
+    let glass = |min: [i32; 3], max: [i32; 3]| MaterialVolume {
+        bounds: FineBox { min, max },
+        material: VolumeMaterial::Glass,
+    };
+    let rows = (pane / 1024) as i32;
+    let rest = (pane % 1024) as i32;
+    let mut volumes = vec![MaterialVolume {
+        bounds: FineBox {
+            min: [0, 0, 0],
+            max: [1024, 128, 1024],
+        },
+        material: VolumeMaterial::Water,
+    }];
+    if rows > 0 {
+        volumes.push(glass([0, 200, 0], [1024, 201, rows]));
+    }
+    if rest > 0 {
+        volumes.push(glass([0, 200, rows], [rest, 201, rows + 1]));
+    }
+    SavedWorld {
+        revision: 0,
+        format_version: 3,
+        bounds: WorldBounds {
+            min: [0, 0, 0],
+            max: [128, 32, 128],
+        },
+        regions: Vec::new(),
+        cells: Vec::new(),
+        roots: Vec::new(),
+        volumes,
+        objects: Vec::new(),
+        next_object: 0,
+    }
+}
+
+/// A full cell in one metre, inside `near_guard`'s water.
+fn cell_at(pos: CellPos) -> RootEdit {
+    RootEdit {
+        pos,
+        fragments: vec![CellFragment::from_cell(pos, Cell::solid(1))],
+    }
+}
+
+/// How many leaves an edit adds to a world.
+fn leaves_added(world: &World, roots: &[RootEdit]) -> usize {
+    let mut probe = world.clone();
+    probe.apply_root_edits(roots).unwrap();
+    probe.stats().leaves() - world.stats().leaves()
+}
+
+/// Joins an editor and builds its world from the Welcome, as a client does.
+fn join_and_build(
+    session: &mut Session,
+) -> (u64, mpsc::UnboundedReceiver<crate::outbound::Queued>, World) {
+    let (events, receiver) = crate::outbound::channel();
+    let (snapshots, _) = watch::channel(None);
+    let (id, welcome) = session.join(events, snapshots).unwrap();
+    session.peers.get_mut(&id).unwrap().player.editing = true;
+    let ServerMessage::Welcome {
+        bounds,
+        regions,
+        cells,
+        roots,
+        volumes,
+        ..
+    } = welcome.expand()
+    else {
+        panic!("a join answers with a Welcome");
+    };
+    let mut world = World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap();
+    world.replace_volumes(&volumes).unwrap();
+    (id, receiver, world)
+}
+
+#[test]
+fn geometry_inside_water_counts_against_the_world_guard() {
+    let guard = sauerteig_core::MAX_WORLD_PIECES;
+    let water = Session::new(near_guard(0), true);
+    assert_eq!(water.world_stats.leaves(), WATER_LEAVES);
+    let (first, second) = (cell_at([4, 4, 4]), cell_at([20, 4, 4]));
+    // One cell splits the 16 m of water around it into many leaves, which
+    // format 3's piece count does not see.
+    let added = leaves_added(&water.world, std::slice::from_ref(&first));
+    assert_eq!(
+        added,
+        leaves_added(&water.world, std::slice::from_ref(&second))
+    );
+    assert!(added > 20, "{added}");
+    let slack = added / 2;
+    let mut session = Session::new(near_guard(guard - slack - added - WATER_LEAVES), true);
+    assert_eq!(session.world_stats.leaves(), guard - slack - added);
+    let (builder, _events) = peer(&mut session, true);
+
+    session.edit_roots(builder, 0, vec![first.clone()]).unwrap();
+    assert_eq!(session.world_stats.leaves(), guard - slack);
+    assert_eq!(session.geometry_fragments, 1);
+
+    // Saved just under the guard, the world opens again unchanged.
+    let dir = temporary_directory("under-guard");
+    let path = dir.join("world.json");
+    write_world(&path, &session.saved()).unwrap();
+    let (saved, world) = crate::persistence::open_world(&path).unwrap();
+    let reopened = Session::from_world(saved, world, true).unwrap();
+    assert_eq!(reopened.world_stats.leaves(), guard - slack);
+    assert_eq!(reopened.world.digest(), session.world.digest());
+    std::fs::remove_dir_all(dir).unwrap();
+
+    // The next cell would pass the guard.
+    let before = session.world.digest();
+    let revision = session.revision;
+    assert_eq!(
+        session
+            .edit_roots(builder, revision, vec![second])
+            .unwrap_err(),
+        crate::WORLD_GUARD_ERROR
+    );
+    assert_eq!(session.world.digest(), before);
+    assert_eq!(session.revision, revision);
+
+    // Removing detail is accepted.
+    session
+        .edit_roots(
+            builder,
+            revision,
+            vec![RootEdit {
+                pos: first.pos,
+                fragments: Vec::new(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(session.world_stats.leaves(), guard - slack - added);
+}
+
+#[test]
+fn a_world_saved_over_the_guard_opens_on_the_server_and_through_a_welcome() {
+    let guard = sauerteig_core::MAX_WORLD_PIECES;
+    let over = guard + 1000;
+    let dir = temporary_directory("over-guard");
+    let path = dir.join("world.json");
+    write_world(&path, &near_guard(over - WATER_LEAVES)).unwrap();
+    let (saved, world) = crate::persistence::open_world(&path).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    let mut session = Session::from_world(saved, world, true).unwrap();
+    assert_eq!(session.world_stats.leaves(), over);
+    let (builder, _events, client) = join_and_build(&mut session);
+    assert_eq!(client.digest(), session.world.digest());
+    assert_eq!(client.volumes(), session.world.volumes());
+
+    // An edit that adds leaves is refused, and one that removes them is
+    // accepted, though the world stays over the guard.
+    assert_eq!(
+        session
+            .edit_roots(builder, 0, vec![cell_at([4, 4, 4])])
+            .unwrap_err(),
+        crate::WORLD_GUARD_ERROR
+    );
+    volume_transaction(
+        &mut session,
+        builder,
+        0,
+        vec![],
+        vec![],
+        vec![volume_edit([0, 200, 0], [64, 201, 1], None)],
+    )
+    .unwrap();
+    assert_eq!(session.world_stats.leaves(), over - 64);
+}
+
+#[test]
+fn a_transaction_near_the_guard_gives_the_client_the_servers_world() {
+    let guard = sauerteig_core::MAX_WORLD_PIECES;
+    let added = leaves_added(
+        &Session::new(near_guard(0), true).world,
+        &[cell_at([4, 4, 4])],
+    );
+    assert!(added > 20, "{added}");
+    let slack = added / 2;
+    let rows = (guard - slack - WATER_LEAVES) / 1024;
+    let mut session = Session::new(near_guard(guard - slack - WATER_LEAVES), true);
+    assert_eq!(session.world_stats.leaves(), guard - slack);
+    let (builder, mut events, mut client) = join_and_build(&mut session);
+    type Patch = (Vec<RootEdit>, Option<Vec<sauerteig_core::MaterialVolume>>);
+    fn take_patch(events: &mut mpsc::UnboundedReceiver<crate::outbound::Queued>) -> Option<Patch> {
+        let mut patch = None;
+        while let Ok(queued) = events.try_recv() {
+            if let ServerMessage::TransactionPatch { roots, volumes, .. } = &queued.packet.message {
+                assert!(patch.is_none(), "one patch an edit");
+                patch = Some((roots.clone(), volumes.clone()));
+            }
+        }
+        patch
+    }
+    fn follow(
+        session: &Session,
+        events: &mut mpsc::UnboundedReceiver<crate::outbound::Queued>,
+        client: &mut World,
+    ) {
+        let (roots, volumes) = take_patch(events).expect("a patch");
+        let chunks = client.apply_patch(&roots, volumes.as_deref()).unwrap();
+        assert!(!chunks.is_empty());
+        assert_eq!(client.digest(), session.world.digest());
+        assert_eq!(client.volumes(), session.world.volumes());
+    }
+    let row = rows as i32 - 1;
+    let cleared = added as i32 + 8;
+
+    // The cell alone would pass the guard; with part of the pane cleared
+    // the result stays under it.
+    volume_transaction(
+        &mut session,
+        builder,
+        0,
+        vec![cell_at([4, 4, 4])],
+        vec![],
+        vec![volume_edit([0, 200, row], [cleared, 201, row + 1], None)],
+    )
+    .unwrap();
+    assert_eq!(session.world_stats.leaves(), guard - slack - 8);
+    follow(&session, &mut events, &mut client);
+
+    // A transaction whose result would pass the guard is refused and sends
+    // nothing.
+    let revision = session.revision;
+    let before = session.world.digest();
+    assert_eq!(
+        volume_transaction(
+            &mut session,
+            builder,
+            revision,
+            vec![cell_at([20, 4, 4])],
+            vec![],
+            vec![volume_edit([0, 200, row - 1], [1, 201, row], None)],
+        )
+        .unwrap_err(),
+        crate::WORLD_GUARD_ERROR
+    );
+    assert_eq!(session.world.digest(), before);
+    assert!(take_patch(&mut events).is_none());
+
+    // Undoing the first puts the pane back before the cell goes: the boxes
+    // alone pass the guard, the result does not, and a client applying the
+    // patch in the server's order agrees.
+    session.undo(builder).unwrap();
+    assert_eq!(session.world_stats.leaves(), guard - slack);
+    follow(&session, &mut events, &mut client);
 }

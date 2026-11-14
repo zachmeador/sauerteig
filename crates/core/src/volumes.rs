@@ -1,5 +1,10 @@
-//! Sparse material space, independent of the terrain's surface textures.
-use crate::{FineBox, RayHit, Vec3, World, FINE_UNITS};
+//! Water and glass as format 3's boxes. The tree holds them as cube material;
+//! the boxes stay as loaded, and a change writes cube material only where it
+//! differs, so unchanged glass keeps its boxes and their edge bands.
+use crate::{
+    cube_material_for, FineBox, RayHit, Vec3, World, FINE_UNITS, MAT_AIR, MAX_CONVERSION_LEAVES,
+    MAX_WORLD_PIECES,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -10,6 +15,33 @@ pub const MAX_VOLUME_EDITS: usize = MAX_MATERIAL_VOLUMES * 2;
 /// subtraction cannot produce an unbounded renderer mesh from crossing strips.
 pub const MAX_VOLUME_FACE_CONTACTS: usize = 65_536;
 const MAX_VOLUME_PIECES: usize = MAX_MATERIAL_VOLUMES * 6;
+const TOO_DETAILED: &str =
+    "This edit creates too much material volume detail; use a smaller selection.";
+
+/// The most leaves cube-material writes may take a world to. An edit stops at
+/// the world's guard, counted before anything is built, so a thin pane cannot
+/// use up memory. Loading a world and applying a patch the server accepted
+/// stop only at the memory limit conversion uses, so a world saved over the
+/// guard still opens and a client never refuses what its server checked.
+#[derive(Clone, Copy)]
+enum Ceiling {
+    Edit,
+    Memory,
+}
+impl Ceiling {
+    fn leaves(self) -> usize {
+        match self {
+            Self::Edit => MAX_WORLD_PIECES,
+            Self::Memory => MAX_CONVERSION_LEAVES,
+        }
+    }
+    fn error(self) -> &'static str {
+        match self {
+            Self::Edit => "This water or glass change would take the world past its 786,432-piece limit; use a smaller selection.",
+            Self::Memory => "Water and glass would take this world past the 4,194,304 leaves it may hold in memory.",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,86 +194,13 @@ impl BoxIndex {
             })),
         }
     }
-    fn ray_query(
-        &self,
-        boxes: &[FineBox],
-        origin: Vec3,
-        direction: Vec3,
-        distance: f32,
-    ) -> Vec<usize> {
-        let mut result = Vec::new();
-        if !self.nodes.is_empty() {
-            self.ray_node(0, boxes, origin, direction, distance, &mut result);
-        }
-        result
-    }
-    fn ray_node(
-        &self,
-        node: usize,
-        boxes: &[FineBox],
-        origin: Vec3,
-        direction: Vec3,
-        distance: f32,
-        out: &mut Vec<usize>,
-    ) {
-        let node = &self.nodes[node];
-        let intersects = |bounds: FineBox| {
-            crate::geometry::ray_box_interval(
-                origin,
-                direction,
-                bounds.world_min(),
-                bounds.world_max(),
-            )
-            .is_some_and(|(enter, exit)| enter <= distance && exit >= 0.0)
-        };
-        if !intersects(node.bounds) {
-            return;
-        }
-        match &node.kind {
-            NodeKind::Branch(a, b) => {
-                self.ray_node(*a, boxes, origin, direction, distance, out);
-                self.ray_node(*b, boxes, origin, direction, distance, out);
-            }
-            NodeKind::Leaf(ids) => {
-                out.extend(ids.iter().copied().filter(|&id| intersects(boxes[id])))
-            }
-        }
-    }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct VolumeLayer {
-    volumes: Arc<Vec<MaterialVolume>>,
-    boxes: Vec<FineBox>,
-    index: BoxIndex,
-}
-impl VolumeLayer {
-    pub(crate) fn authored(&self) -> Arc<Vec<MaterialVolume>> {
-        self.volumes.clone()
-    }
-    fn new(volumes: Vec<MaterialVolume>) -> Self {
-        let boxes: Vec<_> = volumes.iter().map(|volume| volume.bounds).collect();
-        let index = BoxIndex::new(&boxes);
-        Self {
-            volumes: Arc::new(volumes),
-            boxes,
-            index,
-        }
-    }
-
-    fn material_at(&self, point: Vec3) -> Option<VolumeMaterial> {
-        let min = (point * FINE_UNITS as f32).floor().as_ivec3().to_array();
-        let max = min.map(|value| value.saturating_add(1));
-        self.index
-            .query(&self.boxes, FineBox { min, max })
-            .into_iter()
-            .find_map(|id| {
-                let volume = self.volumes[id];
-                (point.cmpge(volume.bounds.world_min()).all()
-                    && point.cmplt(volume.bounds.world_max()).all())
-                .then_some(volume.material)
-            })
-    }
+fn edit_writes(edits: &[VolumeEdit]) -> Vec<(FineBox, u16)> {
+    edits
+        .iter()
+        .map(|e| (e.bounds, e.material.map_or(MAT_AIR, cube_material_for)))
+        .collect()
 }
 
 /// Validate bounded, disjoint material boxes without expanding world cells.
@@ -249,7 +208,7 @@ pub fn validate_material_volumes(
     volumes: &[MaterialVolume],
     bounds: FineBox,
 ) -> Result<(), String> {
-    let limit = crate::compact::MAX_WORLD_COORDINATE * FINE_UNITS;
+    let limit = crate::world::MAX_WORLD_COORDINATE * FINE_UNITS;
     if bounds.is_empty()
         || bounds
             .min
@@ -360,17 +319,15 @@ pub fn coalesce_material_volumes(mut volumes: Vec<MaterialVolume>) -> Vec<Materi
 fn cut_pieces(
     bounds: FineBox,
     cuts: impl Iterator<Item = FineBox>,
+    limit: usize,
 ) -> Result<Vec<FineBox>, String> {
     let mut pieces = vec![bounds];
     for cut in cuts {
         let mut next = Vec::new();
         for piece in pieces {
             next.extend(piece.subtract(cut));
-            if next.len() > MAX_VOLUME_PIECES {
-                return Err(
-                    "This edit creates too much material volume detail; use a smaller selection."
-                        .into(),
-                );
+            if next.len() > limit {
+                return Err(TOO_DETAILED.into());
             }
         }
         pieces = next;
@@ -382,16 +339,113 @@ fn cut_pieces(
 }
 
 impl World {
+    /// Water and glass as format 3's boxes.
     pub fn volumes(&self) -> &[MaterialVolume] {
-        &self.volumes.volumes
+        &self.volumes
     }
 
-    pub fn replace_volumes(&mut self, volumes: &[MaterialVolume]) -> Result<(), String> {
+    /// Replaces the water and glass boxes. Cube material is written only
+    /// where it changes, and the written boxes are returned. Loads, patches
+    /// and the server's undo and redo replace boxes, so the writes are bounded
+    /// by memory (`MAX_CONVERSION_LEAVES`) rather than the world's guard.
+    pub fn replace_volumes(&mut self, volumes: &[MaterialVolume]) -> Result<Vec<FineBox>, String> {
         validate_material_volumes(volumes, self.bounds().fine_box())?;
-        self.volumes = Arc::new(VolumeLayer::new(coalesce_material_volumes(
-            volumes.to_vec(),
-        )));
-        Ok(())
+        self.set_volumes(coalesce_material_volumes(volumes.to_vec()))
+    }
+
+    fn set_volumes(&mut self, volumes: Vec<MaterialVolume>) -> Result<Vec<FineBox>, String> {
+        if volumes == *self.volumes {
+            return Ok(Vec::new());
+        }
+        let writes = self.cube_writes(&volumes);
+        self.tree = self.written(&writes, Ceiling::Memory)?;
+        self.volumes = Arc::new(volumes);
+        Ok(writes.into_iter().map(|(bounds, _)| bounds).collect())
+    }
+
+    /// Where cube material changes from the current boxes to `next`: first
+    /// plain space where a current box is gone and no new box covers it,
+    /// then each new box's material where the current boxes held another.
+    /// A box whose difference would take many pieces is written whole.
+    fn cube_writes(&self, next: &[MaterialVolume]) -> Vec<(FineBox, u16)> {
+        const PIECES: usize = 64;
+        let current = self.volumes.as_slice();
+        let set = |list: &[MaterialVolume]| -> std::collections::BTreeSet<_> {
+            list.iter().map(|v| (v.bounds, v.material)).collect()
+        };
+        let (in_current, in_next) = (set(current), set(next));
+        let current_boxes: Vec<_> = current.iter().map(|v| v.bounds).collect();
+        let next_boxes: Vec<_> = next.iter().map(|v| v.bounds).collect();
+        let (current_index, next_index) =
+            (BoxIndex::new(&current_boxes), BoxIndex::new(&next_boxes));
+        let mut writes = Vec::new();
+        let mut cleared = Vec::new();
+        for old in current
+            .iter()
+            .filter(|v| !in_next.contains(&(v.bounds, v.material)))
+        {
+            let mut cuts = next_index.query(&next_boxes, old.bounds);
+            cuts.sort_unstable();
+            match cut_pieces(
+                old.bounds,
+                cuts.into_iter().map(|id| next_boxes[id]),
+                PIECES,
+            ) {
+                Ok(pieces) => writes.extend(pieces.into_iter().map(|p| (p, MAT_AIR))),
+                Err(_) => {
+                    writes.push((old.bounds, MAT_AIR));
+                    cleared.push(old.bounds);
+                }
+            }
+        }
+        for new in next
+            .iter()
+            .filter(|v| !in_current.contains(&(v.bounds, v.material)))
+        {
+            let cube = cube_material_for(new.material);
+            if cleared
+                .iter()
+                .any(|c: &FineBox| c.intersection(new.bounds).is_some())
+            {
+                writes.push((new.bounds, cube));
+                continue;
+            }
+            let mut cuts: Vec<_> = current_index
+                .query(&current_boxes, new.bounds)
+                .into_iter()
+                .filter(|&id| current[id].material == new.material)
+                .collect();
+            cuts.sort_unstable();
+            match cut_pieces(
+                new.bounds,
+                cuts.into_iter().map(|id| current_boxes[id]),
+                PIECES,
+            ) {
+                Ok(pieces) => writes.extend(pieces.into_iter().map(|p| (p, cube))),
+                Err(_) => writes.push((new.bounds, cube)),
+            }
+        }
+        writes
+    }
+
+    /// The tree with cube-material writes applied in order. Each write's new
+    /// leaves are counted before it is built, and a change that would take
+    /// the world past its ceiling is refused.
+    fn written(
+        &self,
+        writes: &[(FineBox, u16)],
+        ceiling: Ceiling,
+    ) -> Result<crate::Octree, String> {
+        let mut tree = self.tree.clone();
+        let mut budget = ceiling.leaves().saturating_sub(tree.stats().leaves());
+        for &(bounds, cube) in writes {
+            let added = tree
+                .count_cube_write(bounds, cube, budget)
+                .ok_or(ceiling.error())?;
+            budget -= added;
+            tree.set_cube_material(bounds, cube);
+        }
+        Ok(tree)
     }
 
     /// Prepare a complete replacement for an atomic geometry/object/material edit.
@@ -399,6 +453,13 @@ impl World {
         &self,
         edits: &[VolumeEdit],
     ) -> Result<Vec<MaterialVolume>, String> {
+        let result = self.edited_volumes(edits)?;
+        self.written(&edit_writes(edits), Ceiling::Edit)?;
+        Ok(result)
+    }
+
+    /// The boxes after edits applied in order; a later edit wins.
+    fn edited_volumes(&self, edits: &[VolumeEdit]) -> Result<Vec<MaterialVolume>, String> {
         if edits.len() > MAX_VOLUME_EDITS {
             return Err("An edit may contain at most 32,768 material region changes.".into());
         }
@@ -423,12 +484,16 @@ impl World {
             let mut cuts = index.query(&boxes, volume.bounds);
             cuts.sort_unstable();
             result.extend(
-                cut_pieces(volume.bounds, cuts.into_iter().map(|id| boxes[id]))?
-                    .into_iter()
-                    .map(|bounds| MaterialVolume {
-                        bounds,
-                        material: volume.material,
-                    }),
+                cut_pieces(
+                    volume.bounds,
+                    cuts.into_iter().map(|id| boxes[id]),
+                    MAX_VOLUME_PIECES,
+                )?
+                .into_iter()
+                .map(|bounds| MaterialVolume {
+                    bounds,
+                    material: volume.material,
+                }),
             );
             if result.len() > MAX_VOLUME_PIECES {
                 return Err("This edit creates too much material volume detail.".into());
@@ -444,9 +509,13 @@ impl World {
             let mut cuts = index.query_after(&boxes, edit.bounds, id);
             cuts.sort_unstable();
             result.extend(
-                cut_pieces(edit.bounds, cuts.into_iter().map(|id| boxes[id]))?
-                    .into_iter()
-                    .map(|bounds| MaterialVolume { bounds, material }),
+                cut_pieces(
+                    edit.bounds,
+                    cuts.into_iter().map(|id| boxes[id]),
+                    MAX_VOLUME_PIECES,
+                )?
+                .into_iter()
+                .map(|bounds| MaterialVolume { bounds, material }),
             );
             if result.len() > MAX_VOLUME_PIECES {
                 return Err("This edit creates too much material volume detail.".into());
@@ -457,8 +526,17 @@ impl World {
         Ok(result)
     }
 
+    /// Applies edits in order, a later one winning. The tree takes the
+    /// edits' own boxes, which is where cube material can change, and they
+    /// may not take the world past `MAX_WORLD_PIECES`. `changed_chunks` gives
+    /// the mesh units to build again.
     pub fn apply_volume_edits(&mut self, edits: &[VolumeEdit]) -> Result<(), String> {
-        self.volumes = Arc::new(VolumeLayer::new(self.prepare_volume_edits(edits)?));
+        let volumes = self.edited_volumes(edits)?;
+        if volumes == *self.volumes {
+            return Ok(());
+        }
+        self.tree = self.written(&edit_writes(edits), Ceiling::Edit)?;
+        self.volumes = Arc::new(volumes);
         Ok(())
     }
 
@@ -466,62 +544,27 @@ impl World {
     pub fn volume_regions(&self, bounds: FineBox) -> Vec<MaterialVolume> {
         let mut result: Vec<_> = self
             .volumes
-            .index
-            .query(&self.volumes.boxes, bounds)
-            .into_iter()
-            .map(|id| {
-                let volume = self.volumes.volumes[id];
-                MaterialVolume {
-                    bounds: volume.bounds.intersection(bounds).unwrap(),
-                    ..volume
-                }
+            .iter()
+            .filter_map(|volume| {
+                Some(MaterialVolume {
+                    bounds: volume.bounds.intersection(bounds)?,
+                    ..*volume
+                })
             })
             .collect();
         result.sort_unstable_by_key(|volume| (volume.bounds, volume.material));
         result
     }
 
+    /// Water or glass at a point, unless solid geometry occupies it.
     pub fn volume_material_at(&self, point: Vec3) -> Option<VolumeMaterial> {
-        if !point.is_finite() {
-            return None;
-        }
-        if point.cmplt(self.bounds().world_min()).any()
-            || point.cmpge(self.bounds().world_max()).any()
-        {
-            return None;
-        }
-        let material = self.volumes.material_at(point)?;
-        // Imported material space can surround walls and slopes. Terrain owns
-        // occupied points, so water cannot turn a solid wall into swimmable air.
-        let epsilon = (point.abs().max_element() * f32::EPSILON * 2.0).max(0.00001);
-        (!self.intersects_box(point - Vec3::splat(epsilon), point + Vec3::splat(epsilon)))
-            .then_some(material)
+        self.tree.volume_material_at(point)
     }
 
-    pub(crate) fn solid_volumes_in_box(&self, min: Vec3, max: Vec3) -> Vec<MaterialVolume> {
-        if !min.is_finite() || !max.is_finite() || !min.cmplt(max).all() {
-            return Vec::new();
-        }
-        let bounds = FineBox {
-            min: (min * FINE_UNITS as f32).floor().as_ivec3().to_array(),
-            max: (max * FINE_UNITS as f32).ceil().as_ivec3().to_array(),
-        };
-        self.volumes
-            .index
-            .query(&self.volumes.boxes, bounds)
-            .into_iter()
-            .filter_map(|id| {
-                let volume = self.volumes.volumes[id];
-                (volume.material == VolumeMaterial::Glass
-                    && min.cmplt(volume.bounds.world_max()).all()
-                    && max.cmpgt(volume.bounds.world_min()).all())
-                .then_some(volume)
-            })
-            .collect()
-    }
-
+    /// Whether a box overlaps glass, which blocks movement across its whole
+    /// cube.
     pub fn intersects_solid_volume(&self, min: Vec3, max: Vec3) -> bool {
-        !self.solid_volumes_in_box(min, max).is_empty()
+        self.tree.intersects_solid_volume(min, max)
     }
 
     pub fn raycast_volumes(
@@ -530,7 +573,7 @@ impl World {
         direction: Vec3,
         max_distance: f32,
     ) -> Option<RayHit> {
-        self.raycast_volume_material(origin, direction, max_distance, None)
+        self.tree.raycast_volumes(origin, direction, max_distance)
     }
 
     pub fn raycast_solid_volumes(
@@ -539,77 +582,7 @@ impl World {
         direction: Vec3,
         max_distance: f32,
     ) -> Option<RayHit> {
-        self.raycast_volume_material(origin, direction, max_distance, Some(VolumeMaterial::Glass))
-    }
-
-    fn raycast_volume_material(
-        &self,
-        origin: Vec3,
-        direction: Vec3,
-        max_distance: f32,
-        material: Option<VolumeMaterial>,
-    ) -> Option<RayHit> {
-        if !origin.is_finite()
-            || !direction.is_finite()
-            || direction.length_squared() < 1.0e-10
-            || !direction.length_squared().is_finite()
-            || !max_distance.is_finite()
-            || max_distance < 0.0
-        {
-            return None;
-        }
-        let direction = direction.normalize();
-        let mut nearest = None;
-        let mut distance_limit = max_distance;
-        for id in self
-            .volumes
-            .index
-            .ray_query(&self.volumes.boxes, origin, direction, max_distance)
-        {
-            let volume = self.volumes.volumes[id];
-            if material.is_some_and(|material| material != volume.material) {
-                continue;
-            }
-            let min = volume.bounds.world_min();
-            let max = volume.bounds.world_max();
-            let Some((enter, exit)) =
-                crate::geometry::ray_box_interval(origin, direction, min, max)
-            else {
-                continue;
-            };
-            for distance in [enter, exit] {
-                if distance < 0.0 || distance > distance_limit {
-                    continue;
-                }
-                let point = origin + direction * distance;
-                let (face, _) = (0..6)
-                    .map(|face| {
-                        let axis = face / 2;
-                        let plane = if face % 2 == 0 { min[axis] } else { max[axis] };
-                        (face, (point[axis] - plane).abs())
-                    })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .unwrap();
-                let mut normal = Vec3::ZERO;
-                normal[face / 2] = if face % 2 == 0 { -1.0 } else { 1.0 };
-                let epsilon = (point.abs().max_element() * f32::EPSILON * 2.0).max(0.001);
-                // Equal material continues across a partial shared face. Test
-                // both box boundaries so a ray inside joined space can still
-                // reach the exposed exterior after skipping that hidden join.
-                if self.volumes.material_at(point + normal * epsilon) == Some(volume.material) {
-                    continue;
-                }
-                nearest = Some(RayHit {
-                    pos: ((point - normal * epsilon).floor()).as_ivec3().to_array(),
-                    bounds: volume.bounds,
-                    face: face as u8,
-                    normal,
-                    point,
-                    distance,
-                });
-                distance_limit = distance;
-            }
-        }
-        nearest
+        self.tree
+            .raycast_solid_volumes(origin, direction, max_distance)
     }
 }

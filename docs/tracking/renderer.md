@@ -163,13 +163,23 @@ The maintainer approved these on 2026-11-13 with the native-first plan for
   - 2b in wave 1 as well, starting when N1 merges;
   - N1b, the GPU tests on software drivers, parked with
     [platforms](platforms.md) stage 1 until releases are near;
-  - N2 in wave 2, beside [octree](octree.md) O2, once 2b has merged;
+  - N2 since 2026-11-14, started early at the maintainer's request, beside
+    [octree](octree.md) O1b and O3;
   - N3 in wave 4, beside shared-sandbox 2e and 2f, once octree O1b has merged.
-- **The octree changes what the renderer draws.** Octree O1a builds world
-  meshes from one tree and leaves out hidden faces, behind today's
-  `mesh_chunk`; O1b draws water and glass from the tree. O1b and 2b both
-  change the rebuild paths in `render.rs`, so whichever starts second waits for
-  the first to merge.
+- **The octree changes what the renderer draws.** Octree O1a (merged
+  2026-11-14) builds world meshes from one tree in 16 m mesh units, keyed by
+  each unit's minimum corner, and leaves out hidden faces, behind `mesh_chunk`.
+  On the M5 Pro:
+  - the_cube1m's world meshes fell from 3,595,924 to 717,378 triangles, and
+    nub1's from 5,140,198 to 755,996;
+  - GPU throughput on the imported poses at 4K improved, for example spawn
+    5.36 → 2.86 ms and the edit storm 18.27 → 12.39 ms;
+  - the built-in scenes changed by −1.0% to +4.5%, because a small scene now
+    fits in one or two units and culling keeps nearly all of it;
+  - one block edit redraws 46,762 sun-shadow texels instead of 16,124.
+
+  O1b draws water and glass from the tree and changes the rebuild paths in
+  `render.rs`; N2 runs beside it, and the second to merge rebases.
 - **Decided:**
   - **Lighting rule** (maintainer, 2026-11-11): every light is lit and shadowed
     the same way. Quality settings vary only detail (render scale, shadow
@@ -790,7 +800,10 @@ one-minute load average at the start of each measured invocation is given.
 
 ### N2: every light shadowed
 
-State: waits for 2b. Wave 2, beside octree O2, once 2b has merged.
+State: running on branch `renderer-n2` since 2026-11-14, from the commit before
+octree O1a merged. The design lead rebases it onto the octree and reruns its
+measurements before merging. Octree O1b runs beside it and also edits
+`volume.wgsl` and `render.rs`; the second to merge rebases.
 
 - **Decided** (maintainer, 2026-11-13, under the lighting rule):
   - Every light is shadowed: 339 of 339 on the_cube1m, up from 149. No light
@@ -939,6 +952,11 @@ State: waits for N2 and [octree](octree.md) O1b. Wave 4, beside shared-sandbox
 - **Decided** (maintainer, 2026-11-13): lighter world meshes. The 8 GB minimum
   specification made N3 required; whether it still is, once the octree leaves
   out hidden faces, is checked against octree O1a's measurements.
+- **After octree O1a** (computed from its triangle counts, not measured in
+  F3): at 168 B a triangle, the_cube1m's world meshes take about 115 MiB
+  instead of 576 MiB, and nub1's about 121 MiB instead of 824 MiB. N3 would
+  bring them to about 49 and 52 MiB. Whether N3 stays required is for the
+  maintainer to decide before wave 4; the design lead suggests it doesn't.
 - **Why.** On unified-memory machines, which include all three reference
   machines, world meshes are most of a client's memory. The octree leaves out
   at least 61% of an imported map's triangles, and N3 then cuts each remaining

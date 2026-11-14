@@ -1,6 +1,5 @@
 //! The renderer-independent world and simulation shared by every client and server.
 
-mod compact;
 mod fine;
 mod geometry;
 mod movement;
@@ -10,24 +9,19 @@ mod protocol;
 mod volumes;
 mod world;
 
-pub use compact::{
-    WorldBounds, MAX_COMPACT_BATCH_TRIANGLES, MAX_COMPACT_REGIONS, MAX_QUERY_ROOTS,
-    WORLD_FORMAT_VERSION,
-};
 pub use fine::*;
 pub use glam::Vec3;
 pub use movement::*;
 pub use octree::{
-    cube_material_for, volume_material_of, Format3, Leaf, LeafGeometry, NodeBox, Octree,
-    OctreeBuilder, Source, TreeStats, MAT_AIR, MAT_GLASS, MAT_WATER, MAX_CONVERSION_LEAVES,
-    MAX_ROOT_SIZE,
+    cube_material_for, volume_material_of, Format3, Format3Piece, Leaf, LeafGeometry, NodeBox,
+    Octree, OctreeBuilder, PieceChanges, Source, TreeStats, MAT_AIR, MAT_GLASS, MAT_WATER,
+    MAX_CONVERSION_LEAVES, MAX_ROOT_SIZE, MESH_UNIT_SIZE,
 };
 pub use physics::*;
 pub use protocol::*;
 pub use volumes::*;
 pub use world::*;
 
-pub const CHUNK_SIZE: i32 = 8;
 pub const WORLD_MIN: i32 = -64;
 pub const WORLD_MAX: i32 = 64;
 pub const WORLD_HEIGHT: i32 = 48;

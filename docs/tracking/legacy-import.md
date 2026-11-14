@@ -19,8 +19,8 @@ zero-thickness sheets. Four maps, nub1, ralith, ralith1 and ralith2, are OCTA
 version 27. The importer now reads them directly
 ([I1](#i1-the-importer-reads-octa-version-27) below); the three ralith maps in
 the library came through a hand-made shim on 2026-11-11 and convert identically.
-nub1, the one archive map not in the library, still exceeds the 400,000-region
-cap.
+nub1, the one archive map not in the library, converts since octree O1a removed
+the 400,000-region cap, and can now be imported into it.
 
 The archive copies use fallback material. Source texture/model references are not
 loaded assets. Original light properties and spawn facing are not applied. These
@@ -124,9 +124,10 @@ version 27 map in the app.
     counter, so compare content, not bytes.
   - [ ] The reports show the header's title and lighting fields, the checksum
     note and, for ralith and ralith1, the omitted entity.
-  - [ ] A copy of nub1 gets past the header and checksum. Before octree O1a it
+  - [x] A copy of nub1 gets past the header and checksum. Before octree O1a it
     stops only at the region cap ("Too many authored regions."); after O1a it
-    converts.
+    converts: 434,233 regions and 1,552 boxes in 0.56 s (design lead,
+    2026-11-14).
   - [ ] A version 27 file with any other checksum mismatch is refused, as
     before.
   - [ ] In the app, import a converted ralith2 into a scratch library

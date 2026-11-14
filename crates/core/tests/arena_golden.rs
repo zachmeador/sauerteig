@@ -24,8 +24,6 @@ struct Recorder {
     profile: MovementProfile,
     lines: Vec<String>,
     seq: u32,
-    /// Steps on the octree converted from each world instead of the world.
-    tree: Option<(*const World, Octree)>,
 }
 
 impl Recorder {
@@ -34,31 +32,11 @@ impl Recorder {
             profile,
             lines: Vec::new(),
             seq: 0,
-            tree: None,
-        }
-    }
-
-    fn on_tree(profile: MovementProfile) -> Self {
-        Self {
-            tree: Some((
-                std::ptr::null(),
-                Octree::new(WorldBounds::default()).unwrap(),
-            )),
-            ..Self::new(profile)
         }
     }
 
     fn step(&mut self, world: &World, player: &mut Player, input: &InputFrame, dt: f32) {
-        if let Some((key, tree)) = &mut self.tree {
-            if !std::ptr::eq(*key, world) {
-                *key = world;
-                *tree = Octree::from_world(world).unwrap();
-            }
-            tree.simulate_player_with(player, input, dt, &self.profile);
-            if matches!(self.profile.style, MovementStyle::Arena(_)) {
-                assert!(player.movement.is_idle(), "Arena leaves no movement state");
-            }
-        } else if matches!(self.profile.style, MovementStyle::Arena(_)) {
+        if matches!(self.profile.style, MovementStyle::Arena(_)) {
             let mut explicit = player.clone();
             simulate_player_with(world, &mut explicit, input, dt, &self.profile);
             simulate_player(world, player, input, dt);
@@ -655,9 +633,9 @@ fn render(title: &str, profile: &MovementProfile) -> String {
     text
 }
 
-const ARENA_TITLE: &str =
-    "Arena trajectories first recorded at b259f11; re-recorded 2026-11-14 with libm (within 9.6e-7).";
-const SAUERBRATEN_TITLE: &str = "Sauerbraten profile trajectories of the same scenarios.";
+const ARENA_TITLE: &str = "Arena trajectories first recorded at b259f11; re-recorded 2026-11-14 with libm (within 9.6e-7), then on the octree (within 1.5e-4).";
+const SAUERBRATEN_TITLE: &str =
+    "Sauerbraten profile trajectories of the same scenarios; re-recorded 2026-11-14 on the octree (within 3.9e-5).";
 
 fn golden_path(file: &str) -> String {
     format!("{}/tests/golden/{file}", env!("CARGO_MANIFEST_DIR"))
@@ -730,65 +708,4 @@ fn sauerbraten_reproduces_the_recorded_trajectories() {
         return;
     }
     check(SAUERBRATEN_GOLDEN, &MovementProfile::sauerbraten());
-}
-
-/// The same scenarios on the octree that replaces the world's storage. Its
-/// single shape path may round differently from today's paths, but every tick
-/// must stay within the tolerance a re-recording is allowed under. Grounded
-/// flags are reported: today's region path misses a floor lying exactly at the
-/// bottom of the interval it scans, which the tree, like today's cell path,
-/// finds.
-/// One recorded value: an `f32` bit pattern in hexadecimal.
-fn float(bits: &str) -> f32 {
-    f32::from_bits(u32::from_str_radix(bits, 16).expect("an f32 bit pattern"))
-}
-
-fn tree_stays_within_tolerance(golden: &str, profile: &MovementProfile) {
-    const RERECORD_TOLERANCE: f32 = 2.0e-3;
-    let mut recorded = golden
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .peekable();
-    let mut report = Vec::new();
-    for (name, run) in scenarios() {
-        let header = format!("scenario {name}");
-        assert_eq!(recorded.next(), Some(header.as_str()), "scenario order");
-        let mut out = Recorder::on_tree(*profile);
-        run(&mut out);
-        let (mut exact, mut grounded, mut largest) = (0, 0, 0.0f32);
-        for (tick, line) in out.lines.iter().enumerate() {
-            let expected = recorded
-                .next_if(|line| !line.starts_with("scenario "))
-                .unwrap_or_else(|| panic!("{name}: recording ends at tick {tick}"));
-            exact += usize::from(line == expected);
-            let actual: Vec<_> = line.split(' ').collect();
-            let wanted: Vec<_> = expected.split(' ').collect();
-            grounded += usize::from(actual[6] != wanted[6]);
-            for (a, w) in actual[..6].iter().zip(&wanted[..6]) {
-                let difference = (float(a) - float(w)).abs();
-                largest = largest.max(difference);
-                assert!(
-                    difference <= RERECORD_TOLERANCE,
-                    "{name}: tick {tick} differs by {difference}"
-                );
-            }
-        }
-        report.push(format!(
-            "{name}: {exact} of {} ticks bit for bit, {grounded} grounded flags differ, \
-             largest difference {largest}",
-            out.lines.len()
-        ));
-    }
-    println!("{}", report.join("\n"));
-}
-
-#[test]
-fn arena_on_the_tree_stays_within_tolerance_of_the_recording() {
-    tree_stays_within_tolerance(ARENA_GOLDEN, &MovementProfile::arena());
-}
-
-#[test]
-#[ignore = "foundry diverges by 2.3 cm at tick 379 on the tree; octree O1a session 2 finds out why"]
-fn sauerbraten_on_the_tree_stays_within_tolerance_of_the_recording() {
-    tree_stays_within_tolerance(SAUERBRATEN_GOLDEN, &MovementProfile::sauerbraten());
 }

@@ -603,6 +603,7 @@ async fn compact_base_empty_override_and_objects_survive_save_and_rejoin() {
     assert_eq!(revision, 0);
     assert_eq!(original.bounds(), bounds);
     assert_eq!(original.region_count(), 1);
+    assert_eq!(original.regions(), regions);
     assert!(!original.root_fragments([136, 15, 136]).is_empty());
     edit_mode(&mut builder).await;
 
@@ -631,6 +632,8 @@ async fn compact_base_empty_override_and_objects_survive_save_and_rejoin() {
     .await;
     transaction_patch(&mut builder, 1, &empty_override, &objects).await;
     result(&mut builder, 1, true).await;
+    let mut edited = original.clone();
+    edited.apply_root_edits(&empty_override).unwrap();
     send(&mut builder, ClientMessage::Save).await;
     assert!(matches!(event(&mut builder).await,
         ServerMessage::Notice { message } if message == "Save requested."));
@@ -639,11 +642,18 @@ async fn compact_base_empty_override_and_objects_survive_save_and_rejoin() {
             let saved: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&config.world_path).unwrap()).unwrap();
             if saved["revision"] == 1 {
+                // The cube splits around the hole; the file holds the leaves
+                // as regions and cells, and needs no roots.
                 assert_eq!(saved["format_version"], WORLD_FORMAT_VERSION);
-                assert_eq!(saved["regions"].as_array().unwrap().len(), 1);
-                assert_eq!(saved["cells"].as_array().unwrap().len(), 0);
-                let roots: Vec<RootEdit> = serde_json::from_value(saved["roots"].clone()).unwrap();
-                assert_eq!(roots, empty_override);
+                let part = |name: &str| saved.get(name).cloned().unwrap_or_default();
+                let regions: Vec<CellFragment> =
+                    serde_json::from_value(part("regions")).unwrap_or_default();
+                let cells: Vec<CellEdit> = serde_json::from_value(part("cells")).unwrap();
+                let roots: Vec<RootEdit> =
+                    serde_json::from_value(part("roots")).unwrap_or_default();
+                assert!(roots.is_empty());
+                let reopened = World::from_compact_parts(bounds, &regions, &cells, &roots).unwrap();
+                assert_eq!(reopened.digest(), edited.digest());
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -658,8 +668,8 @@ async fn compact_base_empty_override_and_objects_survive_save_and_rejoin() {
     let (mut rejoined, revision, restored, restored_objects) = join(&url).await;
     assert_eq!(revision, 1);
     assert_eq!(restored.bounds(), bounds);
-    assert_eq!(restored.regions(), regions);
-    assert_eq!(restored.root_overrides(), empty_override);
+    assert_eq!(restored.digest(), edited.digest());
+    assert!(restored.root_overrides().is_empty());
     assert!(restored.root_fragments([136, 15, 136]).is_empty());
     assert!(!restored.root_fragments([137, 15, 136]).is_empty());
     assert_eq!(restored_objects, objects);

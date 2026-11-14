@@ -1,7 +1,8 @@
 # Octree world
 
-State: planned. The maintainer chose to rebuild the core around one octree
-before shared-sandbox stage 2's network and save formats (2026-11-13).
+State: active. The maintainer chose to rebuild the core around one octree
+before shared-sandbox stage 2's network and save formats (2026-11-13). O1a
+merged on 2026-11-14; O1b and O3 run in wave 1, and O2 follows O1b.
 
 ## Outcome
 
@@ -196,8 +197,9 @@ Design lead, 2026-11-14, after two reviews of the first draft against the code.
     server works that out before applying the edit, so a thin pane across a
     whole map can't use up memory first.
   - Until shared-sandbox 2d builds the budget, the 786,432-piece world guard
-    (`MAX_WORLD_FRAGMENTS`) plays that part, and the 16 MiB JSON message
-    ceiling applies. 2d sends larger edits in parts.
+    (core's `MAX_WORLD_PIECES`, the server's `MAX_WORLD_FRAGMENTS`) plays that
+    part, and the 16 MiB JSON message ceiling applies. 2d sends larger edits in
+    parts.
   - Undo history stays within a share of the memory budget, oldest entries
     out first, and rate limits count requests, not cubes.
 - **Conflicts and undo compare snapshots; the tree holds no clocks.** The
@@ -236,7 +238,8 @@ Design lead, 2026-11-14, after two reviews of the first draft against the code.
 - Builds from before O2 can't join builds after it. Until 2d's version
   handshake, that shows up as a failed join.
 - Format 3 has no place for the root's origin, so the tree derives it on load
-  (session 1's record says how). Shared-sandbox 2e's binary saves store it.
+  (session 2's record says how), and a save and reload can still move it.
+  Shared-sandbox 2e's binary saves store it.
 
 **Kept from today's design,** because it is sound: cheap shared snapshots, exact
 pieces instead of resampled slopes, stored face diagonals, per-object clocks,
@@ -258,16 +261,15 @@ and full replacements checked against a base revision.
   and core's separate `World` serde format. O2 removes the water and glass edit
   path with its box limits and clock, the per-root clocks, `RootCost` and the
   old messages. O3 removes the importer's box path. 2e retires format 3 as the
-  save format, and 2d replaces the JSON byte caps, `MAX_WORLD_FRAGMENTS`,
-  `MAX_OBJECTS` and the conversion guard (`MAX_CONVERSION_LEAVES`, 4,194,304
+  save format, and 2d replaces the JSON byte caps, the piece guard
+  (`MAX_WORLD_PIECES`, `MAX_WORLD_FRAGMENTS`), `MAX_OBJECTS` and the conversion
+  guard (`MAX_CONVERSION_LEAVES`, 4,194,304
   leaves) with the memory budget.
 
 ## O1a: one octree in the core
 
-State: session 1 (the tree) is on branch `octree-o1a` for review; session 2
-follows on the same branch. Wave 1, large: two sessions in order on one
-branch, merged once. The design lead commits each session's work to the
-branch.
+State: merged on 2026-11-14, both sessions with the fixes from session 2's
+review. The checks in the app await the maintainer.
 
 - **Decided:** the tree, queries, physics and meshing above. Every public core
   item that the server, client, importer and capture tool use keeps its
@@ -311,7 +313,9 @@ branch.
     the boxes that differ from the current ones and reports what changed.
     Cube-material writes count the pieces they would create before building
     them, and are refused if the world would pass the 786,432-piece guard, so
-    a thin pane can't use up memory on the server or a client.
+    a thin pane can't use up memory on the server or a client. (After review:
+    edits only; loads and patches count against the conversion guard, and the
+    server checks every edit's exact leaf count.)
   - **Water and glass boxes.** `volumes()` returns the loaded boxes, cached,
     until a write changes cube material; then only the boxes around the change
     are derived again, deterministically, so unchanged glass keeps its edge
@@ -363,34 +367,36 @@ branch.
     paint water, undo, save, quit and reopen. Nothing changes except speed,
     memory and hidden faces, and glass edge bands move only next to water and
     glass edits.
-  - [ ] Once legacy-import I1 has merged, convert nub1 and host it. Only the
+  - [ ] Convert nub1 with legacy-import I1's reader and host it. Only the
     region cap refused it before; record its counted size against the 63 MiB
     guard, where it had 3.8 MB to spare.
 - **Tests:**
-  - [ ] Every existing test passes, except those that assert removed internals,
+  - [x] Every existing test passes, except those that assert removed internals,
     which assert content instead. `compact_world.rs`'s seam after undo becomes
-    "an edit and its undo restore the identical tree".
-  - [ ] Arena's goldens pass, bit for bit or re-recorded once as decided.
+    "an edit and its undo restore the identical tree". Session 2, below.
+  - [x] Arena's goldens pass, bit for bit or re-recorded once as decided.
+    Session 2 re-recorded both golden files once, below.
   - [x] Copies of every library world, `.local/the_cube1m.json`, the arena and
     synthetic worlds covering every fragment, override and volume case convert
     to the tree, to format 3 and back with equal digests. Session 1, below.
   - [x] Random edit and undo sequences, and random conversions, restore
     identical trees, including edits beside groups that could merge. Session
     1, on the tree's own writes; session 2 repeats it through `World`.
-  - [ ] Old and new code agree on thousands of random queries over copies of
+  - [x] Old and new code agree on thousands of random queries over copies of
     the_cube1m and two smaller library worlds, recorded at the start: point
     material, box overlap, and support and ceiling heights exactly; ray first
     hits within 4 units in the last place of their coordinates, either cube
     where two lie at exactly the same distance; rays that start inside solid,
-    as today.
+    as today. Session 2 replayed session 1's recordings against `World`;
+    every difference falls in a class session 1 recorded, below.
   - [x] The format 3 output of every library copy loads in the loader from
     before O1a. Session 1, below.
-  - [ ] the_cube1m's world-mesh triangles, water and glass excluded, fall from
+  - [x] the_cube1m's world-mesh triangles, water and glass excluded, fall from
     3,595,084 to at most 1.5 million. Captures of every pose in
     `scripts/capture-poses.json` match a baseline taken at the session's base
     commit, within the capture tool's tolerance; differences the session
     expects, such as shadows from faces that are now left out, are listed in
-    the record.
+    the record. Session 2: 717,378 triangles; captures below.
 - **Record:** a standalone server's memory and load time for the_cube1m before
   and after (978–981 MiB and 2.49–2.55 s on the M5 Pro today); leaves, internal
   nodes and bytes per converted world; mesh units and triangles before and
@@ -596,9 +602,329 @@ running app, because `World` doesn't use the tree yet.
     server's memory and load time, which can't change until `World` stores
     the tree.
 
+### O1a session 2 record (2026-11-14)
+
+Code, automated checks and measurements. Nothing here was observed in the
+running app; the acceptance boxes in the app stay for the maintainer.
+
+- **`World` runs on the tree.** It holds the octree and the water and glass
+  boxes; cloning takes constant time. Its queries, `simulate_player*` and the
+  server and clients all go through the tree, and today's paths are gone:
+  `compact.rs` (regions, BVH, masks, overrides, batches), chunk and fine-root
+  storage, compiled triangles, `has_regions()`, `cell_chunk`, `chunk_bounds`,
+  `CHUNK_SIZE`, `MAX_COMPACT_REGIONS`, `MAX_COMPACT_BATCH_TRIANGLES`,
+  `MAX_REGION_PIECES`, `MAX_ROOT_FRAGMENTS` (disjoint fragments in a metre
+  number at most 512 anyway), and core's own `World` serde format. The
+  server's `RootCost` went too: leaf-based accounting replaced its only use,
+  ahead of O2.
+- **Files.** New `octree/mesh.rs` (the mesher and mesh units) and
+  `octree/diff.rs` (what a write changed: leaves removed and added, and where
+  geometry changed). `world.rs` (the new `World`, `WorldSnapshot`,
+  `WorldBounds`), `fine.rs` (root writes), `volumes.rs` (the box facade),
+  `geometry.rs` (now only shape rules), `physics.rs`, `octree/mod.rs` (remerge,
+  write counting, a full-cube fast path), `format3.rs` (borrowed parts,
+  `Format3Piece`), `query.rs` (one support rule, below). Server: `lib.rs`,
+  `edits.rs`, `persistence.rs`, `simulation.rs`, `network.rs` (opening a world
+  once). Client: `render.rs` (mesh keys only) and `game.rs` (the patch path).
+  Importer: `convert.rs`. Docs: `crates/core/CONTRACT.md` and the development
+  guide.
+- **Writes.** `apply_root_edits` validates everything, then clears each
+  metre's geometry and writes its fragments' sources, keeping cube material. A
+  write that changes no geometry restores the tree it started from, so it
+  leaves no split leaves behind. Writing a fragment of a larger shaped source
+  also merges the nodes around it back into that source where every leaf
+  under them is the source restricted: eight children wholly inside or outside
+  a shape (the slab gap in Decided) carry no piece to show which shape they
+  belong to, and without this an undo would leave such a shape split. Every
+  write's mesh units to build again come from the difference between the
+  trees before and after (after review, below). Clipping failures no longer
+  refuse an edit, since nothing is compiled at write time; the mesher falls
+  back to the clipped source without caps if a cap cannot be triangulated,
+  and counts each time it does.
+- **Water and glass.** `volumes()` keeps the loaded boxes. `apply_volume_edits`
+  computes the new list with today's cut, add and coalesce, which changes only
+  boxes the edit touches, and writes the edits' own boxes as cube material.
+  `replace_volumes` writes only where the new list differs from the current
+  one: plain space where a box is gone, then each new box's material where the
+  current boxes held another, a box being written whole when its difference
+  would take more than 64 pieces; it returns the boxes it wrote. Edits'
+  cube-material writes (`apply_volume_edits`, and `prepare_volume_edits`, so
+  the editor learns of a refusal before sending) count the leaves they would
+  add before building them, against `MAX_WORLD_PIECES` (786,432, now a core
+  constant the server uses), and are refused past it; an eighth-thick pane
+  across the whole 8 km test world is refused, a one-metre floor 64 m across
+  is 4,096 leaves. `replace_volumes`, which loading, patches and the server's
+  undo and redo use, counts against the conversion guard instead (after
+  review, below). The variants of water and glass act as water and glass.
+- **Meshes.** As decided, behind `mesh_chunk` and `chunk_keys`. Keys are mesh
+  units' minimum corners in eighths of a metre; the renderer turns them into
+  positions with `FINE_UNITS` and sizes them with `MESH_UNIT_SIZE`, and the
+  batch ids above x = 1,000,000 are gone. Coverage is exact integer arithmetic
+  in 64ths of a metre for full and shaped leaves: a face is covered when, over
+  each neighbour's footprint, the neighbour is full, or its faces on the
+  shared plane (one triangle, or triangles that tile their convex hull) hold
+  the face's part there. Pieces are judged conservatively: covered by full
+  neighbours, by pieces of their own source where they are cut faces, by
+  empty neighbours their source lies outside, or by any piece whose source
+  fills the slab beyond. Most faces are decided with one descent to the leaf
+  beyond. **Unit size:** 16 m. On the_cube1m, units of 16, 32 and 64 m give
+  749, 335 and 218 units against the 2,392 batches they replace, so the
+  smallest size allowed is the nearest; 383 of the 749 hold triangles.
+- **Size accounting.** `World::piece_changes` lists the format 3 pieces a
+  change removed and added, from every leaf it split, merged or replaced, and
+  the server adds their pieces and JSON bytes, each cell by its own JSON. A
+  room starts from its world's written pieces and bytes and refuses to open a
+  world whose next save would not load again. An edit that adds nothing is
+  never refused for size. `snapshot_geometry_bytes` counts cells by their own
+  JSON too, so `load_world` and the room agree. The room also checks the
+  tree's exact leaf count against the world's guard (after review, below).
+- **Other changes.** `/health` has a `world` object: leaves by kind, internal
+  nodes, and bytes by part. The server builds a saved world once at startup
+  instead of twice. A missing world file is the arena's format 3 parts,
+  regions included. The client applies a transaction patch with
+  `World::apply_patch`: the boxes, then the metres, as the server applied the
+  edit, on a copy kept only if both apply, so a refused patch changes nothing
+  and reconnects as other bad patches do. The importer writes the regions it
+  reads, with no cells or roots, as before.
+- **Choices where the order left room:**
+  1. **Support beside walls (the foundry drift).** On the tree, foundry under
+     the Sauerbraten profile fell beside the plinth at x = 20 with its body
+     2.9e-5 m inside the plinth's side, which the box test allows (it clips the
+     body to a full leaf, shrinks it by 1e-5 m on each side and needs more than
+     1e-5 m of what is left: 3e-5 m in all). The support query, like the old
+     region path, counted any leaf the footprint touched, so at tick 379 the
+     player landed on the face between the plinth's two materials at y = 4,
+     inside the wall, while the recording kept falling, 2.3 cm lower at that
+     tick. The old cell path ignored overlaps under 1e-5 m. The fix: support and
+     ceiling queries skip a leaf the footprint overlaps by no more than 3e-5 m,
+     the box test's own tolerance (`SIDE_CONTACT` in `query.rs`). Foundry then
+     stays within 2.1e-5 m of its recording, and no Arena scenario moved.
+  2. **Stored forms.** `get()`, `cells()`, `root_fragments` and patches give a
+     planar face's diagonal its fixed value (session 1's choice 2), and a cell
+     whose six faces all name a material comes back with its first face's
+     material as its fallback, since the tree keeps the six only. Tests that
+     compared cells compare them as a world stores them.
+  3. **Saved files** are the tree's writer output: leaves as regions and cells,
+     no roots. Patches carry each metre's content from `root_fragments`.
+  4. **Thin detail costs leaves.** A fragment a quarter metre wide and a metre
+     tall is eight leaves, where format 3 counted one piece. The server's
+     largest test blueprint (16,384 roots of four strips two eighths wide)
+     would be a million leaves and is refused by the piece guard, so it now
+     uses four half-metre columns per metre: still 65,536 request fragments,
+     131,072 leaves. The crossing-strip test of the face-contact limit uses
+     whole-metre strips for the same reason.
+  5. **Tests of removed internals** assert content and digests: region counts
+     after painting, `cells()` and `detailed_roots()` against files that
+     omitted regions, override counts and empty mask roots, compiled triangle
+     counts, and core's `World` JSON. Session 1's comparisons with today's
+     `World` are gone with it; random worlds now check against the tree's own
+     leaves, the old loader's limits are checked by a test helper that
+     restates them, and the solid-angle containment stays as a test oracle.
+- **After review** (design lead, 2026-11-14), three fixes:
+  1. **The world's guard counts every leaf.** Only cube-material writes
+     counted leaves before, so geometry written inside a large water box could
+     take a world past the guard unseen: the water leaves it splits are not
+     format 3 pieces. The server now refuses an edit when the prepared world's
+     exact `stats().leaves()` is over `MAX_WORLD_PIECES` and above the room's
+     current count. An edit that adds no leaves is never refused, format 3's
+     piece and byte checks stay as they were, and edits' cube-material writes
+     still count before building. Loading never refuses for the guard:
+     `replace_volumes` counts against the conversion guard
+     (`MAX_CONVERSION_LEAVES`) as a memory limit, and every path that builds a
+     world from a file or a snapshot goes through it: the server's
+     `build_world`, the client's Welcome, the capture tool's loads, the
+     importer's check of its output, `measure_join` and the test clients. A
+     client applies a transaction patch with `apply_patch`, the boxes then the
+     metres, as the server applied the edit, within the same memory limit, so
+     it never refuses a patch for the guard.
+  2. **Every write rebuilds the units it changed.** `World::changed_chunks`
+     gives the units to build again from the difference between two trees,
+     skipping shared subtrees, whatever wrote the change; `apply_root_edits`
+     and `apply_patch` return the same. The client so rebuilds the units a
+     patch's water and glass split or merged. The rule also rebuilds units
+     beside a removed or added shaped leaf or piece: a neighbour's coverage
+     by one depends on its kind and box, so splitting a shaped leaf into
+     pieces with the same surface used to leave a neighbour's face out until
+     that unit was built again (fewer faces than a fresh build, never a
+     hole). The client writes boxes only from patches; the capture tool's
+     edit storms write none.
+  3. **The reload root keeps pieces whole.** Loading anchors the root on the
+     largest region whose box is a power-of-two cube on the largest whole
+     region's grid, pieces included, instead of on the largest whole region.
+     The tree writes every leaf as such a region, so a world whose largest
+     whole region was cut, leaving pieces larger than any whole region left,
+     keeps its pieces on reload: 35 pieces and 4,315 bytes in the test below,
+     where the old rule made 44 and 5,506. Clipped regions off that grid are
+     ignored, so old saves behave as before; no private world has a clipped
+     region, so none roots differently. The root can still move at a reload,
+     keeping that region's grid, until shared-sandbox 2e stores it.
+  - **Pieces without caps.** The mesher counts the pieces it draws without
+    caps because a cap could not be built (`cap_fallbacks`, per thread, for
+    tests). It has not happened: 0 of the 19,095 and 5,043 pieces meshed by
+    the two random dirty-unit tests, which now assert it; 0 in the private
+    worlds as loaded, which hold no pieces; and 0 of 582,224 pieces cut from
+    the eight children of every shaped leaf of the_cube1m, complex and
+    ralith1.
+  - **Choices.** The server's undo and redo replace boxes through
+    `replace_volumes`, so they count against the conversion guard and then
+    meet the exact check, which refuses an undo that adds leaves past the
+    guard. A world without whole regions keeps the old root, at its bounds'
+    minimum corner, since clipped regions alone give no grid to trust.
+  - **Tests:** a cell inside water that would pass the guard is refused, one
+    that removes leaves is accepted, and a world saved just under the guard
+    reopens with the same digest; a world saved 1,000 leaves over the guard
+    opens on the server and through a Welcome with the same digest, refuses
+    an edit that adds leaves and accepts one that removes them; near the
+    guard, a transaction whose cell alone would pass it, a refused one and
+    the undo of the first, whose boxes alone pass it, each leave the client's
+    world equal to the server's; the dirty-unit test mixes box edits,
+    `replace_volumes` and patches with root writes over ten worlds holding 69
+    leaves of 32 or 64 m, 68 steps that change the tree, with incremental
+    meshes equal to a fresh build after each; water that splits a shaped leaf
+    into pieces rebuilds the unit beside it; and a cut 64 m slab's pieces and
+    bytes don't grow on reload. The last two and the three server tests fail
+    without their fixes.
+- **nub1 opens** (design lead, 2026-11-14, M5 Pro, release builds of the
+  merged branch). The stock importer converts a copy of nub1 in 0.56 s: 434,233
+  regions, 1,552 boxes, 155 lights, a 62 MB file. The standalone server opens
+  it in 0.34–0.45 s with 177 MiB resident: 511,155 leaves (374,236 full,
+  37,128 shaped, 99,791 water or glass), 99,863 internal nodes and 16.2 MB. A
+  headless client joins in 0.56 s, reading 53.1 MB, with a peak footprint of
+  128 MB. The capture tool loads it in 0.6 s and draws 755,996 world
+  triangles, against 5,140,198 before hidden faces were left out. Nobody has
+  looked at it in the app yet.
+- **Checks,** all passing, and again after the review's fixes: `cargo fmt
+  --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo test --workspace --locked`, the private tests in release (`cargo test
+  --release -p sauerteig-core --lib private_ --locked -- --ignored
+  --test-threads 1`) and the GPU tests (`cargo test -p sauerteig-client --lib
+  gpu_ --locked -- --ignored --test-threads=1`). In the sun cascade test one
+  block now redraws 46,762 of 3,145,728 texels, against 16,124 with the base
+  commit's build: the fingerprint's cells span a quarter of a 16 m unit instead
+  of an 8 m chunk, and the faces beside the block change too. New tests: World
+  edits and their undo restore identical trees over 40 random worlds (12 writes
+  each, root and water edits mixed, undone in reverse); rewriting, or carving
+  and restoring, a metre inside a two-metre slab keeps its shaped leaf; only
+  dirty units' meshes change after random edits, over 25 random worlds; hidden
+  faces are left out and a partly covered face is drawn whole; faces on the
+  root's floor are left out; wedges meeting side to side cover each other; cut
+  faces between pieces of one carved ramp are left out; a leaf four units wide
+  is drawn by the unit at its corner; `piece_changes` is the difference of the
+  written parts; boxes are written only where they differ; a thin pane is
+  refused before it is built; the variants act.
+- **Goldens,** re-recorded once, both files, under platforms stage 2's rule,
+  after checking every tick against the old recordings with the support rule
+  in place. Arena: `stairs` and `ramps` 85 of 230 ticks changed, `shape_ramps`
+  91, all at most 1.47e-4 m; `wall_slide` 63 of 170, at most 2.3e-5 m;
+  `compact_world` 65 grounded flags of 273 ticks, positions and velocities
+  identical (the closed support interval). Sauerbraten: `shape_ramps` 3 of 230
+  ticks (2.4e-7 m), `wall_slide` 154 of 170 (3.9e-5 m), `foundry` 22 of 390
+  (2.1e-5 m, the contact difference above) and `compact_world` 118 grounded
+  flags. Every other scenario stays bit for bit, and release and dev builds
+  give the same bits. The tests that ran movement on a converted tree beside
+  `World` went, since `World` is the tree.
+- **Query replay** (`private_query_recordings_replay`, against `World` loaded
+  as the server loads it), queries agreeing / differing, and why:
+
+  | Queries | the_cube1m | complex | ralith1 |
+  | --- | --- | --- | --- |
+  | Box overlap, solid and glass | 5,000 / 0 | 5,000 / 0 | 5,000 / 0 |
+  | Point material | 4,900 / 100 | 5,000 / 0 | 4,699 / 301 |
+  | Support | 2,209 / 1 | 2,324 / 0 | 1,596 / 0 |
+  | Ceilings | 1,033 / 0 | 613 / 0 | 459 / 0 |
+  | Rays, first hit | 4,995 / 5 | 4,999 / 1 | 4,982 / 18 |
+  | Water and glass rays | 10,000 / 0 | none | 10,000 / 0 |
+
+  Point material differs only where the old code reported water or glass
+  inside solid; the support difference is a face between two old regions
+  inside a leaf the tree merged, which the body only touches; of the rays,
+  22 are hits the old `f32` samples rounded onto the face (lost faces or
+  joins taken for faces) and 2 old hits lie between solids. These are session
+  1's classes and counts; the test now fails on any other difference.
+- **Measurements,** M5 Pro, release builds:
+  - **Standalone server on the_cube1m** (start to first `/health` answer,
+    resident memory after loading, three runs each): before 2.51–2.64 s and
+    980 MiB; after 0.36–0.47 s and 134–135 MiB. `/health` reports 339,113
+    leaves (167,562 full, 58,879 shaped, 112,672 water or glass), 80,332
+    internal nodes and 14.5 MB.
+  - **Leaves, nodes and bytes** are session 1's table; conversion is
+    unchanged. the_cube1m's counted size is 226,441 pieces and 29.48 MiB with
+    cells counted by their own JSON (34.73 MiB counted as roots).
+  - **Meshes:** the_cube1m from 2,392 batches and 3,595,924 triangles (the
+    capture tool's count; the audit counted 3,595,084 another way) to 749
+    units, 383 of them drawing, and 717,378 triangles, 80% fewer. complex from
+    297 batches and 450,596 triangles to 134 units (100 drawing) and 79,469;
+    ralith1 from 328 batches and 500,676 triangles to 1,057 units (603
+    drawing) and 74,256. The arena from 68 chunk meshes and 28,158 triangles
+    to 16 units and 23,220. Building every unit of the_cube1m takes about
+    330 ms on one thread.
+  - **Client join on the_cube1m** (`measure_join`, connect to world built,
+    three runs, alternating): before 1.29–1.31 s, 44.9 MB read and a peak
+    memory footprint of 1,016 MB; after 0.47–0.48 s, 30.9 MB read and 83 MB.
+    The capture tool's load (file to meshes on the GPU): 1,539–1,655 ms before,
+    663–676 ms after.
+  - **Frame times** on the imported poses at 3840 × 2160, three rounds
+    alternating the two builds (medians of the rounds; serial frame median,
+    then GPU throughput in ms a frame):
+
+    | Pose | Frame before | Frame after | Throughput before | Throughput after |
+    | --- | ---: | ---: | ---: | ---: |
+    | imported-spawn | 9.08 | 8.33 | 5.36 | 2.86 |
+    | imported-overlook | 12.65 | 10.89 | 8.63 | 6.82 |
+    | imported-water | 9.60 | 8.05 | 5.93 | 4.94 |
+    | imported-tower | 13.91 | 14.55 | 11.40 | 10.83 |
+    | imported-tower-rooms | 12.64 | 10.99 | 9.59 | 8.76 |
+    | imported-flight | 10.35 | 8.47 | 6.30 | 3.12 |
+    | imported-teleports | 13.90 | 12.33 | 11.40 | 10.83 |
+    | imported-storm | 21.08 | 14.66 | 18.27 | 12.39 |
+
+    Throughput varied by at most 0.6 ms between rounds. Serial frame times
+    include a fence wait and are noisier; imported-tower's serial median rose
+    while its throughput fell.
+  - **Frame times on the built-in poses** (the design lead's measurement with
+    the same two builds): 17 poses, every pose that isn't imported except the
+    storms, waterglass-low-bare, lightshow-dynamic-moved,
+    materials-underwater and lightroom-actors-4, in three alternating rounds
+    at 3840 × 2160 with `--throughput 120 --runs 5`. Throughput changed by
+    −1.0% (arena-yard) to +4.5% (corridor-wall, 6.47 → 6.76 ms), median
+    +1.4%; lightshow-dynamic 4.44 → 4.50 ms, lightroom-center 9.42 → 9.69 ms.
+    Small scenes now fit in one or a few units, so nearly every triangle
+    counts as visible (lamphall-actor 4,940 → 7,344 of 7,344). The serial
+    rise of up to 1.5 ms that one unalternated run of the full capture showed
+    (lightshow-dynamic) was not a GPU cost.
+
+- **Captures.** All 30 poses of `scripts/capture-poses.json` at 3840 × 2160,
+  baseline from the base commit's build taken before any change. Share of
+  pixels whose largest channel differs by more than 16/255: 0.055% for
+  arena-yard, at most 0.001% for every other pose; 0.268% of arena-yard's
+  pixels differ by more than 2/255, at most 0.03% elsewhere (imported-overlook,
+  scattered edge and shadow-texel noise). arena-yard's eye, at [16, 9, 19],
+  sits on top of the east bay's roof (`fill([10, 8, -24], [24, 9, 24])`);
+  below y = 9 it is inside that roof. The lintel over the yard's portal,
+  [10, 8, -4] to [13, 10, 4], rises a metre above the roof, so its side faces
+  are partly covered and drawn whole, and only a camera on or inside the roof
+  sees the covered part, as in Sauerbraten. The design lead's captures at
+  1920 × 1080 show it: with the eye at y = 8.5, 8.95 and 9 the builds differ
+  (0.049–0.053% of pixels by more than 16/255), and at y = 9.05 they match
+  exactly. This is the decided rule; nothing else differs visibly.
+- **Not verified:** anything in the running app, including joins, edits,
+  undo, save and reopen, water painting and glass edge bands; nub1 (not in
+  this machine's library); Windows and Linux.
+- **Left for later:** the slab gap in the canonical form (O2's remip); an edit
+  whose unchanged metres split a union-of-eighths shape without carrying its
+  source still leaves that shape split (geometry identical, digest not);
+  pieces' coverage is conservative, so some covered cut faces of pieces of
+  different sources are drawn; support and ceiling queries skip a leaf the
+  body overlaps by up to 3e-5 m on a side, while the box test treats a shaped
+  leaf as touching only above 2e-5 m, so a body can't rest in that band; the
+  root can still move at a reload until shared-sandbox 2e stores it; the
+  mesher runs on one thread.
+
 ## O1b: water and glass from the tree in the renderer
 
-State: waits for O1a. Medium.
+State: running on branch `octree-o1b` since 2026-11-14. Medium. Renderer N2
+runs beside it and also edits `volume.wgsl` and `render.rs`; the second to
+merge rebases.
 
 - **Scope:**
   - The core mesher emits water and glass surfaces per mesh unit, as decided,
@@ -631,7 +957,7 @@ State: waits for O1a. Medium.
 
 ## O2: grid-sized edits
 
-State: waits for O1a and O1b. Large: two sessions in order on one branch,
+State: waits for O1b. Large: two sessions in order on one branch,
 merged once. The design lead commits each session's work to the branch.
 Between the sessions the branch builds core and the server; the client builds
 again after session 2.
@@ -708,8 +1034,8 @@ again after session 2.
 
 ## O3: imports straight into the tree
 
-State: waits for O1a. Medium. It runs beside O1b and O2, which keep the
-functions the importer calls.
+State: running on branch `octree-o3` since 2026-11-14. Medium. It runs beside
+O1b and O2, which keep the functions the importer calls.
 
 - **Scope:**
   - Read the OGZ octree into the tree through O1a's builder. Edges become

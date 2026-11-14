@@ -22,10 +22,11 @@ also lack a convenient way to locate interesting geometry or navigate between
 distant areas. Existing profiles measure CPU work, not completed GPU frames.
 
 World size is capped today. Each joining player receives the whole world as one
-JSON message, and the 400,000-region cap (`MAX_COMPACT_REGIONS`) and the 64 MiB
-limits on the join snapshot, the save file and the importer's output follow from
-that. The server also caps a world at 786,432 fragments and 1,024 objects. nub1,
-at 434,233 regions, is refused only by the region cap (measured 2026-11-12).
+JSON message, and the 64 MiB limits on the join snapshot, the save file and the
+importer's output follow from that. The server also caps a world at 786,432
+pieces and 1,024 objects. nub1, at 434,233 regions, was refused only by the
+400,000-region cap, which octree O1a removed; it now opens as 511,155 leaves,
+with 275,000 to spare under the piece guard (measured 2026-11-14).
 Every large-world measurement so far comes from the maintainer's private library
 of imported maps, which the project can't redistribute, so contributors can't
 reproduce them.
@@ -64,9 +65,9 @@ Stage 1 below is the first work order.
 
 ## Stage 1: a generated benchmark world
 
-State: waits for [octree](octree.md) O1a, whose tree the generator builds. Wave
-1, medium. Shared-sandbox 2b's second session waits for it, because its records
-use the smaller preset.
+State: running on branch `large-worlds-1` since 2026-11-14, on the tree that
+[octree](octree.md) O1a merged. Wave 1, medium. Shared-sandbox 2b's second
+session waits for it, because its records use the smaller preset.
 
 - **Why.** Performance claims need evidence that contributors can reproduce
   ([direction](README.md#direction)), and today's come from a private library.
@@ -90,8 +91,8 @@ use the smaller preset.
     today's JSON limits until shared-sandbox 2d removes them: 786,432 pieces
     (`MAX_WORLD_FRAGMENTS`), 63 MiB of geometry JSON (`MAX_GEOMETRY_BYTES`) and
     the importer's 64 MiB (`MAX_WORLD_BYTES`). At the_cube's size a world
-    already takes about 45 MB of JSON, so the edited layer has about 20 MB
-    (estimate).
+    takes about 31 MB of JSON since octree O1a, so the edited layer has about
+    30 MB (estimate).
   - **Presets.** A nub1 preset aims at nub1's measured conversion: 434,233
     imported leaves in a 2,048 m map, about 11.8 triangles per leaf before
     culling (5,140,198 in all), as much water and glass as nub1's 1,552 boxes

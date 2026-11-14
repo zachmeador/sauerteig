@@ -3,7 +3,7 @@
 use crate::{
     edits::BUSY,
     outbound,
-    persistence::{load_world, write_snapshot},
+    persistence::{open_world, write_snapshot},
     simulation::{self, Command, Commit, Handle, Health, State as RunState},
     Config, Retired, Session, MAX_PLAYERS, MAX_WORLD_SNAPSHOT_BYTES,
 };
@@ -631,7 +631,8 @@ async fn serve_inner(
     let editing = config.editing_allowed;
     let session = tokio::task::spawn_blocking(move || {
         let fresh = !path.exists();
-        let mut session = Session::from_saved(load_world(&path)?, editing)?;
+        let (saved, world) = open_world(&path)?;
+        let mut session = Session::from_world(saved, world, editing)?;
         if fresh {
             session.save_now();
         }

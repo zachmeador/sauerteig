@@ -218,10 +218,11 @@ fn both_profiles_walk_up_half_metre_steps_but_not_taller_ones() {
     };
     for profile in [MovementProfile::arena(), MovementProfile::sauerbraten()] {
         let climb = |rise: u8| {
+            let world = ledge(rise);
             let mut player = stand();
             let (mut peak, mut reach) = (0.0_f32, 0.0_f32);
             for _ in 0..80 {
-                simulate_player_with(&ledge(rise), &mut player, &strafe(), FIXED_DT, &profile);
+                simulate_player_with(&world, &mut player, &strafe(), FIXED_DT, &profile);
                 peak = peak.max(player.position.y);
                 reach = reach.max(player.position.x);
             }

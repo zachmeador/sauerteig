@@ -23,6 +23,10 @@ const EPS: f32 = 1.0e-5;
 /// visit: triangle tests accept hits a little past their edges.
 const RAY_MARGIN: f64 = 1.0e-4;
 const CLIP_EPS: f64 = 1.0e-9;
+/// How far a body may overlap a full leaf's side without touching it, in
+/// metres: the box overlap test clips the body to the leaf, shrinks it by
+/// `EPS` on each side and needs more than `EPS` of what is left.
+const SIDE_CONTACT: f32 = 3.0 * EPS;
 
 fn world_point(origin: [i32; 3], size: u32, p: [i32; 3]) -> Vec3 {
     let c = |a: usize| {
@@ -280,8 +284,23 @@ fn source_overlaps_box(source: &Source, min: Vec3, max: Vec3) -> bool {
     lattice::source_contains_fine(source, fine)
 }
 
+/// Whether a box overlaps a format 3 fragment's solid by more than the
+/// contact tolerance, as a leaf holding that fragment would.
+pub(crate) fn fragment_overlaps_box(fragment: &CellFragment, min: Vec3, max: Vec3) -> bool {
+    let Ok((source, _)) = super::ShapeCache::default().source(super::format3::source_of(
+        fragment.origin,
+        fragment.size,
+        &fragment.cell,
+    )) else {
+        return false;
+    };
+    let lo = min.max(fragment.bounds.world_min());
+    let hi = max.min(fragment.bounds.world_max());
+    lo.cmplt(hi).all() && source_overlaps_box(&source, lo, hi)
+}
+
 /// Clips triangles to a box, as fragment clipping does, without caps.
-fn clip_triangles(triangles: Vec<[DVec3; 3]>, bounds: FineBox) -> Vec<[DVec3; 3]> {
+pub(crate) fn clip_triangles(triangles: Vec<[DVec3; 3]>, bounds: FineBox) -> Vec<[DVec3; 3]> {
     let mut triangles = triangles;
     let floor = CLIP_EPS * CLIP_EPS;
     for axis in 0..3 {
@@ -513,7 +532,7 @@ impl Octree {
     }
 
     /// Every leaf, air included, meeting a fine box with positive volume.
-    fn visit_all(&self, query: FineBox, visit: &mut dyn FnMut(NodeBox, &Node) -> bool) {
+    pub(crate) fn visit_all(&self, query: FineBox, visit: &mut dyn FnMut(NodeBox, &Node) -> bool) {
         fn walk(
             node: &Node,
             at: NodeBox,
@@ -633,6 +652,18 @@ impl Octree {
             let Some(source) = leaf_source(leaf, at) else {
                 return true;
             };
+            // A body may overlap a solid's side by up to the contact
+            // tolerance without touching it, so a leaf it overlaps by no
+            // more than that holds it up no more than it blocks it. Without
+            // this, a body falling beside a wall lands on the faces between
+            // the wall's leaves.
+            let b = at.fine_box();
+            let (lo, hi) = (b.world_min(), b.world_max());
+            if max.x.min(hi.x) - min.x.max(lo.x) <= SIDE_CONTACT
+                || max.z.min(hi.z) - min.z.max(lo.z) <= SIDE_CONTACT
+            {
+                return true;
+            }
             let triangles = source_triangles(&source);
             if !matches!(leaf, Node::Piece(_)) {
                 for (t, _) in triangles {

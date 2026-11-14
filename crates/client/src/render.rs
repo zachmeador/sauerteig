@@ -36,7 +36,7 @@ use self::{
 use crate::lighting::{sun_cascades, LightDesc, ShadowMode, CASCADES};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
-use sauerteig_core::{ChunkKey, Mesh, World, WorldObject, CHUNK_SIZE};
+use sauerteig_core::{ChunkKey, Mesh, World, WorldObject, FINE_UNITS, MESH_UNIT_SIZE};
 use std::{collections::BTreeMap, sync::Arc};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -994,11 +994,13 @@ impl Renderer {
                     material: v.material as u32,
                 })
                 .collect();
+            // A mesh key is its unit's minimum corner in eighths of a metre.
+            let min = Vec3::from_array(key.map(|v| v as f32 / FINE_UNITS as f32));
+            let size = MESH_UNIT_SIZE as f32;
             // Lights whose reach touches the old or new mesh redraw their tiles.
-            let min = Vec3::from_array(key.map(|v| (v * CHUNK_SIZE) as f32));
             let mut dirty = Bounds {
                 min,
-                max: min + Vec3::splat(CHUNK_SIZE as f32),
+                max: min + Vec3::splat(size),
             };
             if let Some(old) = self.chunks.get(&key) {
                 dirty = dirty.union(old.bounds);
@@ -1010,9 +1012,9 @@ impl Renderer {
             self.lights.invalidate_bounds(dirty);
             // The sun redraws only where triangles differ from the old mesh's.
             let started = std::time::Instant::now();
-            let print = Fingerprint::of(min, CHUNK_SIZE as f32, &gpu, &indices);
+            let print = Fingerprint::of(min, size, &gpu, &indices);
             let old_print = self.prints.get(&key).copied().unwrap_or(Fingerprint::EMPTY);
-            if let Some(changed) = print.changed_since(&old_print, min, CHUNK_SIZE as f32) {
+            if let Some(changed) = print.changed_since(&old_print, min, size) {
                 self.sun.invalidate_bounds(changed);
             }
             if print.is_empty() {

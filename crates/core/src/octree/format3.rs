@@ -14,6 +14,47 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+/// A stored leaf as format 3 writes it: a one-metre plain leaf on whole
+/// metres as a cell, any other leaf as a region.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Format3Piece {
+    Region(CellFragment),
+    Cell(CellEdit),
+}
+
+/// The format 3 pieces a change removed and added.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PieceChanges {
+    pub removed: Vec<Format3Piece>,
+    pub added: Vec<Format3Piece>,
+}
+
+/// How format 3 writes a leaf, if it holds solid geometry.
+pub(crate) fn piece_of(at: NodeBox, leaf: &Leaf, world: FineBox) -> Option<Format3Piece> {
+    let (origin, size, shape) = match leaf.geometry {
+        LeafGeometry::Empty => return None,
+        LeafGeometry::Full => (at.min, at.size, None),
+        LeafGeometry::Shaped(shape) => (at.min, at.size, Some(shape)),
+        LeafGeometry::Piece(source) => (source.origin, source.size, Some(source.shape)),
+    };
+    let cell = cell_for(shape, leaf.faces);
+    let plain = !matches!(leaf.geometry, LeafGeometry::Piece(_));
+    if plain && at.size == 8 && at.min.iter().all(|v| v.rem_euclid(8) == 0) {
+        return Some(Format3Piece::Cell(CellEdit {
+            pos: at.min.map(|v| v.div_euclid(8)),
+            cell: Some(cell),
+        }));
+    }
+    // A merged piece's cube can cross the bounds while its solid stays
+    // inside them.
+    Some(Format3Piece::Region(CellFragment {
+        bounds: at.fine_box().intersection(world)?,
+        origin,
+        size,
+        cell,
+    }))
+}
+
 /// A world's geometry in format 3's parts.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Format3 {
@@ -24,11 +65,11 @@ pub struct Format3 {
     pub volumes: Vec<MaterialVolume>,
 }
 
-fn faces_of(cell: &Cell) -> [u8; 6] {
+pub(crate) fn faces_of(cell: &Cell) -> [u8; 6] {
     std::array::from_fn(|face| cell.material_for_face(face as u8))
 }
 
-fn source_of(origin: [i32; 3], size: u32, cell: &Cell) -> Source {
+pub(crate) fn source_of(origin: [i32; 3], size: u32, cell: &Cell) -> Source {
     Source {
         origin,
         size,
@@ -61,21 +102,45 @@ pub(super) fn cell_for(shape: Option<Shape>, faces: [u8; 6]) -> Cell {
     cell
 }
 
-/// The root for converted cubes: at the bounds' minimum corner when the
-/// largest whole region lies on that grid, otherwise on the largest whole
-/// region's grid just below the bounds, so an imported map's own octree keeps
-/// its leaves whole.
+struct Parts<'a> {
+    regions: &'a [CellFragment],
+    cells: &'a [CellEdit],
+    roots: &'a [RootEdit],
+    volumes: &'a [MaterialVolume],
+}
+
+/// The root for converted cubes. Format 3 cannot store it, so it is anchored
+/// on the largest region whose box is a power-of-two cube on the grid of the
+/// largest whole region, pieces included, and placed on that box's grid just
+/// below the bounds' minimum corner. An imported map's own octree keeps its
+/// leaves whole, and the tree's own output, where every leaf is such a
+/// region, keeps its pieces when no whole region as large remains. Clipped
+/// regions off that grid are ignored, and a world without whole regions roots
+/// at the bounds' minimum corner.
 fn choose_root(bounds: WorldBounds, regions: &[CellFragment]) -> Result<NodeBox, String> {
     let fine = bounds.fine_box();
-    let anchor = regions
+    let whole = regions
         .iter()
         .filter(|r| r.source_bounds() == Some(r.bounds))
         .max_by(|a, b| a.size.cmp(&b.size).then(b.origin.cmp(&a.origin)));
-    let origin = match anchor {
+    let origin = match whole {
         None => fine.min,
-        Some(region) => {
-            let size = region.size as i32;
-            std::array::from_fn(|a| fine.min[a] - (fine.min[a] - region.origin[a]).rem_euclid(size))
+        Some(whole) => {
+            let cube = |b: FineBox| {
+                let side = b.max[0] - b.min[0];
+                ((0..3).all(|a| b.max[a] - b.min[a] == side) && (side as u32).is_power_of_two())
+                    .then_some(side)
+            };
+            let (anchor, side) = regions
+                .iter()
+                .filter_map(|r| Some((r.bounds.min, cube(r.bounds)?)))
+                .filter(|&(min, side)| {
+                    let step = side.min(whole.size as i32);
+                    (0..3).all(|a| (min[a] - whole.origin[a]).rem_euclid(step) == 0)
+                })
+                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+                .expect("the largest whole region is on its own grid");
+            std::array::from_fn(|a| fine.min[a] - (fine.min[a] - anchor[a]).rem_euclid(side))
         }
     };
     root_for(bounds, origin)
@@ -118,18 +183,40 @@ impl Octree {
     /// Loads a world saved in format 1, 2 or 3, after the same validation as
     /// `World::from_compact_parts` and `World::replace_volumes`.
     pub fn from_format3(world: &Format3) -> Result<Self, String> {
-        let bounds = world.bounds;
+        Self::from_parts(
+            world.bounds,
+            &world.regions,
+            &world.cells,
+            &world.roots,
+            &world.volumes,
+        )
+    }
+
+    /// The same from borrowed parts.
+    pub fn from_parts(
+        bounds: WorldBounds,
+        regions: &[CellFragment],
+        cells: &[CellEdit],
+        roots: &[RootEdit],
+        volumes: &[MaterialVolume],
+    ) -> Result<Self, String> {
+        let world = Parts {
+            regions,
+            cells,
+            roots,
+            volumes,
+        };
         if !bounds.is_valid() {
             return Err("Invalid world bounds (maximum 8192 metres per axis).".into());
         }
         let fine = bounds.fine_box();
-        for region in &world.regions {
+        for region in world.regions {
             if !region.is_valid() || !fine.contains(region.bounds) {
                 return Err("Invalid compact region bounds or geometry.".into());
             }
         }
         let mut seen = BTreeSet::new();
-        for cell in &world.cells {
+        for cell in world.cells {
             if !bounds.contains_pos(cell.pos)
                 || cell.cell.is_some_and(|c| !c.is_valid())
                 || !seen.insert(cell.pos)
@@ -137,18 +224,18 @@ impl Octree {
                 return Err("Invalid or repeated coarse cell.".into());
             }
         }
-        for root in &world.roots {
+        for root in world.roots {
             if !seen.insert(root.pos) {
                 return Err("A saved root has repeated geometry.".into());
             }
         }
-        validate_root_edits(&world.roots)?;
+        validate_root_edits(world.roots)?;
         if world.roots.iter().any(|r| !bounds.contains_pos(r.pos)) {
             return Err("Edit lies outside this world.".into());
         }
-        validate_material_volumes(&world.volumes, fine)?;
+        validate_material_volumes(world.volumes, fine)?;
 
-        let root_box = choose_root(bounds, &world.regions)?;
+        let root_box = choose_root(bounds, world.regions)?;
         let mut builder = OctreeBuilder::new(bounds, root_box)?;
         let mut nodes = Vec::new();
         let add = |builder: &mut OctreeBuilder,
@@ -190,7 +277,7 @@ impl Octree {
             }
             Ok(())
         };
-        for region in &world.regions {
+        for region in world.regions {
             add(
                 &mut builder,
                 &mut nodes,
@@ -201,7 +288,7 @@ impl Octree {
         }
         let overrides = !world.regions.is_empty();
         if !overrides {
-            for cell in &world.cells {
+            for cell in world.cells {
                 if let Some(c) = cell.cell {
                     let root = FineBox::root(cell.pos);
                     add(
@@ -213,7 +300,7 @@ impl Octree {
                     )?;
                 }
             }
-            for root in &world.roots {
+            for root in world.roots {
                 for f in &root.fragments {
                     add(
                         &mut builder,
@@ -228,7 +315,7 @@ impl Octree {
         let mut tree = builder.finish()?;
         if overrides {
             // Cells and roots replace the regions in their metre.
-            for cell in &world.cells {
+            for cell in world.cells {
                 let root = FineBox::root(cell.pos);
                 tree.clear_geometry(root);
                 if let Some(c) = cell.cell {
@@ -236,7 +323,7 @@ impl Octree {
                 }
             }
             let mut shapes = super::ShapeCache::default();
-            for root in &world.roots {
+            for root in world.roots {
                 tree.clear_geometry(FineBox::root(root.pos));
                 for f in &root.fragments {
                     let (source, _) = shapes.source(source_of(f.origin, f.size, &f.cell))?;
@@ -245,27 +332,20 @@ impl Octree {
             }
         }
         let mut budget = MAX_CONVERSION_LEAVES.saturating_sub(tree.stats().leaves());
-        for volume in &world.volumes {
+        for volume in world.volumes {
             nodes.clear();
             decompose(root_box, volume.bounds, budget, &mut nodes)?;
             budget -= nodes.len();
         }
-        for volume in &world.volumes {
+        for volume in world.volumes {
             tree.set_cube_material(volume.bounds, cube_material_for(volume.material));
         }
         Ok(tree)
     }
 
-    /// Converts a `World` through its snapshot's format 3 parts.
+    /// A world's tree.
     pub fn from_world(world: &World) -> Result<Self, String> {
-        let snapshot = world.snapshot();
-        Self::from_format3(&Format3 {
-            bounds: snapshot.bounds(),
-            regions: snapshot.regions().to_vec(),
-            cells: snapshot.cells(),
-            roots: snapshot.root_overrides(),
-            volumes: snapshot.volumes().to_vec(),
-        })
+        Ok(world.tree.clone())
     }
 
     /// Format 3 for files and messages. Builds from before the octree open it
@@ -290,35 +370,14 @@ impl Octree {
         }
     }
 
-    fn geometry_parts(&self) -> (Vec<CellFragment>, Vec<CellEdit>) {
+    pub(crate) fn geometry_parts(&self) -> (Vec<CellFragment>, Vec<CellEdit>) {
         let world = self.bounds.fine_box();
         let mut regions = Vec::new();
         let mut cells = Vec::new();
-        self.for_each_leaf(|at, leaf| {
-            let (origin, size, shape) = match leaf.geometry {
-                LeafGeometry::Empty => return,
-                LeafGeometry::Full => (at.min, at.size, None),
-                LeafGeometry::Shaped(shape) => (at.min, at.size, Some(shape)),
-                LeafGeometry::Piece(source) => (source.origin, source.size, Some(source.shape)),
-            };
-            let cell = cell_for(shape, leaf.faces);
-            let plain = !matches!(leaf.geometry, LeafGeometry::Piece(_));
-            if plain && at.size == 8 && at.min.iter().all(|v| v.rem_euclid(8) == 0) {
-                cells.push(CellEdit {
-                    pos: at.min.map(|v| v.div_euclid(8)),
-                    cell: Some(cell),
-                });
-            } else {
-                // A merged piece's cube can cross the bounds while its solid
-                // stays inside them.
-                let bounds = at.fine_box().intersection(world).unwrap();
-                regions.push(CellFragment {
-                    bounds,
-                    origin,
-                    size,
-                    cell,
-                });
-            }
+        self.for_each_leaf(|at, leaf| match piece_of(at, &leaf, world) {
+            Some(Format3Piece::Region(region)) => regions.push(region),
+            Some(Format3Piece::Cell(cell)) => cells.push(cell),
+            None => {}
         });
         cells.sort_by_key(|c| c.pos);
         (regions, cells)

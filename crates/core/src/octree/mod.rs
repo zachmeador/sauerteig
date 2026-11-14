@@ -10,16 +10,21 @@
 //! Its queries take `World`'s arguments and give `World`'s results, so `World`
 //! can route them through it.
 
+mod diff;
 mod digest;
 mod format3;
 pub(crate) mod lattice;
+pub(crate) mod mesh;
 #[cfg(test)]
 mod private_worlds;
 mod query;
 #[cfg(test)]
 mod tests;
 
-pub use format3::Format3;
+pub(crate) use format3::{faces_of, piece_of, source_of};
+pub use format3::{Format3, Format3Piece, PieceChanges};
+pub use mesh::MESH_UNIT_SIZE;
+pub(crate) use query::fragment_overlaps_box;
 
 use crate::{FineBox, Shape, VolumeMaterial, WorldBounds, MATERIAL_COLORS};
 use lattice::Class;
@@ -31,16 +36,11 @@ pub const MAT_AIR: u16 = 0;
 pub const MAT_WATER: u16 = 1 << 2;
 /// Sauerbraten's glass, without variant or flags.
 pub const MAT_GLASS: u16 = 3 << 2;
-const MATF_INDEX: u16 = 3;
 const MATF_VOLUME: u16 = 7 << 2;
 
-/// The material that acts: water and glass, without a variant. Clip,
-/// death and other flags are stored but inert, and so are lava and the water
-/// and glass variants.
+/// The material that acts: water and glass, whatever their variant. Clip,
+/// death and other flags are stored but inert, and so is lava.
 pub fn volume_material_of(cube_material: u16) -> Option<VolumeMaterial> {
-    if cube_material & MATF_INDEX != 0 {
-        return None;
-    }
     match cube_material & MATF_VOLUME {
         MAT_WATER => Some(VolumeMaterial::Water),
         MAT_GLASS => Some(VolumeMaterial::Glass),
@@ -316,6 +316,16 @@ pub(crate) struct Canonical {
 impl ShapeCache {
     /// None when the shape has no volume or folds through itself.
     pub(crate) fn canonical(&mut self, shape: Shape) -> Option<Canonical> {
+        if lattice::is_solid(shape) && shape.diagonals < 64 {
+            // Every face of the full cube is a convex square.
+            return Some(Canonical {
+                shape: Shape {
+                    diagonals: lattice::FIXED_DIAGONALS,
+                    ..shape
+                },
+                visible: [true; 6],
+            });
+        }
         *self
             .0
             .entry((shape.vertices, shape.diagonals))
@@ -758,6 +768,15 @@ impl Octree {
         });
     }
 
+    /// Fills a box with solid geometry of the given surface materials,
+    /// keeping cube material.
+    pub(crate) fn fill_solid(&mut self, target: FineBox, faces: [u8; 6]) {
+        let solid = Node::Full(faces, MAT_AIR);
+        self.modify(target, &mut |node, at| {
+            combine(&solid, node, at, Parts::Shape)
+        });
+    }
+
     /// Sets the cube material in a box, keeping geometry.
     pub(crate) fn set_cube_material(&mut self, target: FineBox, cube: u16) {
         self.modify(target, &mut |node, at| {
@@ -829,6 +848,158 @@ impl Octree {
             }
         }
         at
+    }
+}
+
+impl Octree {
+    /// Merges the nodes around a written box back into a source's own content
+    /// wherever every leaf under them is that source restricted. Children that
+    /// all lie wholly inside or outside a shape have no piece to show which
+    /// shape they belong to, so the canonical merge cannot rebuild it; the
+    /// source of a written fragment can. With it, writing back a piece of a
+    /// larger shape, as an undo does, restores the shape's leaf.
+    pub(crate) fn remerge(&mut self, source: Source, faces: [u8; 6], near: FineBox) {
+        let Some(own) = source.fine_box() else {
+            return;
+        };
+        fn walk(
+            node: &mut Node,
+            at: NodeBox,
+            near: FineBox,
+            source: &Source,
+            own: FineBox,
+            faces: [u8; 6],
+        ) -> bool {
+            if relation(at, near) == Relation::Disjoint {
+                return false;
+            }
+            let Node::Branch(children) = &*node else {
+                return false;
+            };
+            let mut rebuilt: Option<[Node; 8]> = None;
+            for i in 0..8 {
+                let mut child = children[i].clone();
+                if walk(&mut child, at.child(i), near, source, own, faces) {
+                    rebuilt.get_or_insert_with(|| (**children).clone())[i] = child;
+                }
+            }
+            let mut changed = false;
+            if let Some(children) = rebuilt {
+                *node = canonical_branch(children, at);
+                changed = true;
+            }
+            if matches!(node, Node::Branch(_)) && own.contains(at.fine_box()) {
+                let candidate = restrict(*source, faces, first_cube(node), at);
+                if expands_to(&candidate, at, node) {
+                    *node = candidate;
+                    changed = true;
+                }
+            }
+            changed
+        }
+        walk(&mut self.root, self.root_box, near, &source, own, faces);
+    }
+
+    /// How many leaves setting the cube material in a box would add,
+    /// counted before anything is built and ignoring merges, or `None` past
+    /// `limit`.
+    pub(crate) fn count_cube_write(
+        &self,
+        target: FineBox,
+        cube: u16,
+        limit: usize,
+    ) -> Option<usize> {
+        match target.intersection(self.bounds.fine_box()) {
+            Some(target) => added_leaves(&self.root, self.root_box, target, cube, limit),
+            None => Some(0),
+        }
+    }
+}
+
+/// The cube material of a subtree's first leaf.
+fn first_cube(node: &Node) -> u16 {
+    match node {
+        Node::Branch(children) => first_cube(&children[0]),
+        leaf => leaf.cube(),
+    }
+}
+
+/// Whether a subtree holds exactly what a leaf splits into.
+fn expands_to(candidate: &Node, at: NodeBox, subtree: &Node) -> bool {
+    match subtree {
+        Node::Branch(children) => {
+            let parts = split(candidate, at);
+            (0..8).all(|i| expands_to(&parts[i], at.child(i), &children[i]))
+        }
+        leaf => leaf == candidate,
+    }
+}
+
+/// Leaves a cube-material write adds under a node, or `None` past `limit`.
+fn added_leaves(
+    node: &Node,
+    at: NodeBox,
+    target: FineBox,
+    cube: u16,
+    limit: usize,
+) -> Option<usize> {
+    match relation(at, target) {
+        Relation::Disjoint => Some(0),
+        Relation::Inside => {
+            // Every leaf keeps its place; only plain air becomes a leaf.
+            let mut added = 0;
+            if cube != MAT_AIR {
+                count_air(node, &mut added);
+            }
+            (added <= limit).then_some(added)
+        }
+        Relation::Partial => match node {
+            Node::Branch(children) => {
+                let mut added = 0;
+                for (i, child) in children.iter().enumerate() {
+                    added += added_leaves(child, at.child(i), target, cube, limit - added)?;
+                }
+                Some(added)
+            }
+            leaf => {
+                let after = split_leaves(leaf, at, target, cube, limit + 1)?;
+                let added = after.saturating_sub(usize::from(!leaf.is_air()));
+                (added <= limit).then_some(added)
+            }
+        },
+    }
+}
+
+fn count_air(node: &Node, count: &mut usize) {
+    match node {
+        Node::Branch(children) => children.iter().for_each(|c| count_air(c, count)),
+        leaf if leaf.is_air() => *count += 1,
+        _ => {}
+    }
+}
+
+/// How many leaves other than plain air a leaf becomes when a write covers
+/// part of it, or `None` past `limit`.
+fn split_leaves(
+    leaf: &Node,
+    at: NodeBox,
+    target: FineBox,
+    cube: u16,
+    limit: usize,
+) -> Option<usize> {
+    match relation(at, target) {
+        Relation::Disjoint => Some(usize::from(!leaf.is_air())),
+        Relation::Inside => Some(usize::from(leaf.has_geometry() || cube != MAT_AIR)),
+        Relation::Partial => {
+            let mut total = 0;
+            for (i, child) in split(leaf, at).iter().enumerate() {
+                total += split_leaves(child, at.child(i), target, cube, limit - total)?;
+                if total > limit {
+                    return None;
+                }
+            }
+            Some(total)
+        }
     }
 }
 

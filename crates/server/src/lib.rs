@@ -16,10 +16,10 @@ use outbound::{cost, Events, Packet, FOLLOW_UP_BYTES};
 use persistence::SavedWorld;
 use sauerteig_core::{
     forward, player_intersects_fragment, player_intersects_volume, ray_player, simulate_player,
-    spawn_point, Cell, CellEdit, CellFragment, CellPos, ClientMessage, FineBox, InputFrame,
-    MaterialVolume, ObjectEdit, ObjectKind, ObjectPlacement, Player, Projectile, RootEdit,
-    ServerMessage, ShotEffect, Vec3, VolumeEdit, VolumeMaterial, World, WorldObject, FIXED_DT,
-    PLAYER_HEIGHT, PLAYER_RADIUS,
+    spawn_point, Cell, CellEdit, CellFragment, CellPos, ClientMessage, FineBox, Format3Piece,
+    InputFrame, MaterialVolume, ObjectEdit, ObjectKind, ObjectPlacement, PieceChanges, Player,
+    Projectile, RootEdit, ServerMessage, ShotEffect, TreeStats, Vec3, VolumeEdit, VolumeMaterial,
+    World, WorldObject, FIXED_DT, MAX_WORLD_PIECES, PLAYER_HEIGHT, PLAYER_RADIUS,
 };
 use std::sync::Arc;
 use std::{
@@ -33,9 +33,13 @@ const MAX_PLAYERS: usize = 16;
 const MAX_EDITS: usize = 16_384;
 const MAX_EDIT_FRAGMENTS: usize = 65_536;
 const MAX_HISTORY_COMPLEXITY: usize = 262_144;
-// A full legacy world still fits. Fine detail spends this same occupied-geometry
-// budget; it cannot expand all unit roots into hundreds of millions of leaves.
-const MAX_WORLD_FRAGMENTS: usize = 786_432;
+// A full legacy world still fits. Every leaf with solid geometry is one format
+// 3 piece, so fine detail spends this same budget.
+const MAX_WORLD_FRAGMENTS: usize = MAX_WORLD_PIECES;
+// Edits may not take the tree past `MAX_WORLD_PIECES` leaves, water and glass
+// included.
+const WORLD_GUARD_ERROR: &str =
+    "The room has reached its limit of 786,432 pieces of detail; remove some detail or water and glass first.";
 const EDIT_BURST: f64 = 131_072.0;
 const EDIT_RATE: f64 = 65_536.0;
 const MAX_OBJECTS: usize = 1024;
@@ -167,20 +171,38 @@ struct FlyingRocket {
     ticks_left: u16,
 }
 
-#[derive(Clone, Copy, Default)]
-struct RootCost {
-    fragments: usize,
-    bytes: usize,
+/// Format 3 pieces and their bytes, as the world's file and Welcome count
+/// them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Size {
+    pieces: isize,
+    bytes: isize,
 }
-impl RootCost {
-    fn new(root: &RootEdit, keep_empty: bool) -> Self {
-        if root.fragments.is_empty() && !keep_empty {
-            return Self::default();
-        }
+impl Size {
+    fn of(piece: &Format3Piece) -> Self {
+        let bytes = match piece {
+            Format3Piece::Region(region) => json_bytes(region),
+            Format3Piece::Cell(cell) => json_bytes(cell),
+        };
         Self {
-            fragments: root.fragments.len().max(1),
-            bytes: json_bytes(root) + 1,
+            pieces: 1,
+            bytes: bytes as isize + 1,
         }
+    }
+    /// The size a change adds: the pieces it adds less the pieces it removes.
+    fn change(changes: &PieceChanges) -> Self {
+        let mut size = Self::default();
+        for piece in &changes.added {
+            let added = Self::of(piece);
+            size.pieces += added.pieces;
+            size.bytes += added.bytes;
+        }
+        for piece in &changes.removed {
+            let removed = Self::of(piece);
+            size.pieces -= removed.pieces;
+            size.bytes -= removed.bytes;
+        }
+        size
     }
 }
 
@@ -198,8 +220,9 @@ struct Session {
     volumes_changed_at: u64,
     volume_bytes: usize,
     geometry_fragments: usize,
-    geometry_root_costs: HashMap<CellPos, RootCost>,
     geometry_bytes: usize,
+    /// The tree's leaves, internal nodes and bytes, for `/health`.
+    world_stats: TreeStats,
     peers: HashMap<u64, Peer>,
     retired: Retired,
     rockets: Vec<FlyingRocket>,
@@ -222,48 +245,36 @@ impl Session {
         Self::from_saved(saved, editing_allowed).unwrap()
     }
 
+    #[cfg(test)]
     fn from_saved(saved: SavedWorld, editing_allowed: bool) -> Result<Self, String> {
+        let world = persistence::build_world(&saved)?;
+        Self::from_world(saved, world, editing_allowed)
+    }
+
+    /// A room for a saved world, given the world it builds.
+    fn from_world(saved: SavedWorld, world: World, editing_allowed: bool) -> Result<Self, String> {
         let cell_revisions: HashMap<_, _> = saved
             .cells
             .iter()
             .map(|e| (e.pos, saved.revision))
             .chain(saved.roots.iter().map(|e| (e.pos, saved.revision)))
             .collect();
-        let mut world =
-            World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)?;
-        world.replace_volumes(&saved.volumes)?;
         let volume_bytes = json_bytes(&world.volumes());
         let volume_revision = (!world.volumes().is_empty()).then_some(saved.revision);
-        let geometry_root_costs: HashMap<_, _> = world
-            .cells()
-            .iter()
-            .map(|cell| {
-                (
-                    cell.pos,
-                    RootCost::new(&legacy_root(cell.clone()), world.has_regions()),
-                )
-            })
-            .chain(
-                world
-                    .root_overrides()
-                    .iter()
-                    .map(|root| (root.pos, RootCost::new(root, world.has_regions()))),
-            )
-            .collect();
-        let geometry_fragments = world.region_count()
-            + geometry_root_costs
-                .values()
-                .map(|cost| cost.fragments)
-                .sum::<usize>();
-        let geometry_bytes = world
-            .regions()
-            .iter()
-            .map(|fragment| json_bytes(fragment) + 1)
-            .sum::<usize>()
-            + geometry_root_costs
-                .values()
-                .map(|cost| cost.bytes)
-                .sum::<usize>();
+        // The pieces and bytes this world's file holds: every leaf with solid
+        // geometry, as a region or a cell.
+        let snapshot = world.snapshot();
+        let geometry_fragments = snapshot.regions().len() + snapshot.cells().len();
+        let geometry_bytes = snapshot_geometry_bytes(snapshot.regions(), &snapshot.cells(), &[]);
+        // The tree may split what the file merged; a world whose next save
+        // would not open again is refused now.
+        if geometry_fragments > MAX_WORLD_FRAGMENTS {
+            return Err("Invalid saved world limits.".into());
+        }
+        if geometry_bytes + volume_bytes > MAX_GEOMETRY_BYTES {
+            return Err(SNAPSHOT_LIMIT_ERROR.into());
+        }
+        let world_stats = world.stats();
         let object_revisions: HashMap<_, _> = saved
             .objects
             .iter()
@@ -289,8 +300,8 @@ impl Session {
             volumes_changed_at: saved.revision,
             volume_bytes,
             geometry_fragments,
-            geometry_root_costs,
             geometry_bytes,
+            world_stats,
             peers: HashMap::new(),
             retired: Vec::new(),
             rockets: Vec::new(),
@@ -1119,21 +1130,18 @@ fn json_bytes(value: &impl serde::Serialize) -> usize {
     counter.0
 }
 
+/// The bytes of a world's geometry as format 3 writes it, each part counted
+/// by its own JSON and a separator.
 fn snapshot_geometry_bytes(
     regions: &[CellFragment],
     cells: &[CellEdit],
     roots: &[RootEdit],
 ) -> usize {
-    // RootEdit is more verbose than a legacy coarse cell, so this bounds both
-    // snapshot encodings and remains valid when a cell becomes a detailed root.
     regions
         .iter()
         .map(|fragment| json_bytes(fragment) + 1)
         .sum::<usize>()
-        + cells
-            .iter()
-            .map(|cell| json_bytes(&legacy_root(cell.clone())) + 1)
-            .sum::<usize>()
+        + cells.iter().map(|cell| json_bytes(cell) + 1).sum::<usize>()
         + roots
             .iter()
             .map(|root| {

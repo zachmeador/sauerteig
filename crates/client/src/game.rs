@@ -877,7 +877,9 @@ impl Game {
                         return;
                     }
                 }
-                match self.world.apply_root_edits(&roots) {
+                // Water and glass, then geometry, as the server applied them;
+                // a patch this world refuses changes nothing.
+                match self.world.apply_patch(&roots, volumes.as_deref()) {
                     Ok(chunks) => {
                         if let Some(pending) = &mut self.pending_object {
                             pending.observe_patch(&self.objects, &objects);
@@ -886,10 +888,7 @@ impl Game {
                         self.objects = objects;
                         self.revision = revision;
                         renderer.rebuild(&self.world, &chunks);
-                        if let Some(volumes) = volumes {
-                            self.world
-                                .replace_volumes(&volumes)
-                                .expect("validated volume patch");
+                        if volumes.is_some() {
                             renderer.rebuild_volumes(&self.world);
                         }
                         if objects_changed {

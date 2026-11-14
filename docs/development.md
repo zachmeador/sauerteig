@@ -2,8 +2,9 @@
 
 ## Workspace
 
-- `crates/core`: editable geometry, chunk meshes, ray queries, collision,
-  player movement, and the shared protocol. No graphics dependencies.
+- `crates/core`: the world's octree of cubes, its meshes, ray queries,
+  collision, player movement, and the shared protocol. No graphics
+  dependencies.
 - `crates/client`: the desktop client, using wgpu, winit, and egui. Editing,
   local blueprints, rendering, and client prediction live here.
 - `crates/server`: authoritative room simulation, edit validation and history,
@@ -151,23 +152,31 @@ overrides it.
 
 ## Rendering and assets
 
-Rendering meshes are derived from the editable geometry. Imported large leaves
-remain compact and use a spatial query index. Local metre-root edits mask the
-authored base without expanding the whole map. An edit rebuilds affected mesh
-batches, local chunks, and their face neighbors; raycasts and collision use the
-same cell shapes. Camera and shadow passes cull using actual mesh bounds.
-The [core contract](../crates/core/CONTRACT.md) describes the geometry and protocol
-invariants.
+The world is one octree of cubes, from an eighth of a metre to the whole map, as
+in Sauerbraten. Imported maps keep their large leaves, and an edit splits only
+the leaves around what it changes and copies only the path to them; undo merges
+them back. Rendering meshes come from the tree in 16 m mesh units: each leaf is
+drawn by the unit holding its minimum corner, faces covered by solid neighbours
+are left out, a partly covered face is drawn whole, and faces on the root's
+outer boundary are left out. Any write, water and glass included, rebuilds the
+units owning leaves it removed or added and those beside changed geometry or
+beside a shaped leaf or piece it split or merged. Raycasts and collision use the
+same leaves. Camera and shadow passes cull using actual mesh bounds. The [core
+contract](../crates/core/CONTRACT.md) describes the geometry and protocol
+invariants. The server's `/health` reports the tree's leaves by kind, its
+internal nodes, and estimated bytes by part under `world`.
 
-Water and glass occupy a separate sparse layer of disjoint eighth-metre boxes.
-Volume edits rebuild cached boundary meshes; contiguous regions of the same
-material omit internal faces. Transparent faces are culled and sorted behind
-opaque geometry using the same depth buffer. This is alpha blending, with
-procedural water motion and glass tint rather than scene refraction or reflected
-scene captures. Material regions do not cast opaque shadows. Keep intersecting
-transparent regions and large visible water surfaces in runtime checks: sorting
-uses face centers and can show ordering artifacts for overlapping views of large
-faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
+Water and glass are cube material in the tree. The renderer draws them from
+the world's list of disjoint eighth-metre boxes, which stay as loaded until an
+edit changes them. Volume edits rebuild cached boundary meshes; contiguous
+regions of the same material omit internal faces. Transparent faces are culled
+and sorted behind opaque geometry using the same depth buffer. This is alpha
+blending, with procedural water motion and glass tint rather than scene
+refraction or reflected scene captures. Material regions do not cast opaque
+shadows. Keep intersecting transparent regions and large visible water surfaces
+in runtime checks: sorting uses face centers and can show ordering artifacts for
+overlapping views of large faces. An underwater eye adds blue-green distance fog
+and a subtle screen tint.
 
 The scene renders in linear HDR, with a filmic exposure/tonemapping pass before
 egui. Settings include quality, bloom (zero disables it), anti-aliasing, render

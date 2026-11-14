@@ -33,7 +33,7 @@ fn report(name: &str, mut milliseconds: Vec<f64>) {
 fn main() {
     let world = World::arena();
     let keys = world.chunk_keys();
-    let cells = world.cells();
+    let leaves = world.stats().leaves();
     let (vertices, triangles) = keys
         .iter()
         .map(|&key| {
@@ -57,8 +57,7 @@ fn main() {
         }
     );
     println!(
-        "Arena: {} occupied cells, {} chunks, {vertices} vertices, {triangles} triangles",
-        cells.len(),
+        "Arena: {leaves} leaves, {} mesh units, {vertices} vertices, {triangles} triangles",
         keys.len()
     );
     println!("World construction and fixture preparation are excluded from timings.");
@@ -100,7 +99,7 @@ fn main() {
             .expect("profiling edit fixture must contain a cell")
     });
     report(
-        "One edit + dirty chunk meshes",
+        "One edit + dirty unit meshes",
         measure(
             |sample| {
                 let index = (sample / 2) % edit_positions.len();
@@ -244,7 +243,7 @@ fn main() {
         ),
     );
     println!();
-    println!("Ray fixture: {hit_count} hits / {} rays; edit invalidation rebuilds the touched chunk plus six neighbors.", rays.len());
+    println!("Ray fixture: {hit_count} hits / {} rays; an edit rebuilds the mesh units it touches and those beside it.", rays.len());
     println!("Times are wall-clock samples on this machine. They are not GPU frame times,");
     println!("network measurements, or proof of a laptop FPS budget.");
 }

@@ -1,11 +1,10 @@
-use crate::{Vec3, CHUNK_SIZE};
-use im::{OrdMap, OrdSet};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::BTreeSet, sync::Arc};
+use crate::Vec3;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, OnceLock};
 
 pub type CellPos = [i32; 3];
+/// A mesh unit's key: its minimum corner in eighths of a metre.
 pub type ChunkKey = [i32; 3];
-const CHUNK_VOLUME: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
 
 /// Fallback colors for the stable material slots named by `MATERIAL_NAMES`.
 pub const MATERIAL_COLORS: [[f32; 3]; 8] = [
@@ -204,165 +203,101 @@ pub struct RayHit {
     pub distance: f32,
 }
 
-#[derive(Clone, Debug)]
-struct Chunk {
-    cells: Box<[Option<Cell>; CHUNK_VOLUME]>,
-    occupied: usize,
+/// The world's extent in whole metres: `min` inclusive, `max` exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldBounds {
+    pub min: CellPos,
+    pub max: CellPos,
 }
-
-impl Default for Chunk {
+impl Default for WorldBounds {
     fn default() -> Self {
         Self {
-            cells: Box::new([None; CHUNK_VOLUME]),
-            occupied: 0,
+            min: [crate::WORLD_MIN, 0, crate::WORLD_MIN],
+            max: [crate::WORLD_MAX, crate::WORLD_HEIGHT, crate::WORLD_MAX],
         }
     }
 }
-
-#[derive(Clone, Debug, Default)]
-pub struct World {
-    chunks: OrdMap<ChunkKey, Arc<Chunk>>,
-    pub(crate) fine: OrdMap<CellPos, Arc<crate::fine::FineRoot>>,
-    pub(crate) authored_roots: OrdMap<CellPos, Arc<Vec<crate::CellFragment>>>,
-    pub(crate) bounds: crate::WorldBounds,
-    pub(crate) compact: crate::compact::CompactWorld,
-    pub(crate) overrides: OrdSet<CellPos>,
-    pub(crate) volumes: Arc<crate::volumes::VolumeLayer>,
+impl WorldBounds {
+    pub fn is_valid(self) -> bool {
+        (0..3).all(|a| {
+            self.min[a] >= -MAX_WORLD_COORDINATE
+                && self.max[a] <= MAX_WORLD_COORDINATE
+                && self.min[a] < self.max[a]
+                && self.max[a] - self.min[a] <= MAX_WORLD_COORDINATE
+        })
+    }
+    pub fn contains_pos(self, pos: CellPos) -> bool {
+        (0..3).all(|a| pos[a] >= self.min[a] && pos[a] < self.max[a])
+    }
+    pub fn fine_box(self) -> crate::FineBox {
+        crate::FineBox {
+            min: self.min.map(|v| v * 8),
+            max: self.max.map(|v| v * 8),
+        }
+    }
+    pub fn world_min(self) -> Vec3 {
+        Vec3::from_array(self.min.map(|v| v as f32))
+    }
+    pub fn world_max(self) -> Vec3 {
+        Vec3::from_array(self.max.map(|v| v as f32))
+    }
 }
 
-/// A consistent, constant-time copy of authored data. Expanding it to wire/save
-/// vectors belongs on a worker; no triangles, mesh batches, or query indexes are
-/// retained here. Edits copy only the affected persistent-map paths/chunks.
+pub const WORLD_FORMAT_VERSION: u32 = 3;
+/// The most metres a selection may hold, for queries that list them.
+pub const MAX_QUERY_ROOTS: usize = 32_768;
+pub(crate) const MAX_WORLD_COORDINATE: i32 = 8192;
+/// The world's guard: the most leaves an edit may take a world to, until
+/// shared-sandbox stage 2 replaces it with a memory budget. Edits that add no
+/// leaves pass, and loading never refuses for it.
+pub const MAX_WORLD_PIECES: usize = 786_432;
+
+/// A world: one octree of cubes holding geometry and cube material, and the
+/// water and glass boxes format 3 writes, kept as loaded until a write
+/// changes cube material. Cloning takes constant time.
+#[derive(Clone, Debug)]
+pub struct World {
+    pub(crate) tree: crate::Octree,
+    pub(crate) volumes: Arc<Vec<crate::MaterialVolume>>,
+}
+
+impl Default for World {
+    fn default() -> Self {
+        Self::with_tree(
+            crate::Octree::new(crate::WorldBounds::default()).expect("default bounds are valid"),
+        )
+    }
+}
+
+/// A consistent, constant-time copy of a world. Expanding it to wire and save
+/// vectors belongs on a worker; the format 3 parts are written once, when
+/// first asked for.
 #[derive(Clone, Debug)]
 pub struct WorldSnapshot {
-    bounds: crate::WorldBounds,
-    regions: Arc<Vec<crate::CellFragment>>,
-    chunks: OrdMap<ChunkKey, Arc<Chunk>>,
-    roots: OrdMap<CellPos, Arc<Vec<crate::CellFragment>>>,
-    overrides: OrdSet<CellPos>,
+    tree: crate::Octree,
     volumes: Arc<Vec<crate::MaterialVolume>>,
+    parts: Arc<OnceLock<(Vec<crate::CellFragment>, Vec<CellEdit>)>>,
 }
 impl WorldSnapshot {
+    fn parts(&self) -> &(Vec<crate::CellFragment>, Vec<CellEdit>) {
+        self.parts.get_or_init(|| self.tree.geometry_parts())
+    }
     pub fn bounds(&self) -> crate::WorldBounds {
-        self.bounds
+        self.tree.bounds()
     }
     pub fn regions(&self) -> &[crate::CellFragment] {
-        &self.regions
+        &self.parts().0
     }
     pub fn volumes(&self) -> &[crate::MaterialVolume] {
         &self.volumes
     }
     pub fn cells(&self) -> Vec<CellEdit> {
-        stored_cells(&self.chunks)
+        self.parts().1.clone()
     }
+    /// The tree has no masks or overrides, so format 3 needs no roots.
     pub fn root_overrides(&self) -> Vec<crate::RootEdit> {
-        let mut roots: Vec<_> = self
-            .roots
-            .iter()
-            .map(|(&pos, fragments)| crate::RootEdit {
-                pos,
-                fragments: fragments.as_ref().clone(),
-            })
-            .collect();
-        roots.extend(
-            self.overrides
-                .iter()
-                .filter(|&&pos| {
-                    !self.roots.contains_key(&pos)
-                        && self
-                            .chunks
-                            .get(&World::cell_chunk(pos))
-                            .and_then(|c| c.cells[local_index(pos)])
-                            .is_none()
-                })
-                .map(|&pos| crate::RootEdit {
-                    pos,
-                    fragments: Vec::new(),
-                }),
-        );
-        roots.sort_by_key(|r| r.pos);
-        roots
+        Vec::new()
     }
-}
-
-// Old array/object saves remain readable; new snapshots name their format explicitly.
-impl Serialize for World {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if !self.has_regions()
-            && self.bounds == crate::WorldBounds::default()
-            && self.fine.is_empty()
-            && self.volumes().is_empty()
-        {
-            return self.cells().serialize(serializer);
-        }
-        #[derive(Serialize)]
-        struct Parts {
-            format_version: u32,
-            bounds: crate::WorldBounds,
-            regions: Vec<crate::CellFragment>,
-            cells: Vec<CellEdit>,
-            roots: Vec<crate::RootEdit>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            volumes: Vec<crate::MaterialVolume>,
-        }
-        Parts {
-            format_version: crate::WORLD_FORMAT_VERSION,
-            bounds: self.bounds(),
-            regions: self.regions(),
-            cells: self.cells(),
-            roots: self.root_overrides(),
-            volumes: self.volumes().to_vec(),
-        }
-        .serialize(serializer)
-    }
-}
-impl<'de> Deserialize<'de> for World {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Parts {
-            Legacy(Vec<CellEdit>),
-            Current {
-                #[serde(default)]
-                format_version: u32,
-                #[serde(default)]
-                bounds: crate::WorldBounds,
-                #[serde(default)]
-                regions: Vec<crate::CellFragment>,
-                #[serde(default)]
-                cells: Vec<CellEdit>,
-                #[serde(default)]
-                roots: Vec<crate::RootEdit>,
-                #[serde(default)]
-                volumes: Vec<crate::MaterialVolume>,
-            },
-        }
-        match Parts::deserialize(deserializer)? {
-            Parts::Legacy(cells) => Self::from_parts(&cells, &[]),
-            Parts::Current {
-                format_version,
-                bounds,
-                regions,
-                cells,
-                roots,
-                volumes,
-            } => {
-                if format_version > crate::WORLD_FORMAT_VERSION {
-                    return Err(serde::de::Error::custom("Unsupported world format version"));
-                }
-                Self::from_compact_parts(bounds, &regions, &cells, &roots).and_then(|mut world| {
-                    world.replace_volumes(&volumes)?;
-                    Ok(world)
-                })
-            }
-        }
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-fn local_index(pos: CellPos) -> usize {
-    let [x, y, z] = pos.map(|v| v.rem_euclid(CHUNK_SIZE) as usize);
-    x + CHUNK_SIZE as usize * (y + CHUNK_SIZE as usize * z)
 }
 
 impl World {
@@ -370,16 +305,17 @@ impl World {
         Self::default()
     }
 
-    /// Outer coordinate safety envelope; use contains_pos for this world's bounds.
-    pub fn is_valid_pos(pos: CellPos) -> bool {
-        pos.into_iter().all(|v| {
-            (-crate::compact::MAX_WORLD_COORDINATE..crate::compact::MAX_WORLD_COORDINATE)
-                .contains(&v)
-        })
+    pub(crate) fn with_tree(tree: crate::Octree) -> Self {
+        Self {
+            tree,
+            volumes: Arc::new(Vec::new()),
+        }
     }
 
-    pub fn cell_chunk(pos: CellPos) -> ChunkKey {
-        pos.map(|v| v.div_euclid(CHUNK_SIZE))
+    /// Outer coordinate safety envelope; use contains_pos for this world's bounds.
+    pub fn is_valid_pos(pos: CellPos) -> bool {
+        pos.into_iter()
+            .all(|v| (-MAX_WORLD_COORDINATE..MAX_WORLD_COORDINATE).contains(&v))
     }
 
     pub fn from_cells(cells: &[CellEdit]) -> Self {
@@ -390,14 +326,29 @@ impl World {
         world
     }
 
-    pub fn get(&self, pos: CellPos) -> Option<Cell> {
-        self.chunks
-            .get(&Self::cell_chunk(pos))
-            .and_then(|c| c.cells[local_index(pos)])
+    /// A world from format 3's parts, validated as format 3 requires. Cells
+    /// and roots replace the regions in their metre.
+    pub fn from_compact_parts(
+        bounds: crate::WorldBounds,
+        regions: &[crate::CellFragment],
+        cells: &[CellEdit],
+        roots: &[crate::RootEdit],
+    ) -> Result<Self, String> {
+        crate::Octree::from_parts(bounds, regions, cells, roots, &[]).map(Self::with_tree)
     }
 
-    pub(crate) fn has_local_geometry(&self) -> bool {
-        !self.chunks.is_empty() || !self.fine.is_empty()
+    pub fn bounds(&self) -> crate::WorldBounds {
+        self.tree.bounds()
+    }
+
+    pub fn contains_pos(&self, pos: CellPos) -> bool {
+        self.bounds().contains_pos(pos)
+    }
+
+    /// The coarse cell filling a whole metre: a one-metre shaped leaf on whole
+    /// metres, or any metre of a full leaf.
+    pub fn get(&self, pos: CellPos) -> Option<Cell> {
+        self.tree.get(pos)
     }
 
     /// Invalid data is ignored, rather than silently deleting an existing cell.
@@ -405,65 +356,115 @@ impl World {
         if !self.contains_pos(pos) || cell.is_some_and(|c| !c.is_valid()) {
             return;
         }
-        if self.has_regions() {
-            let edit = crate::RootEdit {
-                pos,
-                fragments: cell
-                    .map(|c| vec![crate::CellFragment::from_cell(pos, c)])
-                    .unwrap_or_default(),
-            };
-            let _ = self.apply_root_edits(&[edit]);
-            return;
-        }
-        self.set_storage(pos, cell);
-    }
-
-    pub(crate) fn set_storage(&mut self, pos: CellPos, cell: Option<Cell>) {
-        self.fine.remove(&pos);
-        self.authored_roots.remove(&pos);
-        let key = Self::cell_chunk(pos);
-        let index = local_index(pos);
-        if let Some(cell) = cell {
-            let chunk = Arc::make_mut(self.chunks.entry(key).or_default());
-            if chunk.cells[index].is_none() {
-                chunk.occupied += 1;
-            }
-            chunk.cells[index] = Some(cell);
-        } else if let Some(chunk) = self.chunks.get_mut(&key) {
-            let chunk = Arc::make_mut(chunk);
-            if chunk.cells[index].take().is_some() {
-                chunk.occupied -= 1;
-            }
-            if chunk.occupied == 0 {
-                self.chunks.remove(&key);
-            }
+        let edit = crate::RootEdit {
+            pos,
+            fragments: cell
+                .map(|c| vec![crate::CellFragment::from_cell(pos, c)])
+                .unwrap_or_default(),
+        };
+        let before = self.tree.clone();
+        if self.write_roots(&[edit]).is_ok() && self.tree.changes_from(&before).changed.is_empty() {
+            self.tree = before;
         }
     }
 
+    /// One-metre leaves on whole metres, which format 3 writes as cells.
     pub fn cells(&self) -> Vec<CellEdit> {
-        stored_cells(&self.chunks)
+        self.tree.cells()
+    }
+
+    /// The leaves format 3 writes as regions.
+    pub fn regions(&self) -> Vec<crate::CellFragment> {
+        self.tree.regions()
+    }
+
+    /// The tree has no masks or overrides, so format 3 needs no roots.
+    pub fn root_overrides(&self) -> Vec<crate::RootEdit> {
+        Vec::new()
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.tree.region_count()
+    }
+
+    pub fn override_count(&self) -> usize {
+        0
     }
 
     pub fn snapshot(&self) -> WorldSnapshot {
         WorldSnapshot {
-            bounds: self.bounds,
-            regions: self.compact.sources.clone(),
-            chunks: self.chunks.clone(),
-            roots: self.authored_roots.clone(),
-            overrides: self.overrides.clone(),
-            volumes: self.volumes.authored(),
+            tree: self.tree.clone(),
+            volumes: self.volumes.clone(),
+            parts: Arc::new(OnceLock::new()),
         }
     }
 
+    /// The tree's leaves, internal nodes and estimated bytes by part.
+    pub fn stats(&self) -> crate::TreeStats {
+        self.tree.stats()
+    }
+
+    /// A hash of the tree: equal worlds have equal digests.
+    pub fn digest(&self) -> [u8; 16] {
+        self.tree.digest()
+    }
+
+    /// The format 3 pieces this world has that `before` had not, and the
+    /// ones it lost: every leaf a change split, merged or replaced, including
+    /// leaves split outside the box a write named.
+    pub fn piece_changes(&self, before: &World) -> crate::PieceChanges {
+        let world = self.bounds().fine_box();
+        let changes = self.tree.changes_from(&before.tree);
+        let pieces = |list: &[(crate::NodeBox, crate::Leaf)]| {
+            list.iter()
+                .filter_map(|(at, leaf)| crate::octree::piece_of(*at, leaf, world))
+                .collect()
+        };
+        crate::PieceChanges {
+            removed: pieces(&changes.removed),
+            added: pieces(&changes.added),
+        }
+    }
+
+    /// The mesh units to build again after this world changed from `before`,
+    /// whatever wrote the change: units owning a leaf with solid geometry that
+    /// was removed or added, and units owning a leaf beside changed geometry
+    /// or beside a removed or added shaped leaf or piece. Subtrees the two
+    /// worlds share are skipped, so this costs what changed.
+    pub fn changed_chunks(&self, before: &World) -> Vec<ChunkKey> {
+        self.tree.dirty_units(&self.tree.changes_from(&before.tree))
+    }
+
+    /// Applies a transaction patch in the order the server applied its edit:
+    /// the water and glass boxes, then the metres. The world changes only if
+    /// both apply. The server has checked the world's guard, so the box
+    /// writes are bounded by memory alone, as when loading. Returns the mesh
+    /// units to build again.
+    pub fn apply_patch(
+        &mut self,
+        roots: &[crate::RootEdit],
+        volumes: Option<&[crate::MaterialVolume]>,
+    ) -> Result<Vec<ChunkKey>, String> {
+        let mut world = self.clone();
+        if let Some(volumes) = volumes {
+            world.replace_volumes(volumes)?;
+        }
+        world.apply_root_edits(roots)?;
+        let chunks = world.changed_chunks(self);
+        *self = world;
+        Ok(chunks)
+    }
+
+    /// Mesh units holding solid geometry, by their keys: each unit's minimum
+    /// corner in eighths of a metre.
     pub fn chunk_keys(&self) -> Vec<ChunkKey> {
-        self.chunks
-            .keys()
-            .copied()
-            .chain(self.fine.keys().copied().map(Self::cell_chunk))
-            .chain(self.compact.batches.keys().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+        self.tree.mesh_keys()
+    }
+
+    /// The opaque surfaces of one mesh unit. Water and glass are drawn from
+    /// `volumes()`.
+    pub fn mesh_chunk(&self, key: ChunkKey) -> Mesh {
+        self.tree.mesh_unit(key)
     }
 
     pub fn apply_edits(&mut self, edits: &[CellEdit]) -> Vec<ChunkKey> {
@@ -479,6 +480,27 @@ impl World {
             })
             .collect();
         self.apply_root_edits(&roots).unwrap_or_default()
+    }
+
+    /// Full effective fragments intersecting the query; query edges never add caps.
+    pub fn fragments_in(&self, bounds: crate::FineBox) -> Vec<crate::CellFragment> {
+        self.tree.fragments_in(bounds)
+    }
+
+    pub fn try_roots_in(
+        &self,
+        bounds: crate::FineBox,
+        max_roots: usize,
+    ) -> Result<Vec<crate::RootEdit>, String> {
+        self.tree.try_roots_in(bounds, max_roots)
+    }
+
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        self.tree.raycast(origin, direction, max_distance)
+    }
+
+    pub fn intersects_box(&self, min: Vec3, max: Vec3) -> bool {
+        self.tree.intersects_box(min, max)
     }
 
     /// Foundry: roofed perimeter bays around an open service yard. Upper routes
@@ -669,14 +691,14 @@ impl World {
         w
     }
 
+    /// Fills whole metres with solid cubes of one material, as setting each
+    /// metre would.
     fn fill(&mut self, min: CellPos, max: CellPos, material: u8) {
-        for z in min[2]..max[2] {
-            for y in min[1]..max[1] {
-                for x in min[0]..max[0] {
-                    self.set([x, y, z], Some(Cell::solid(material)));
-                }
-            }
-        }
+        let target = crate::FineBox {
+            min: min.map(|v| v * 8),
+            max: max.map(|v| v * 8),
+        };
+        self.tree.fill_solid(target, [material; 6]);
     }
 }
 
@@ -761,29 +783,6 @@ pub fn block_edits_in(
         }
     }
     edits
-}
-
-fn stored_cells(chunks: &OrdMap<ChunkKey, Arc<Chunk>>) -> Vec<CellEdit> {
-    let mut cells = Vec::new();
-    for (&key, chunk) in chunks {
-        for (index, &cell) in chunk.cells.iter().enumerate() {
-            if cell.is_none() {
-                continue;
-            }
-            let x = index as i32 % CHUNK_SIZE;
-            let y = index as i32 / CHUNK_SIZE % CHUNK_SIZE;
-            let z = index as i32 / (CHUNK_SIZE * CHUNK_SIZE);
-            cells.push(CellEdit {
-                pos: [
-                    key[0] * CHUNK_SIZE + x,
-                    key[1] * CHUNK_SIZE + y,
-                    key[2] * CHUNK_SIZE + z,
-                ],
-                cell,
-            });
-        }
-    }
-    cells
 }
 
 #[cfg(test)]

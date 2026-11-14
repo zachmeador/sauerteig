@@ -7,8 +7,10 @@ use std::time::Duration;
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
 pub fn largest_blueprint(bounds: WorldBounds, material: u8) -> Vec<RootEdit> {
-    // Maximum request: 16,384 roots and 65,536 fragments, four distinct
-    // material strips per root so canonicalization cannot collapse the load.
+    // Maximum request: 16,384 roots and 65,536 fragments, four columns of
+    // distinct materials per root so canonicalization cannot collapse the
+    // load. Each half-metre column is two cubes in the tree, so the world
+    // stays within its piece guard.
     let start = [bounds.min[0] + 2, bounds.max[1] - 18, bounds.min[2] + 2];
     (0..16_384)
         .map(|i| {
@@ -19,14 +21,17 @@ pub fn largest_blueprint(bounds: WorldBounds, material: u8) -> Vec<RootEdit> {
             ];
             let root = FineBox::root(pos);
             let fragments = (0..4)
-                .map(|strip| CellFragment {
-                    bounds: FineBox {
-                        min: [root.min[0] + strip * 2, root.min[1], root.min[2]],
-                        max: [root.min[0] + strip * 2 + 2, root.max[1], root.max[2]],
-                    },
-                    origin: root.min,
-                    size: 8,
-                    cell: Cell::solid((material + strip as u8) % 8),
+                .map(|column| {
+                    let (x, z) = (column % 2 * 4, column / 2 * 4);
+                    CellFragment {
+                        bounds: FineBox {
+                            min: [root.min[0] + x, root.min[1], root.min[2] + z],
+                            max: [root.min[0] + x + 4, root.max[1], root.min[2] + z + 4],
+                        },
+                        origin: root.min,
+                        size: 8,
+                        cell: Cell::solid((material + column as u8) % 8),
+                    }
                 })
                 .collect();
             RootEdit { pos, fragments }

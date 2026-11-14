@@ -8,19 +8,31 @@ fn close(actual: f32, expected: f32) {
     );
 }
 
+/// The mesh unit holding a metre of the default world, whose root starts at
+/// its bounds' minimum corner.
+fn unit_of(pos: CellPos) -> ChunkKey {
+    let root = WorldBounds::default().fine_box().min;
+    let unit = MESH_UNIT_SIZE * 8;
+    std::array::from_fn(|a| root[a] + (pos[a] * 8 - root[a]).div_euclid(unit) * unit)
+}
+
 #[test]
-fn negative_coordinates_are_distinct_and_empty_chunks_are_reclaimed() {
+fn negative_coordinates_are_distinct_and_empty_units_are_reclaimed() {
     let mut world = World::empty();
     world.set([-1, 3, -9], Some(Cell::solid(0)));
     world.set([7, 3, -9], Some(Cell::solid(2)));
-    assert_eq!(World::cell_chunk([-1, 3, -9]), [-1, 0, -2]);
     assert_eq!(world.get([-1, 3, -9]), Some(Cell::solid(0)));
     assert_eq!(world.get([7, 3, -9]), Some(Cell::solid(2)));
-    assert_eq!(world.chunk_keys().len(), 2);
+    assert_ne!(unit_of([-1, 3, -9]), unit_of([7, 3, -9]));
+    assert_eq!(
+        world.chunk_keys(),
+        vec![unit_of([-1, 3, -9]), unit_of([7, 3, -9])]
+    );
     world.set([-1, 3, -9], None);
-    assert_eq!(world.chunk_keys(), vec![[0, 0, -2]]);
+    assert_eq!(world.chunk_keys(), vec![unit_of([7, 3, -9])]);
     world.set([7, 3, -9], None);
     assert!(world.chunk_keys().is_empty());
+    assert_eq!(world.digest(), World::empty().digest());
 }
 
 #[test]
@@ -37,36 +49,33 @@ fn snapshots_roundtrip_only_occupied_cells_and_reject_bad_geometry() {
         }),
     );
     world.set([1, 2, 3], Some(Cell::solid(5)));
-    let json = serde_json::to_value(&world).unwrap();
-    assert_eq!(json.as_array().unwrap().len(), 2);
-    let restored: World = serde_json::from_value(json).unwrap();
+    assert_eq!(world.cells().len(), 2);
+    assert!(world.regions().is_empty());
+    let restored = World::from_parts(&world.cells(), &[]).unwrap();
     assert_eq!(restored.cells(), world.cells());
-    let malformed = r#"[{"pos":[0,0,0],"cell":{"material":0,"heights":[9,8,8,8]}}]"#;
-    assert!(serde_json::from_str::<World>(malformed).is_err());
+    assert_eq!(restored.digest(), world.digest());
+    let malformed: Vec<CellEdit> =
+        serde_json::from_str(r#"[{"pos":[0,0,0],"cell":{"material":0,"heights":[9,8,8,8]}}]"#)
+            .unwrap();
+    assert!(World::from_parts(&malformed, &[]).is_err());
     assert!(!world.contains_pos([0, -1, 0]));
     assert!(!world.contains_pos([64, 0, 0]));
     assert!(!World::is_valid_pos([8192, 0, 0]));
 }
 
 #[test]
-fn group_edits_are_bounded_and_invalidate_neighbor_chunks() {
+fn group_edits_are_bounded_and_rebuild_the_units_they_touch() {
     let edits = block_edits([-4, 0, -4], 8, Some(Cell::solid(0)));
     assert_eq!(edits.len(), 512);
     let mut world = World::empty();
     let dirty = world.apply_edits(&edits);
-    assert_eq!(world.cells().len(), 512);
+    assert!(edits.iter().all(|e| world.get(e.pos) == e.cell));
+    // Equal cubes merge: eight 4 m leaves, owned by the four units that hold
+    // their minimum corners.
+    assert_eq!(world.stats().leaves(), 8);
     assert_eq!(world.chunk_keys().len(), 4);
     assert_eq!(dirty.len(), dirty.iter().collect::<BTreeSet<_>>().len());
-    for key in world.chunk_keys() {
-        assert!(dirty.contains(&key));
-        for axis in 0..3 {
-            for offset in [-1, 1] {
-                let mut adjacent = key;
-                adjacent[axis] += offset;
-                assert!(dirty.contains(&adjacent));
-            }
-        }
-    }
+    assert_eq!(dirty, world.chunk_keys());
     assert!(world.apply_edits(&edits).is_empty());
     assert_eq!(block_edits([63, 47, 63], 8, Some(Cell::solid(0))).len(), 1);
     assert!(block_edits([0, 0, 0], 3, None).is_empty());
@@ -94,17 +103,21 @@ fn invalid_set_does_not_erase_existing_cell() {
 }
 
 #[test]
-fn adjoining_solid_cells_have_no_internal_faces_even_across_chunks() {
+fn adjoining_solid_cells_have_no_internal_faces_even_across_units() {
     let mut world = World::empty();
-    world.set([7, 1, 0], Some(Cell::solid(0)));
-    assert_eq!(world.mesh_chunk([0, 0, 0]).indices.len(), 36);
-    world.set([8, 1, 0], Some(Cell::solid(0)));
-    let meshes = [world.mesh_chunk([0, 0, 0]), world.mesh_chunk([1, 0, 0])];
+    world.set([31, 1, 0], Some(Cell::solid(0)));
+    assert_eq!(world.mesh_chunk(unit_of([31, 1, 0])).indices.len(), 36);
+    world.set([32, 1, 0], Some(Cell::solid(1)));
+    assert_ne!(unit_of([31, 1, 0]), unit_of([32, 1, 0]));
+    let meshes = [
+        world.mesh_chunk(unit_of([31, 1, 0])),
+        world.mesh_chunk(unit_of([32, 1, 0])),
+    ];
     assert_eq!(meshes.iter().map(|m| m.indices.len()).sum::<usize>(), 60);
     for mesh in meshes {
         for vertex in mesh.vertices {
             close(Vec3::from_array(vertex.normal).length(), 1.0);
-            assert!(!(vertex.position[0] == 8.0 && vertex.normal[0].abs() > 0.99));
+            assert!(!(vertex.position[0] == 32.0 && vertex.normal[0].abs() > 0.99));
         }
     }
 }
@@ -129,7 +142,8 @@ fn rays_mesh_and_collision_share_the_deformed_top() {
         close(hit.normal.x, -std::f32::consts::FRAC_1_SQRT_2);
         close(hit.normal.y, std::f32::consts::FRAC_1_SQRT_2);
     }
-    let mesh = world.mesh_chunk([0, 0, 0]);
+    let mesh = world.mesh_chunk(unit_of([0, 0, 0]));
+    assert!(!mesh.vertices.is_empty());
     for vertex in mesh.vertices.iter().filter(|v| v.normal[1] > 0.1) {
         close(vertex.position[1], vertex.position[0]);
     }
@@ -306,15 +320,13 @@ fn partial_neighbors_expose_only_the_step_between_them() {
 #[test]
 fn arena_spawns_are_clear_and_supported() {
     let world = World::arena();
-    assert!(world.cells().len() > 3000);
+    assert!(world.stats().leaves() > 1000);
     for index in 0..8 {
         let mut player = Player::new(index as u64, "test".into());
         player.position = spawn_point(index);
-        assert!(world.cells().iter().all(|e| !player_intersects_cell(
-            &player,
-            e.pos,
-            e.cell.unwrap()
-        )));
+        let p = player.position;
+        let reach = Vec3::new(PLAYER_RADIUS, 0.0, PLAYER_RADIUS);
+        assert!(!world.intersects_box(p - reach, p + reach + Vec3::Y * PLAYER_HEIGHT));
         let ground = world.raycast(player.position, Vec3::NEG_Y, 0.1).unwrap();
         close(ground.point.y, 1.0);
     }

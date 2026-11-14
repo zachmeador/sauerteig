@@ -7,7 +7,7 @@ use crate::{
     persistence::SavedSnapshot,
     Retired, Session,
 };
-use sauerteig_core::{ClientMessage, Player, ServerMessage};
+use sauerteig_core::{ClientMessage, Player, ServerMessage, TreeStats};
 use serde::Serialize;
 use std::{
     io::Write,
@@ -30,7 +30,40 @@ pub(crate) struct Health {
     pub tick: u64,
     pub revision: u64,
     pub timing: crate::metrics::Report,
+    pub world: WorldHealth,
     pub error: Option<String>,
+}
+
+/// The world's octree: leaves by kind, internal nodes, and estimated bytes
+/// by part.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct WorldHealth {
+    pub leaves: usize,
+    pub full_leaves: usize,
+    pub shaped_leaves: usize,
+    pub piece_leaves: usize,
+    pub material_leaves: usize,
+    pub internal_nodes: usize,
+    pub bytes: usize,
+    pub branch_bytes: usize,
+    pub shaped_bytes: usize,
+    pub piece_bytes: usize,
+}
+impl From<TreeStats> for WorldHealth {
+    fn from(stats: TreeStats) -> Self {
+        Self {
+            leaves: stats.leaves(),
+            full_leaves: stats.full_leaves,
+            shaped_leaves: stats.shaped_leaves,
+            piece_leaves: stats.piece_leaves,
+            material_leaves: stats.material_leaves,
+            internal_nodes: stats.internal_nodes,
+            bytes: stats.bytes(),
+            branch_bytes: stats.branch_bytes,
+            shaped_bytes: stats.shaped_bytes,
+            piece_bytes: stats.piece_bytes,
+        }
+    }
 }
 pub(crate) struct Welcome {
     pub id: u64,
@@ -154,6 +187,7 @@ pub(crate) fn start(
         tick: session.tick,
         revision: session.revision,
         timing: metrics.report(),
+        world: session.world_stats.into(),
         error: None,
     });
     let thread = thread::Builder::new()
@@ -240,6 +274,7 @@ fn run(
                 tick: session.tick,
                 revision: session.revision,
                 timing,
+                world: session.world_stats.into(),
                 error: None,
             });
             continue;
@@ -409,6 +444,7 @@ mod tests {
             tick: 0,
             revision: 0,
             timing: Metrics::default().report(),
+            world: WorldHealth::default(),
             error: None,
         });
         let (state, running) = watch::channel(State::Running);

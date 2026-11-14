@@ -56,19 +56,29 @@ impl SavedSnapshot {
     }
 }
 
+#[cfg(test)]
 pub(super) fn load_world(path: &Path) -> Result<SavedWorld, String> {
+    open_world(path).map(|(saved, _)| saved)
+}
+
+/// Reads and validates a saved world, and builds it once. A missing file is
+/// the arena.
+pub(super) fn open_world(path: &Path) -> Result<(SavedWorld, World), String> {
     if !path.exists() {
-        return Ok(SavedWorld {
+        let arena = World::arena();
+        let snapshot = arena.snapshot();
+        let saved = SavedWorld {
             revision: 0,
             format_version: WORLD_FORMAT_VERSION,
-            bounds: WorldBounds::default(),
-            regions: Vec::new(),
-            cells: World::arena().cells(),
+            bounds: snapshot.bounds(),
+            regions: snapshot.regions().to_vec(),
+            cells: snapshot.cells(),
             roots: Vec::new(),
             volumes: Vec::new(),
             objects: arena_objects(),
             next_object: 0,
-        });
+        };
+        return Ok((saved, arena));
     }
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if metadata.len() > MAX_SAVE_BYTES as u64 {
@@ -119,16 +129,22 @@ pub(super) fn load_world(path: &Path) -> Result<SavedWorld, String> {
     {
         return Err(crate::SNAPSHOT_LIMIT_ERROR.into());
     }
-    let mut world =
-        World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)?;
-    world.replace_volumes(&saved.volumes)?;
+    let world = build_world(&saved)?;
     for object in &saved.objects {
         let position = object.position.floor().as_ivec3().to_array();
         if !saved.bounds.contains_pos(position) {
             return Err("Saved object is outside the world bounds.".into());
         }
     }
-    Ok(saved)
+    Ok((saved, world))
+}
+
+/// The world a save holds.
+pub(super) fn build_world(saved: &SavedWorld) -> Result<World, String> {
+    let mut world =
+        World::from_compact_parts(saved.bounds, &saved.regions, &saved.cells, &saved.roots)?;
+    world.replace_volumes(&saved.volumes)?;
+    Ok(world)
 }
 
 #[cfg(test)]

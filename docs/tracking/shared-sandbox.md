@@ -19,19 +19,17 @@ Nobody's game hitches when someone else pastes, saves, or joins.
   stage 2's formats carry them.
 - **The simulation has one owner.** It runs on its own thread, and saves, joins,
   and edit preparation work from shared snapshots off that thread (stage 1).
-- **A joining player still receives the whole world as one JSON message,** about
-  45 MB for the largest archive maps.
+- **A joining player still receives the whole world as one JSON message:**
+  30.9 MB for the_cube1m since octree O1a, down from 44.9 MB.
   - The server now waits through a 30 second stall rather than a fixed 5 second
     limit.
   - The client still builds and meshes the world on the main thread, which
     freezes the game.
-- **The region cap keeps the largest archive map out.** nub1 (434,233 regions)
-  is refused only by the 400,000-region cap (`MAX_COMPACT_REGIONS`), which
-  octree O1a removes. It fits every other limit, with 5.8% of the 63 MiB
-  geometry budget left for building (measured 2026-11-12 on the M5 Pro). nub1
-  is an OCTA 27 map, which the importer can't read yet
-  ([legacy import](legacy-import.md) I1), so that measurement converted it
-  through a hand-made header shim.
+- **The largest archive map loads.** Octree O1a removed the 400,000-region
+  cap that refused nub1 (434,233 regions). A copy of nub1 now converts with the
+  stock importer, the standalone server opens it in 0.34–0.45 s with 177 MiB,
+  and a headless client joins in 0.56 s, reading 53.1 MB (measured 2026-11-14
+  on the M5 Pro, release builds). Nobody has looked at it in the app yet.
 - **The wire format is still JSON** over one reliable WebSocket. Protocol types
   carry JSON-specific serde attributes, so a compact encoding needs a codec
   boundary.
@@ -118,7 +116,7 @@ What players get:
 - Hosting opens a big world in under a second and uses far less memory
   (octree O1a).
 - Joining never freezes the window and shows progress. The largest library maps
-  download about 0.2 MB instead of 45 MB and are playable in about a second on a
+  download about 0.2 MB instead of 31 MB and are playable in about a second on a
   LAN (estimate).
 - No more "busy, try again": commits never wait for a slow or joining player,
   and a player who falls behind catches up.
@@ -134,8 +132,9 @@ Why: every byte cap that keeps big maps out comes from one prototype choice.
 Each joiner receives the whole world as one JSON message (`connection` in the
 server's `network.rs`). The client's WebSocket library limits a message to
 64 MiB by default, and ewebsock 0.8 can't change that. The snapshot budget, the
-save cap, the importer cap, the write buffer and the 400,000-region cap, raised
-"within snapshot limits" in a622226, all follow from it. None is a browser rule
+save cap, the importer cap, the write buffer and the 400,000-region cap (raised
+"within snapshot limits" in a622226, and removed by octree O1a) all follow from
+it. None is a browser rule
 or a maintainer decision, so stage 2 removes the cause instead of raising the
 numbers.
 
@@ -191,13 +190,13 @@ N3 and 2g is checked against the octree's measurements.
 ### World size
 
 - **One memory budget replaces every remaining size cap.** The octree removes
-  the region cap (`MAX_COMPACT_REGIONS`) and the water and glass box caps. 2d
-  removes the 786,432-fragment cap (`MAX_WORLD_FRAGMENTS`), the 1,024-object
-  cap (`MAX_OBJECTS`, repeated in the importer), and every 64 MiB cap: the
-  snapshot budget (`MAX_WORLD_SNAPSHOT_BYTES`, `MAX_GEOMETRY_BYTES`), the save
-  cap (`MAX_SAVE_BYTES`), the importer's `MAX_WORLD_BYTES` and the write buffer
-  (`OUTBOUND_WRITE_BYTES`). Nor is the piece cap of an earlier draft
-  (`MAX_WORLD_PIECES`) added.
+  the region cap (O1a) and the water and glass box caps (O2). 2d removes the
+  786,432-piece guard (core's `MAX_WORLD_PIECES`, which the server checks
+  against the tree's leaves and, as `MAX_WORLD_FRAGMENTS`, against format 3's
+  pieces), the 1,024-object cap (`MAX_OBJECTS`, repeated in the importer), and
+  every 64 MiB cap: the snapshot budget (`MAX_WORLD_SNAPSHOT_BYTES`,
+  `MAX_GEOMETRY_BYTES`), the save cap (`MAX_SAVE_BYTES`), the importer's
+  `MAX_WORLD_BYTES` and the write buffer (`OUTBOUND_WRITE_BYTES`).
 - **The budget counts estimated memory.** One core function estimates what a
   joining client needs: the tree's leaves and nodes, the triangles of its
   meshes, objects and lights, plus a fixed term for the renderer. A cube count
@@ -851,15 +850,15 @@ doesn't snap.
 - **Limits:**
   - The budget check runs on commits only (see World size). The importer
     reports the estimate and refuses nothing for size.
-  - Delete `MAX_WORLD_FRAGMENTS`, `MAX_OBJECTS` with the importer's
-    1,024-object check, `MAX_WORLD_SNAPSHOT_BYTES`, `SNAPSHOT_ENVELOPE_BYTES`
-    and `MAX_GEOMETRY_BYTES` with the JSON accounting (`json_bytes`,
-    `snapshot_geometry_bytes` and their callers), the importer's
-    `MAX_WORLD_BYTES`, the write-progress wrapper
-    (`network/transport.rs`) and the Welcome read-timeout exemption (`welcoming`
-    in `read_commands`), and the limit of 2,048 object changes per edit
-    (`MAX_OBJECTS * 2` in `edits.rs`); objects count in the estimate. Keep the
-    60 s read timeout and the 15 s pings.
+  - Delete `MAX_WORLD_FRAGMENTS` with core's `MAX_WORLD_PIECES`, `MAX_OBJECTS`
+    with the importer's 1,024-object check, `MAX_WORLD_SNAPSHOT_BYTES`,
+    `SNAPSHOT_ENVELOPE_BYTES` and `MAX_GEOMETRY_BYTES` with the JSON accounting
+    (`json_bytes`, `snapshot_geometry_bytes` and their callers), the importer's
+    `MAX_WORLD_BYTES`, the write-progress wrapper (`network/transport.rs`) and
+    the Welcome read-timeout exemption (`welcoming` in `read_commands`), and the
+    limit of 2,048 object changes per edit (`MAX_OBJECTS * 2` in `edits.rs`);
+    objects count in the estimate. Keep the 60 s read timeout and the 15 s
+    pings.
   - JSON saves: the loader accepts files up to at least 1 GiB, because a world
     within the budget can pass 512 MiB of JSON at about 300–350 B per shaped
     piece (computed). The writer refuses any save the loader would refuse,
@@ -1082,8 +1081,8 @@ State: waits for 2d. Medium.
 - **Autosave** within 1 s of the first unsaved change for worlds saved as
   `world.sauerteig`, down from the save and quit fixes' 10 s, now that those
   saves take milliseconds. Worlds that stay JSON keep the 10 s limit: each of
-  their saves rewrites the whole file, 45 MB for the_cube1m and 62 MB for
-  nub1.
+  their saves rewrites the whole file, about 31 MB for the_cube1m since octree
+  O1a.
 - **Touches:** core `wire` (format 4), the server's `persistence.rs`,
   `network.rs` (the save worker) and `lib.rs` (`Config`), the client's
   `world_saves.rs`, `hosting.rs` and library screen (`launcher.rs`), and the
