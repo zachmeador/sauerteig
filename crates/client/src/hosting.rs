@@ -270,11 +270,13 @@ mod tests {
         drop(socket);
     }
 
-    #[test]
-    fn an_edit_survives_stopping_and_reopening_the_host() {
-        use sauerteig_core::{ClientMessage, ObjectKind, ServerMessage, Vec3};
-        let directory = TestDirectory::new();
-        let mut host = HostedServer::start(directory.world(), false).unwrap();
+    /// Connects as a player, turns editing on and places a light, returning
+    /// once the server has applied it. Dropping the sender leaves.
+    fn place_light(
+        host: &HostedServer,
+        position: sauerteig_core::Vec3,
+    ) -> (ewebsock::WsSender, ewebsock::WsReceiver) {
+        use sauerteig_core::{ClientMessage, ObjectKind, ServerMessage};
         let (mut sender, receiver) =
             ewebsock::connect(host.endpoint(), ewebsock::Options::default()).unwrap();
         receive(&receiver, |message| {
@@ -296,7 +298,6 @@ mod tests {
                 }
             )
         });
-        let position = Vec3::new(0.0, 40.0, 0.0);
         sender.send(ewebsock::WsMessage::Text(
             serde_json::to_string(&ClientMessage::PlaceObject {
                 kind: ObjectKind::Light,
@@ -309,6 +310,24 @@ mod tests {
             &receiver,
             |message| matches!(message, ServerMessage::Objects { objects, .. } if objects.iter().any(|object| object.position == position)),
         );
+        (sender, receiver)
+    }
+
+    fn wait_for_file(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !path.is_file() {
+            assert!(Instant::now() < deadline, "the first save never came");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn an_edit_survives_stopping_and_reopening_the_host() {
+        use sauerteig_core::{ObjectKind, ServerMessage, Vec3};
+        let directory = TestDirectory::new();
+        let mut host = HostedServer::start(directory.world(), false).unwrap();
+        let position = Vec3::new(0.0, 40.0, 0.0);
+        let (sender, _receiver) = place_light(&host, position);
         // Stop immediately after the edit is acknowledged, before waiting for
         // autosave. Reopening through the public protocol proves final-save use.
         drop(sender);
@@ -341,14 +360,40 @@ mod tests {
 
     #[test]
     fn final_save_failure_is_returned_to_the_session() {
+        use sauerteig_core::Vec3;
         let directory = TestDirectory::new();
         let mut host = HostedServer::start(directory.world(), false).unwrap();
-        let socket = open_websocket(&host);
+        // A new world is saved when the server starts. After that, only a
+        // change makes the final save write again.
+        wait_for_file(&directory.world());
+        let (sender, _receiver) = place_light(&host, Vec3::new(0.0, 40.0, 0.0));
         // The running server has loaded a world, then its save destination
         // becomes a directory, so the final atomic replacement must fail.
+        fs::remove_file(directory.world()).unwrap();
         fs::create_dir(directory.world()).unwrap();
         host.stop();
         assert!(wait_for_completion(&mut host).is_err());
-        drop(socket);
+        drop(sender);
+    }
+
+    #[test]
+    fn a_session_without_changes_does_not_rewrite_the_world() {
+        let directory = TestDirectory::new();
+        let mut first = HostedServer::start(directory.world(), false).unwrap();
+        wait_for_file(&directory.world());
+        first.shutdown_blocking().unwrap();
+        let (bytes, stamp) = (
+            fs::read(directory.world()).unwrap(),
+            fs::metadata(directory.world()).unwrap().modified().unwrap(),
+        );
+        thread::sleep(Duration::from_millis(50));
+        let mut second = HostedServer::start(directory.world(), false).unwrap();
+        thread::sleep(Duration::from_millis(1200));
+        second.shutdown_blocking().unwrap();
+        assert_eq!(fs::read(directory.world()).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(directory.world()).unwrap().modified().unwrap(),
+            stamp
+        );
     }
 }

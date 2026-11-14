@@ -161,7 +161,50 @@ fn write_guarded(
         let _ = std::fs::remove_file(&temporary);
         return Err("Save cancelled because the simulation failed.".into());
     }
-    std::fs::rename(temporary, path).map_err(|e| e.to_string())
+    durable_rename(&temporary, path).map_err(|e| e.to_string())
+}
+
+/// Replaces `to` with `from` and returns once the replacement is on disk, so a
+/// power cut right after a save keeps either the old world or the new one.
+#[cfg(unix)]
+fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)?;
+    // The rename lives in the folder, not the file, so the folder needs its own
+    // sync. A folder that cannot be opened to sync (as on some network shares)
+    // is not a failed save.
+    let folder = to.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Ok(folder) = std::fs::File::open(folder.unwrap_or(Path::new("."))) {
+        folder.sync_all()?;
+    }
+    Ok(())
+}
+/// Windows has no folder sync; `MOVEFILE_WRITE_THROUGH` makes the move itself
+/// return only once it is on disk.
+#[cfg(windows)]
+fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain([0]).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: `from` and `to` are NUL-terminated UTF-16 buffers that stay alive
+    // and unmoved for the whole call, and `MoveFileExW` keeps neither pointer.
+    let moved = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(any(unix, windows)))]
+fn durable_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 fn legacy_format_version() -> u32 {

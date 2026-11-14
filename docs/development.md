@@ -51,9 +51,15 @@ world on an available port. Local hosting binds loopback unless the LAN checkbox
 is selected. **Main menu** releases gameplay input and keeps the current session
 running; **Resume** returns to it. Choosing another world or server drains pending
 edits and local writes, closes the old connection, and waits for a hosted world's
-final save before opening the destination. Closing the window follows the same
-save path. A sync or save error blocks the switch and remains visible. A world lock
-prevents two app instances from hosting or duplicating the same managed save.
+final save before opening the destination. Every way of quitting follows the same
+save path: closing the window, including a minimized one, and the application's
+own Quit, such as Cmd+Q on macOS, which waits in winit's `exiting` handler. The
+per-frame updates (the host, the game's network and simulation, and a session
+change) run in a tick that `about_to_wait` drives, once per drawn frame or every
+50 ms while the window is minimized, covered or otherwise not redrawn, so a
+change finishes without drawing. A sync or save error blocks the switch and
+remains visible. A world lock prevents two app instances from hosting or
+duplicating the same managed save.
 
 Managed saves live under the application-data directory in `worlds/<id>/`, with
 separate display metadata and an opaque `world.json`. Import and duplicate copy
@@ -69,8 +75,14 @@ The standalone server remains available for dedicated hosting:
 | `--world PATH` | `.local/world.json` | `SAUERTEIG_WORLD` |
 | `--no-edit` | Editing allowed | — |
 
-World changes save after a short delay, on explicit save, and on graceful
-shutdown, using buffered writes and an atomic file replacement. Leaving a session
+World changes save after 750 ms without edits, and at the latest 9 s after the
+first unsaved change however long editing continues (the save worker polls once
+a second, which keeps that under 10 s). They also save on explicit save and on
+graceful shutdown, which writes only if something changed since the last save.
+A world with no file yet is saved when the server starts. Writes are buffered
+into a temporary file that is synced, then renamed over the world, and the
+rename is made durable: macOS and Linux sync the world's folder, and Windows
+renames with `MoveFileExW` and `MOVEFILE_WRITE_THROUGH`. Leaving a session
 waits for queued edits, an ordered server acknowledgment, and local document writes.
 An existing file is loaded at startup; an unused path starts a fresh
 arena. Stop the server before replacing its save file.
@@ -119,7 +131,12 @@ connect to `/ws`. Names are display labels, with no account authentication.
 
 Shared geometry, material volumes, and objects live in the server's JSON save.
 Blueprints, settings, and the home screen's remembered choices are client-local,
-in the OS application-data folder: `~/Library/Application Support/Sauerteig`
+in the OS application-data folder, and the home screen's choices save through
+the same storage worker as the other documents. A failure to start, such as a
+graphics adapter the renderer can't use, is shown in a native dialog
+(`MessageBoxW` on Windows, `NSAlert` on macOS, `zenity` or `kdialog` on Linux
+when installed), printed to stderr and appended to `sauerteig.log` in that
+folder. The folder is `~/Library/Application Support/Sauerteig`
 on macOS, `%LOCALAPPDATA%\Sauerteig` on Windows, and `$XDG_DATA_HOME/sauerteig`
 (by default `~/.local/share/sauerteig`) on Linux. `SAUERTEIG_DATA_DIR`
 overrides it.
@@ -191,14 +208,20 @@ adapters without compute shaders or enough storage buffers. The device request
 (`Limits::default()` in `Renderer::create`) already turns such adapters away,
 so only the capture tool's `--tier` flag reaches these paths.
 
-Shaders compile without wgpu's forced loop bounding, through the one `unsafe`
-function in the workspace, `shaders::trusted` in `render/shaders.rs`. On Metal the
+Shaders compile without wgpu's forced loop bounding, through `shaders::trusted`
+in `render/shaders.rs`. On Metal the
 forced bounding makes the compiler keep every loop by reading a volatile flag in
 each iteration, which made the clustered light loop about three times slower (stage
 1's sun filtering sped up as well). Every embedded loop has a bounded trip count,
 the clustered one at most 8 mask words of 32 bits that each lose a set bit per
 iteration, and runtime bounds checks stay on. Keep both true when changing a shader,
 as the function's `SAFETY` comment says.
+
+`unsafe` appears in four places, each with a `SAFETY` comment: `shaders::trusted`,
+the server's `durable_rename` on Windows (`MoveFileExW` in `persistence.rs`),
+and the startup-failure dialogs in the client's `failure.rs` (`MessageBoxW` on
+Windows and `NSAlert` on macOS). Keep new `unsafe` out of other code, and add it
+to this list when it is unavoidable.
 
 Nodes have no visible model in play; their guides do not cast shadows. Lamp props
 are independent decoration, with emissive surfaces but no automatic local light.

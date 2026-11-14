@@ -318,7 +318,7 @@ octree O1a.
 
 #### Save and quit fixes
 
-State: ready. Small to medium. It goes first in wave 1.
+State: merged on 2026-11-14. The in-app checks below wait for the maintainer.
 
 - **Decided:** close known ways of losing edits or rewriting a world for
   nothing, ahead of 2e's compact saves.
@@ -382,19 +382,112 @@ State: ready. Small to medium. It goes first in wave 1.
   - [ ] A forced startup failure shows a message, and the log file names the
     error.
 - **Tests:**
-  - [ ] Server tests for the skipped final save, a new world's first save and
+  - [x] Server tests for the skipped final save, a new world's first save and
     the 10 s limit.
-  - [ ] Hosting tests that relied on a save after every session follow the new
+  - [x] Hosting tests that relied on a save after every session follow the new
     rule: `final_save_failure_is_returned_to_the_session` makes an edit so
     that a final save runs, and
     `repeated_host_sessions_save_and_release_the_listener` and
     `dropping_host_waits_for_save_and_lan_requires_explicit_opt_in` now rely on
     a new world's first save.
-  - [ ] Session preferences still save and load.
+  - [x] Session preferences still save and load.
 - **Record:** which quit paths were checked on which systems, and whether the
   Windows code was compiled, for example with
   `cargo check --target x86_64-pc-windows-msvc`, or waits for
   [platforms](platforms.md) stage 1's Windows job.
+
+##### Result
+
+What changed:
+
+- **Server.** `Session` tracks `dirty_since`, the age of the oldest unsaved
+  change, next to the quiet timer. A save is due after 750 ms without edits or
+  once a change is 9 s old (`AUTOSAVE_LIMIT`; the save worker polls once a
+  second, so a save starts within 10 s). A save that finishes while newer
+  edits exist leaves them dirty with the age of the save's snapshot.
+  `Command::Stop` returns a snapshot only when something is unsaved. A world
+  whose file doesn't exist when the server starts is marked for saving at
+  once, so it has its file within a second, or at the final save if the
+  server stops first. `write_guarded` ends in `durable_rename`: rename then
+  fsync of the folder on macOS and Linux, and `MoveFileExW` with
+  `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` on Windows.
+- **Client.** The per-frame updates moved into `Runtime::tick`, which
+  `about_to_wait` runs once per drawn frame, or every 50 ms while the window
+  isn't being redrawn (minimized, occluded, or no redraw for 250 ms; the last
+  case covers Wayland, which reports neither state). Then the control flow
+  waits for the next tick instead of polling, and each tick still asks for a
+  redraw so that drawing resumes by itself. `App::exiting` runs
+  `Runtime::finish_for_exit`, which starts the normal close and ticks until the
+  host's final save is done (waiting at most 20 s for the server to confirm
+  edits first; `Drop` then still waits for the host's save with no limit). A
+  failed final save at that point shows the dialog. Session preferences are
+  queued on the storage worker (`Work::Session`), counted in
+  `pending_writes`, and failures come back through `take_write_error`.
+  Startup failures go through the new `failure` module: stderr, an appended
+  `sauerteig.log` in the data folder (restarted once it passes 256 KiB), and a
+  native dialog. The window-system and `run_app` errors that used to `expect`
+  now report the same way.
+- **New `unsafe`.** `MoveFileExW` (server, Windows), `MessageBoxW` (client,
+  Windows) and `NSAlert` calls (client, macOS), each with a `SAFETY` comment,
+  all named in `docs/development.md`. New dependencies: `windows-sys 0.52` in
+  both crates on Windows, and `objc2 0.5`, `objc2-app-kit 0.2` and
+  `objc2-foundation 0.2` on macOS, the versions winit already builds.
+  `Cargo.lock` gained only those dependency edges, with no new packages.
+
+Checks, run in the worktree on the M5 Pro (macOS):
+
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D
+  warnings` and `cargo test --workspace --locked`: clean and passing (client 173
+  passed and 6 ignored, server 66).
+- New server tests: `a_save_waits_for_quiet_but_never_longer_than_the_autosave_limit`,
+  `changes_made_during_a_save_stay_unsaved_and_keep_their_age`,
+  `replacing_a_world_file_leaves_only_the_new_world`,
+  `a_session_without_changes_leaves_the_world_file_untouched`,
+  `an_edit_is_saved_by_the_final_save_when_the_server_stops_at_once` and
+  `a_new_world_is_saved_once_when_the_server_starts` (stopping at once and
+  waiting for the first save). New client tests:
+  `a_session_without_changes_does_not_rewrite_the_world`,
+  `session_choices_save_on_the_storage_worker_and_failures_are_reported`, and
+  the log tests in `failure.rs`. `final_save_failure_is_returned_to_the_session`
+  now places a light after the first save.
+- Windows: `cargo check --target x86_64-pc-windows-msvc -p sauerteig-client -p
+  sauerteig-server --locked` (also `--all-targets` for the client) compiles,
+  after the target was added with rustup. It is a check, not a link or a run,
+  so `MoveFileExW` and `MessageBoxW` have not run.
+- Linux: `cargo check --target x86_64-unknown-linux-gnu -p sauerteig-server`
+  compiles. The client was not checked for Linux, whose audio and window
+  libraries are missing here, so the `zenity` and `kdialog` code was compiled
+  alone with `rustc` and run once with neither tool installed, which does
+  nothing, as intended.
+- Observed on macOS: with the renderer forced to fail temporarily (a patch that
+  was removed again), the app wrote the error to stderr and appended it to
+  `sauerteig.log` in the data folder, then stayed up, as it does while a modal
+  alert is open. A first attempt showed that winit's run-loop observer panics
+  if the alert opens after the event loop ended, so the dialog is shown inside
+  the loop's callback. I could not see the alert itself.
+
+Not observed, for the maintainer (the acceptance boxes above stay unticked):
+
+- Whether `world.json`'s time stays put when a world is opened and quit, and
+  advances every 10 s during steady editing. The server tests cover the logic
+  with the hosted server, not the app.
+- Closing the window and the menu's Quit or Cmd+Q, including `exiting`
+  running on Cmd+Q (winit's source calls it from `applicationWillTerminate`),
+  while hosting with a fresh edit, and the same from a minimized window.
+- That the alert shows on macOS, and everything on Windows and Linux.
+
+Choices and gaps:
+
+- The 9 s limit, not 10 s, so that the one-second poll keeps saves within 10 s.
+- The tick is once per drawn frame, so the on-screen fps figure still follows
+  frames, and mouse events between frames don't tick extra. While idle it is
+  20 Hz, which also keeps the connection alive in a minimized window.
+- A session-preferences write that fails now surfaces when a session change
+  or the quit drain next takes write errors, not on the home screen at once.
+- Client documents other than the world (`settings.json`, `blueprints.json`
+  and the session file) still use a plain rename without a folder sync.
+- The quit drain gives up on waiting for the server to confirm edits after
+  20 s, then closes anyway; the host's final save is always waited for.
 
 #### 2b. Joining without freezing
 

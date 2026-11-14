@@ -629,10 +629,16 @@ async fn serve_inner(
 ) -> Result<(), String> {
     let path = config.world_path.clone();
     let editing = config.editing_allowed;
-    let session =
-        tokio::task::spawn_blocking(move || Session::from_saved(load_world(&path)?, editing))
-            .await
-            .map_err(|e| e.to_string())??;
+    let session = tokio::task::spawn_blocking(move || {
+        let fresh = !path.exists();
+        let mut session = Session::from_saved(load_world(&path)?, editing)?;
+        if fresh {
+            session.save_now();
+        }
+        Ok::<_, String>(session)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let (state, _) = watch::channel(RunState::Running);
     let (retire, retired) = mpsc::unbounded_channel();
     let (simulation, published_health, thread) = simulation::start(session, state.clone(), retire)?;
@@ -690,12 +696,13 @@ async fn serve_inner(
             .request(|reply| Command::Stop { reply })
             .await
         {
-            Ok(saved) => {
+            Ok(Some(saved)) => {
                 let path = app.config.world_path.clone();
                 tokio::task::spawn_blocking(move || write_snapshot(&path, &saved, || true))
                     .await
                     .map_err(|e| e.to_string())?
             }
+            Ok(None) => Ok(()),
             Err(error) => Err(error),
         }
     };

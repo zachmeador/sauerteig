@@ -49,6 +49,10 @@ const SNAPSHOT_LIMIT_ERROR: &str =
 const MAX_PROJECTILES: usize = 64;
 const MAX_INPUT_BACKLOG: usize = 64;
 const SAVE_DELAY: Duration = Duration::from_millis(750);
+/// The longest an unsaved change waits, even while editing continues. The save
+/// worker polls once a second, so the wait is a poll shorter than the 10 s
+/// promised to players.
+const AUTOSAVE_LIMIT: Duration = Duration::from_secs(9);
 const SHOT_DISTANCE: f32 = 128.0;
 
 #[derive(Clone, Debug)]
@@ -205,6 +209,10 @@ struct Session {
     next_object: u32,
     editing_allowed: bool,
     dirty: bool,
+    /// When the oldest change not yet in a finished save was made.
+    dirty_since: Instant,
+    /// When the latest save snapshot was taken.
+    snapshot_at: Instant,
     last_edit: Instant,
 }
 
@@ -292,6 +300,8 @@ impl Session {
             next_object,
             editing_allowed,
             dirty: false,
+            dirty_since: Instant::now(),
+            snapshot_at: Instant::now(),
             last_edit: Instant::now(),
         })
     }
@@ -322,8 +332,39 @@ impl Session {
 
     fn changed(&mut self) {
         self.revision += 1;
-        self.dirty = true;
+        self.mark_unsaved();
         self.last_edit = Instant::now();
+    }
+    fn mark_unsaved(&mut self) {
+        if !self.dirty {
+            self.dirty = true;
+            self.dirty_since = Instant::now();
+        }
+    }
+    /// Makes the next save poll write, as a new world and a save request need.
+    fn save_now(&mut self) {
+        self.mark_unsaved();
+        self.last_edit = Instant::now() - SAVE_DELAY;
+    }
+    /// Quiet for `SAVE_DELAY`, or unsaved for `AUTOSAVE_LIMIT`.
+    fn save_due(&self) -> bool {
+        self.dirty
+            && (self.last_edit.elapsed() >= SAVE_DELAY
+                || self.dirty_since.elapsed() >= AUTOSAVE_LIMIT)
+    }
+    /// Takes the snapshot a save writes, and notes when it was taken.
+    fn begin_save(&mut self) -> persistence::SavedSnapshot {
+        self.snapshot_at = Instant::now();
+        self.saved_snapshot()
+    }
+    /// A save of `revision` finished. Changes made while it wrote stay unsaved,
+    /// and are as old as the snapshot.
+    fn finish_save(&mut self, revision: u64) {
+        if self.revision == revision {
+            self.dirty = false;
+        } else {
+            self.dirty_since = self.snapshot_at;
+        }
     }
 
     fn players(&self) -> Vec<Player> {
@@ -565,8 +606,7 @@ impl Session {
 
             ClientMessage::Save => {
                 self.require_editor(id)?;
-                self.dirty = true;
-                self.last_edit = Instant::now() - SAVE_DELAY;
+                self.save_now();
                 self.send(
                     id,
                     ServerMessage::Notice {

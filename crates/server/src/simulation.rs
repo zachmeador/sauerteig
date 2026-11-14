@@ -5,7 +5,7 @@ use crate::{
     metrics::Metrics,
     outbound::{Events, Packet},
     persistence::SavedSnapshot,
-    Retired, Session, SAVE_DELAY,
+    Retired, Session,
 };
 use sauerteig_core::{ClientMessage, Player, ServerMessage};
 use serde::Serialize;
@@ -99,7 +99,7 @@ pub(crate) enum Command {
         revision: u64,
     },
     Stop {
-        reply: oneshot::Sender<SavedSnapshot>,
+        reply: oneshot::Sender<Option<SavedSnapshot>>,
     },
     #[cfg(test)]
     Panic,
@@ -318,20 +318,16 @@ fn run(
                 "reply"
             }
             Command::Save { force, reply } => {
-                let snapshot = (force
-                    || (session.dirty && session.last_edit.elapsed() >= SAVE_DELAY))
-                    .then(|| session.saved_snapshot());
+                let snapshot = (force || session.save_due()).then(|| session.begin_save());
                 let _ = reply.send(snapshot);
                 "save_snapshot"
             }
             Command::Saved { revision } => {
-                if session.revision == revision {
-                    session.dirty = false;
-                }
+                session.finish_save(revision);
                 "save_finished"
             }
             Command::Stop { reply } => {
-                let _ = reply.send(session.saved_snapshot());
+                let _ = reply.send(session.dirty.then(|| session.begin_save()));
                 break;
             }
             #[cfg(test)]

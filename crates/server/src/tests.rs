@@ -11,7 +11,10 @@ use sauerteig_core::{
     InputFrame, ObjectKind, RootEdit, ServerMessage, Vec3, World, WorldObject, FIXED_DT, WORLD_MAX,
     WORLD_MIN,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, watch},
@@ -2403,4 +2406,57 @@ fn a_leaving_peers_history_is_retired_not_freed_by_the_thread_that_removes_it() 
     assert_eq!(session.retired.len(), 6);
     drop(std::mem::take(&mut session.retired));
     assert!(undo.upgrade().is_none() && redo.upgrade().is_none());
+}
+
+#[test]
+fn a_save_waits_for_quiet_but_never_longer_than_the_autosave_limit() {
+    use crate::{AUTOSAVE_LIMIT, SAVE_DELAY};
+    let mut session = room();
+    assert!(!session.save_due(), "nothing changed");
+    session.changed();
+    assert!(!session.save_due(), "a fresh edit waits for quiet");
+    session.last_edit = Instant::now() - SAVE_DELAY;
+    assert!(session.save_due(), "quiet long enough");
+
+    session.last_edit = Instant::now();
+    session.dirty_since = Instant::now() - AUTOSAVE_LIMIT + Duration::from_secs(1);
+    session.changed();
+    assert!(!session.save_due(), "still young, and edits continue");
+    assert!(
+        session.dirty_since.elapsed() >= AUTOSAVE_LIMIT - Duration::from_secs(1),
+        "later edits do not restart the clock"
+    );
+    session.dirty_since = Instant::now() - AUTOSAVE_LIMIT;
+    session.changed();
+    assert!(session.save_due(), "old enough, though editing continues");
+    assert!(AUTOSAVE_LIMIT < Duration::from_secs(10));
+}
+
+#[test]
+fn changes_made_during_a_save_stay_unsaved_and_keep_their_age() {
+    let mut session = room();
+    session.changed();
+    let snapshot = session.begin_save();
+    let taken = session.snapshot_at;
+    session.changed();
+    session.finish_save(snapshot.revision);
+    assert!(session.dirty);
+    assert_eq!(session.dirty_since, taken);
+    let snapshot = session.begin_save();
+    session.finish_save(snapshot.revision);
+    assert!(!session.dirty);
+}
+
+#[test]
+fn replacing_a_world_file_leaves_only_the_new_world() {
+    let directory = std::env::temp_dir().join(format!("sauerteig-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let path = directory.join("world.json");
+    let mut saved = room().saved();
+    write_world(&path, &saved).unwrap();
+    saved.revision = 7;
+    write_world(&path, &saved).unwrap();
+    assert_eq!(load_world(&path).unwrap().revision, 7);
+    assert!(!path.with_extension("json.tmp").exists());
+    std::fs::remove_dir_all(&directory).unwrap();
 }

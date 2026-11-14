@@ -28,3 +28,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
 
 [dev-dependencies]
 naga = { version = "24", features = ["wgsl-in"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", default-features = false, features = ["NSAlert", "NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.2", default-features = false, features = ["NSString"] }

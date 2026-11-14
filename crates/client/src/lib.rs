@@ -2,6 +2,7 @@ mod audio;
 mod blueprints;
 pub mod capture;
 mod editor;
+mod failure;
 mod game;
 mod hosting;
 mod launcher;
@@ -40,7 +41,10 @@ struct Runtime {
     host: Option<hosting::HostedServer>,
     context: egui::Context,
     egui: egui_winit::State,
-    last_frame: Instant,
+    last_tick: Instant,
+    last_redraw: Instant,
+    ticked_this_frame: bool,
+    occluded: bool,
 }
 struct Session {
     title: String,
@@ -199,7 +203,10 @@ impl Runtime {
             host: None,
             context,
             egui,
-            last_frame: Instant::now(),
+            last_tick: Instant::now(),
+            last_redraw: Instant::now(),
+            ticked_this_frame: false,
+            occluded: false,
         };
         if let Some(action) = initial_action {
             runtime.launch(action);
@@ -420,11 +427,25 @@ impl Runtime {
         action
     }
 
-    fn render(&mut self) {
-        self.poll_host();
+    /// True while the window is being redrawn. Some systems send no redraws to
+    /// a minimized or covered window, and some report neither state, so a
+    /// window that has gone quiet also counts as not drawing.
+    fn drawing(&self) -> bool {
+        !self.occluded
+            && self.window.is_minimized() != Some(true)
+            && self.last_redraw.elapsed() < REDRAW_TIMEOUT
+    }
+
+    /// The updates that never depend on drawing: the host, the game's network
+    /// and simulation, and a session change in progress. `about_to_wait` runs
+    /// it once per drawn frame, or every `IDLE_TICK` while nothing draws, so a
+    /// minimized window keeps draining and can finish closing.
+    fn tick(&mut self) {
         let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32();
-        self.last_frame = now;
+        let dt = (now - self.last_tick).as_secs_f32();
+        self.last_tick = now;
+        self.ticked_this_frame = true;
+        self.poll_host();
         if self.session.is_some() {
             self.game.update(dt, &mut self.renderer);
             if self.game.captured && (!self.game.connected || !self.accepts_game_input()) {
@@ -432,6 +453,43 @@ impl Runtime {
             }
         }
         self.poll_change();
+    }
+
+    /// Leaving through the application's own quit, which ends the event loop
+    /// without a close request: starts the same close a window's close button
+    /// does and runs it to its end, so the host's final save finishes first.
+    fn finish_for_exit(&mut self) {
+        if self.exit_requested {
+            return;
+        }
+        self.begin_change(Destination::Close);
+        let started = Instant::now();
+        while !self.exit_requested {
+            self.tick();
+            let waiting = match &self.change {
+                None => false,
+                Some(change) if change.phase == ChangePhase::SavingHost => true,
+                // Waiting on the server or local writes gets a limit: its
+                // own, then this one. The host's save is then waited for by
+                // `Drop`, which has none.
+                Some(change) => {
+                    change.phase == ChangePhase::Draining && started.elapsed() < EXIT_DRAIN_LIMIT
+                }
+            };
+            if !waiting {
+                break;
+            }
+            std::thread::sleep(IDLE_TICK / 10);
+        }
+        if !self.exit_requested && self.session.is_none() && self.change.is_none() {
+            // The final save failed: the dialog is the only place left to say so.
+            failure::show_problem("Sauerteig could not save your world", &self.launcher.status);
+        }
+    }
+
+    fn render(&mut self) {
+        self.last_redraw = Instant::now();
+        self.ticked_this_frame = false;
         let raw = self.egui.take_egui_input(&self.window);
         let mut menu_action = None;
         let mut session_action = None;
@@ -558,6 +616,15 @@ impl Runtime {
         }
     }
 }
+/// The longest a drawn window waits between redraws before it counts as not
+/// drawing.
+const REDRAW_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// The tick rate while nothing draws.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+/// How long quitting waits for the server to confirm edits before it stops
+/// waiting and lets the host's own final save finish.
+const EXIT_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 enum UserEvent {
     Ready(Result<Box<Runtime>, String>),
 }
@@ -566,6 +633,14 @@ struct App {
     window: Option<Arc<Window>>,
     proxy: EventLoopProxy<UserEvent>,
     options: Option<LaunchOptions>,
+    failed: bool,
+}
+impl App {
+    fn fail(&mut self, error: String, event_loop: &ActiveEventLoop) {
+        failure::report(&error);
+        self.failed = true;
+        event_loop.exit();
+    }
 }
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -578,8 +653,7 @@ impl ApplicationHandler<UserEvent> for App {
         let window = match event_loop.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(e) => {
-                report_error(&e.to_string());
-                event_loop.exit();
+                self.fail(e.to_string(), event_loop);
                 return;
             }
         };
@@ -593,10 +667,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Ready(Ok(runtime)) => {
                 self.runtime = Some(runtime);
             }
-            UserEvent::Ready(Err(error)) => {
-                report_error(&error);
-                event_loop.exit();
-            }
+            UserEvent::Ready(Err(error)) => self.fail(error, event_loop),
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -635,6 +706,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match event {
             WindowEvent::Resized(size) => runtime.renderer.resize(size.width, size.height),
+            WindowEvent::Occluded(occluded) => runtime.occluded = occluded,
             WindowEvent::RedrawRequested => runtime.render(),
             _ => {}
         }
@@ -656,14 +728,43 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(runtime) = &mut self.runtime else {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        };
+        let drawing = runtime.drawing();
+        let due = if drawing {
+            !runtime.ticked_this_frame
+        } else {
+            runtime.last_tick.elapsed() >= IDLE_TICK
+        };
+        if due {
+            runtime.tick();
+        }
+        if runtime.exit_requested {
+            event_loop.exit();
+            return;
+        }
+        // While drawing, each redraw paces the loop. Otherwise it sleeps until
+        // the next tick, and still asks for a redraw so that it notices when
+        // drawing resumes.
+        runtime.window.request_redraw();
+        event_loop.set_control_flow(if drawing {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::WaitUntil(runtime.last_tick + IDLE_TICK)
+        });
+    }
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Every way out ends here, including the menu's Quit and Cmd+Q on
+        // macOS, which end the process right after this returns.
+        if let Some(mut runtime) = self.runtime.take() {
+            runtime.finish_for_exit();
         }
     }
-}
-fn report_error(error: &str) {
-    log::error!("{error}");
 }
 fn options() -> LaunchOptions {
     let mut options = LaunchOptions::default();
@@ -693,17 +794,33 @@ pub fn run() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .try_init();
     let options = options();
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .expect("create event loop");
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            failure::report(&format!("The window system could not be started: {error}"));
+            std::process::exit(1);
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         runtime: None,
         window: None,
         proxy: event_loop.create_proxy(),
         options: Some(options),
+        failed: false,
     };
-    event_loop.run_app(&mut app).expect("run game");
+    let result = event_loop.run_app(&mut app);
+    // Dropped before the process ends, so a failed start never leaves a window
+    // or a locked world behind.
+    drop(app.runtime.take());
+    drop(app.window.take());
+    if let Err(error) = result {
+        failure::record(&error.to_string());
+        std::process::exit(1);
+    }
+    if app.failed {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

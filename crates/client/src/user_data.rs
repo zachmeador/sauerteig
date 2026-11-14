@@ -62,9 +62,14 @@ impl SessionPreferences {
         )
     }
 
+    /// Queues the write on the storage worker and returns. A failed write
+    /// reaches the user through `take_write_error`, as other local saves do,
+    /// and `flush_pending` waits for it.
     pub fn save(&self) -> Result<(), String> {
         let value = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        execute_named(&data_directory()?, "session", Some(&value)).map(|_| ())
+        let directory = data_directory()?;
+        native::enqueue_session(value, directory);
+        Ok(())
     }
 }
 
@@ -167,13 +172,7 @@ fn complete(job: Job, sender: mpsc::Sender<Completion>, result: Result<Option<St
     let writing = job.value.is_some();
     if writing {
         if let Err(error) = &result {
-            let message = format!("Could not save {}: {error}", job.document.key());
-            let mut errors = WRITE_ERRORS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if !errors.contains(&message) {
-                errors.push(message);
-            }
+            record_write_error(format!("Could not save {}: {error}", job.document.key()));
         }
     }
     let event = match result {
@@ -191,6 +190,22 @@ fn complete(job: Job, sender: mpsc::Sender<Completion>, result: Result<Option<St
     }
     if writing {
         PENDING_WRITES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Ends one queued session write, remembering a failure for the user.
+fn finish_session_write(result: Result<Option<String>, String>) {
+    if let Err(error) = result {
+        record_write_error(format!("Could not save session: {error}"));
+    }
+    PENDING_WRITES.fetch_sub(1, Ordering::AcqRel);
+}
+fn record_write_error(message: String) {
+    let mut errors = WRITE_ERRORS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !errors.contains(&message) {
+        errors.push(message);
     }
 }
 
@@ -228,6 +243,10 @@ mod native {
             sender: mpsc::Sender<Completion>,
             directory: Result<PathBuf, String>,
         },
+        Session {
+            value: String,
+            directory: PathBuf,
+        },
         Barrier(mpsc::Sender<Result<(), String>>),
         #[cfg(test)]
         Pause {
@@ -254,6 +273,10 @@ mod native {
                                     let result =
                                         directory.and_then(|directory| execute(&directory, &job));
                                     complete(job, sender, result);
+                                }
+                                Work::Session { value, directory } => {
+                                    let result = execute_named(&directory, "session", Some(&value));
+                                    finish_session_write(result);
                                 }
                                 Work::Barrier(sender) => {
                                     let _ = sender.send(take_write_error().map_or(Ok(()), Err));
@@ -296,6 +319,19 @@ mod native {
         if let Work::Document { job, sender, .. } = work {
             complete(job, sender, Err(error));
         }
+    }
+
+    pub(super) fn enqueue_session(value: String, directory: PathBuf) {
+        PENDING_WRITES.fetch_add(1, Ordering::AcqRel);
+        let work = Work::Session { value, directory };
+        let error = match worker() {
+            Ok(worker) => match worker.send(work) {
+                Ok(()) => return,
+                Err(_) => "Local storage worker stopped unexpectedly".to_string(),
+            },
+            Err(error) => error,
+        };
+        finish_session_write(Err(error));
     }
 
     pub(super) fn flush_pending() -> Result<(), String> {
@@ -466,6 +502,41 @@ pub(crate) mod tests {
         );
         assert!(serde_json::from_str::<SessionPreferences>("not valid json").is_err());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_choices_save_on_the_storage_worker_and_failures_are_reported() {
+        let _serial = QUEUE_TEST.lock().unwrap();
+        let _ = flush_pending();
+        let directory =
+            std::env::temp_dir().join(format!("sauerteig-session-worker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let choices = SessionPreferences {
+            player_name: "Builder".into(),
+            server: "ws://127.0.0.1:4321/ws".into(),
+            last_world: Some("world-123".into()),
+        };
+        let resume = native::pause();
+        native::enqueue_session(serde_json::to_string(&choices).unwrap(), directory.clone());
+        assert!(pending_writes(), "the caller does not wait for the disk");
+        assert!(!directory.join("session.json").exists());
+        resume.send(()).unwrap();
+        flush_pending().unwrap();
+        assert!(!pending_writes());
+        let saved: SessionPreferences =
+            serde_json::from_str(&execute_named(&directory, "session", None).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(saved, choices);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let blocked =
+            std::env::temp_dir().join(format!("sauerteig-session-blocked-{}", std::process::id()));
+        std::fs::write(&blocked, b"a file cannot hold the session").unwrap();
+        native::enqueue_session("{}".into(), blocked.clone());
+        assert!(flush_pending()
+            .unwrap_err()
+            .contains("Could not save session"));
+        std::fs::remove_file(blocked).unwrap();
     }
 
     #[test]

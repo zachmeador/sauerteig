@@ -71,13 +71,17 @@ impl TestRoom {
         }
     }
     async fn finish(self) {
+        let directory = self.directory.clone();
+        self.finish_keeping_files().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    async fn finish_keeping_files(self) {
         let _ = self.stop.send(());
         tokio::time::timeout(Duration::from_secs(10), self.server)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        std::fs::remove_dir_all(self.directory).unwrap();
     }
     async fn health(&self) -> serde_json::Value {
         // A real published /health read, rather than a private Session lookup.
@@ -691,4 +695,77 @@ async fn a_refused_connection_hears_why_before_the_close_frame() {
         &goodbye(Farewell::Normal).await[..],
         [Message::Close(None)]
     ));
+}
+
+fn modified(path: &std::path::Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_without_changes_leaves_the_world_file_untouched() {
+    let room = TestRoom::start(64).await;
+    let path = room.directory.join("world.json");
+    let (bytes, stamp) = (std::fs::read(&path).unwrap(), modified(&path));
+    // Long enough for the save worker's first poll to have looked.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    room.finish_keeping_files().await;
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(modified(&path), stamp);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_is_saved_by_the_final_save_when_the_server_stops_at_once() {
+    let room = TestRoom::start(64).await;
+    let path = room.directory.join("world.json");
+    let stamp = modified(&path);
+    let mut bot = Bot::join(&room.endpoint).await.unwrap();
+    bot.edit_mode().await.unwrap();
+    small_edit(&mut bot, 1).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let revision = room.health().await["revision"].as_u64().unwrap();
+    assert!(revision > 0);
+    room.finish_keeping_files().await;
+    assert_ne!(modified(&path), stamp);
+    let saved = crate::persistence::load_world(&path).unwrap();
+    assert_eq!(saved.revision, revision);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_world_is_saved_once_when_the_server_starts() {
+    for stop_at_once in [true, false] {
+        let directory = std::env::temp_dir().join(format!(
+            "sauerteig-first-save-{}-{stop_at_once}",
+            std::process::id()
+        ));
+        let path = directory.join("world.json");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let server = tokio::spawn(serve_inner(
+            listener,
+            Config {
+                world_path: path.clone(),
+                ..Config::default()
+            },
+            async {
+                let _ = stopped.await;
+            },
+            None,
+        ));
+        if !stop_at_once {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !path.is_file() {
+                assert!(Instant::now() < deadline, "no first save while running");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+        crate::persistence::load_world(&path).unwrap();
+        assert!(path.is_file());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }
