@@ -5,7 +5,10 @@ use super::{
     lightset::MAX_TILE_JOBS,
     GpuMesh, GpuVertex,
 };
-use crate::props::{self, PropMesh};
+use crate::{
+    lighting::CASCADES,
+    props::{self, PropMesh},
+};
 use glam::Vec3;
 use sauerteig_core::{ObjectKind, WorldObject};
 
@@ -33,7 +36,7 @@ pub(super) struct TileView {
 /// What a shadow draw of props is for.
 #[derive(Clone, Copy)]
 pub(super) enum ShadowTarget {
-    Sun,
+    Cascade(usize),
     Tile(usize),
 }
 
@@ -43,7 +46,7 @@ struct PropLod {
     transforms: Vec<Transform>,
     world_count: u32,
     tile_ranges: Vec<(u32, u32)>,
-    sun_range: (u32, u32),
+    sun_ranges: [(u32, u32); CASCADES],
 }
 
 impl PropLod {
@@ -60,9 +63,9 @@ impl PropLod {
                 material: v.material,
             })
             .collect();
-        // The world pass, the sun and each tile rendered in a frame have their
-        // own instance range.
-        let capacity = MAX_INSTANCES_PER_KIND * (MAX_TILE_JOBS + 2);
+        // The world pass, each cascade of the sun and each tile rendered in a
+        // frame have their own instance range.
+        let capacity = MAX_INSTANCES_PER_KIND * (MAX_TILE_JOBS + 1 + CASCADES);
         Ok(Self {
             mesh: GpuMesh::new(device, &vertices, &mesh.indices).ok_or("Empty prop mesh")?,
             instances: device.create_buffer(&wgpu::BufferDescriptor {
@@ -74,7 +77,7 @@ impl PropLod {
             transforms: Vec::with_capacity(capacity),
             world_count: 0,
             tile_ranges: Vec::new(),
-            sun_range: (0, 0),
+            sun_ranges: [(0, 0); CASCADES],
         })
     }
 }
@@ -130,7 +133,7 @@ impl PropRenderer {
         queue: &wgpu::Queue,
         objects: &[WorldObject],
         eye: Vec3,
-        sun_frustum: &Frustum,
+        sun_frustums: &[Frustum; CASCADES],
         tiles: &[TileView],
     ) {
         for batch in &mut self.batches {
@@ -187,7 +190,9 @@ impl PropRenderer {
                 }
                 (start, batch.near.transforms.len() as u32)
             };
-            batch.near.sun_range = append(sun_frustum, None);
+            for (range, frustum) in batch.near.sun_ranges.iter_mut().zip(sun_frustums) {
+                *range = append(frustum, None);
+            }
             batch.near.tile_ranges = tiles
                 .iter()
                 .map(|tile| append(&tile.frustum, Some((tile.center, tile.range))))
@@ -204,7 +209,7 @@ impl PropRenderer {
         for batch in &self.batches {
             let lod = &batch.near;
             let (start, end) = match target {
-                ShadowTarget::Sun => lod.sun_range,
+                ShadowTarget::Cascade(i) => lod.sun_ranges[i],
                 ShadowTarget::Tile(i) => lod.tile_ranges.get(i).copied().unwrap_or_default(),
             };
             Self::draw_lod(pass, lod, start, end);

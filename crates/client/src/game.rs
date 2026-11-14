@@ -2201,6 +2201,6 @@ impl Game {
                 });
         }
         self.asset_panel(ctx, renderer, window);
-        self.local_panels(ctx, window, renderer.sample_counts());
+        self.local_panels(ctx, window, renderer.sample_counts(), renderer.auto_level());
     }
 }

@@ -256,29 +256,58 @@ pub fn light_from_object(object: &WorldObject) -> Option<LightDesc> {
         .flatten()
 }
 
-/// A bounded sun-shadow window follows the camera on large maps. Snap its light-space
-/// origin to texels so small camera motions do not make stationary shadows crawl.
-pub fn sun_shadow_matrix(sun: Vec3, focus: Vec3) -> Mat4 {
-    const HALF_WIDTH: f32 = 96.0;
-    const DEPTH: f32 = 256.0;
-    const RESOLUTION: f32 = 2048.0;
+/// How many cascades the sun's shadow is split into.
+pub const CASCADES: usize = 3;
+/// How far from the eye each cascade is guaranteed to reach, in metres.
+pub const CASCADE_SPLITS: [f32; CASCADES] = [15.0, 42.0, 150.0];
+/// A cascade's window moves in steps of this many texels, so its cached map
+/// stays valid while the eye walks inside a step.
+const CASCADE_STEP_TEXELS: f32 = 64.0;
+/// Half the depth range each cascade covers around its snapped centre.
+const CASCADE_DEPTH: f32 = 256.0;
+
+/// One cascade of the sun's shadow: a square window around the eye, looking
+/// along the sun.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunCascade {
+    pub matrix: Mat4,
+    /// Metres per shadow-map texel.
+    pub texel: f32,
+    /// Half the window's width in metres.
+    pub half_width: f32,
+}
+
+/// Three square windows centred on the eye, reaching `CASCADE_SPLITS` metres in
+/// every direction, in `resolution`-texel maps. A window depends on the eye's
+/// position only, never on where it looks, and moves in whole steps of 64
+/// texels, with its depth origin snapped the same way, so a cached map stays
+/// valid until the eye leaves its step and no stationary shadow crawls.
+pub fn sun_cascades(sun: Vec3, eye: Vec3, resolution: u32) -> [SunCascade; CASCADES] {
     let sun = sun.try_normalize().unwrap_or(Vec3::Y);
     let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
     let view = Mat4::look_to_rh(Vec3::ZERO, -sun, up);
-    let mut center = view.transform_point3(focus);
-    let texel = 2.0 * HALF_WIDTH / RESOLUTION;
-    // A six-metre window step (64 texels) keeps the projection stable while
-    // strafing. Quantize depth too; a continuous depth origin defeats caching.
-    let step = texel * 64.0;
-    center = (center / step).round() * step;
-    Mat4::orthographic_rh(
-        center.x - HALF_WIDTH,
-        center.x + HALF_WIDTH,
-        center.y - HALF_WIDTH,
-        center.y + HALF_WIDTH,
-        -center.z - DEPTH,
-        -center.z + DEPTH,
-    ) * view
+    let focus = view.transform_point3(eye);
+    let resolution = resolution as f32;
+    CASCADE_SPLITS.map(|split| {
+        // The window must hold the whole circle of radius `split` around an eye
+        // that can sit half a step from the window's centre.
+        let half_width = split / (1.0 - CASCADE_STEP_TEXELS / resolution);
+        let texel = 2.0 * half_width / resolution;
+        let step = texel * CASCADE_STEP_TEXELS;
+        let center = (focus / step).round() * step;
+        SunCascade {
+            matrix: Mat4::orthographic_rh(
+                center.x - half_width,
+                center.x + half_width,
+                center.y - half_width,
+                center.y + half_width,
+                -center.z - CASCADE_DEPTH,
+                -center.z + CASCADE_DEPTH,
+            ) * view,
+            texel,
+            half_width,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -310,33 +339,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sun_shadows_follow_distant_players_and_snap_small_camera_motion() {
-        let focus = Vec3::new(3000.0, 800.0, -4000.0);
-        let matrix = sun_shadow_matrix(Vec3::Y, focus);
-        for corner in box_corners(focus - Vec3::splat(40.0), focus + Vec3::splat(40.0)) {
-            let p = ndc(matrix, corner);
-            assert!(p.x.abs() < 1.0 && p.y.abs() < 1.0 && p.z > 0.0 && p.z < 1.0);
-        }
-        assert_eq!(
-            sun_shadow_matrix(Vec3::Y, Vec3::ZERO),
-            sun_shadow_matrix(Vec3::Y, Vec3::X * 0.001)
-        );
+    fn inside(matrix: Mat4, position: Vec3) -> bool {
+        let p = ndc(matrix, position);
+        p.x.abs() < 1.0 && p.y.abs() < 1.0 && p.z > 0.0 && p.z < 1.0
     }
 
     #[test]
-    fn sun_projection_contains_the_full_world_with_positive_depth_and_padding() {
+    fn every_cascade_holds_the_ball_around_the_eye_that_it_promises() {
+        let sun = Vec3::new(-0.44, 0.76, 0.34);
+        for resolution in [512, 1024, 2048] {
+            for eye in [
+                Vec3::new(3000.0, 800.0, -4000.0),
+                Vec3::new(0.3, 2.6, 0.3),
+                Vec3::new(-17.9, 40.1, 63.7),
+            ] {
+                let cascades = sun_cascades(sun, eye, resolution);
+                for (cascade, split) in cascades.iter().zip(CASCADE_SPLITS) {
+                    let reach = split * 0.999;
+                    for offset in [
+                        Vec3::X,
+                        -Vec3::X,
+                        Vec3::Y,
+                        -Vec3::Y,
+                        Vec3::Z,
+                        -Vec3::Z,
+                        Vec3::new(1.0, 1.0, 1.0).normalize(),
+                        Vec3::new(-1.0, 1.0, -1.0).normalize(),
+                    ] {
+                        assert!(
+                            inside(cascade.matrix, eye + offset * reach),
+                            "eye {eye:?}, {resolution}, split {split}, {offset:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cascade_windows_move_in_whole_steps_and_ignore_where_the_eye_looks() {
+        let sun = Vec3::new(-0.44, 0.76, 0.34);
+        let eye = Vec3::new(10.0, 20.0, 30.0);
+        let base = sun_cascades(sun, eye, 1024);
+        // Moving by less than a texel never changes a window, and neither does
+        // turning, which the eye position alone decides.
+        for nudge in [Vec3::X, Vec3::Y, Vec3::Z, -Vec3::X, -Vec3::Y, -Vec3::Z] {
+            let moved = sun_cascades(sun, eye + nudge * 0.001, 1024);
+            for (a, b) in base.iter().zip(&moved) {
+                assert_eq!(a.matrix, b.matrix);
+            }
+        }
+        // The three windows have the texel sizes the splits promise at 1024.
+        for (cascade, expected) in base.iter().zip([0.031, 0.0875, 0.3125]) {
+            assert!((cascade.texel - expected).abs() < 0.0005, "{cascade:?}");
+        }
+        // Every window's translation is a whole number of texels, so a shadow
+        // texel never lands at a different place after the window moves.
+        let walked = sun_cascades(sun, eye + Vec3::new(40.0, 0.0, 0.0), 1024);
+        for (a, b) in base.iter().zip(&walked) {
+            let corner = Vec3::new(5.0, 6.0, 7.0);
+            let (pa, pb) = (ndc(a.matrix, corner), ndc(b.matrix, corner));
+            let texels = |d: f32| d * 0.5 * 1024.0;
+            let shift = [texels(pa.x - pb.x), texels(pa.y - pb.y)];
+            for s in shift {
+                assert!((s - s.round()).abs() < 0.01, "{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_far_cascade_holds_the_whole_world_with_positive_depth_and_padding() {
         let corners = box_corners(
             Vec3::new(WORLD_MIN as f32, 0.0, WORLD_MIN as f32),
             Vec3::new(WORLD_MAX as f32, WORLD_HEIGHT as f32, WORLD_MAX as f32),
         );
         for sun in [Vec3::new(-0.44, 0.76, 0.34), Vec3::Y, -Vec3::Y, Vec3::X] {
-            let matrix = sun_shadow_matrix(sun, Vec3::new(0.0, WORLD_HEIGHT as f32 * 0.5, 0.0));
+            let eye = Vec3::new(0.0, WORLD_HEIGHT as f32 * 0.5, 0.0);
+            for cascade in sun_cascades(sun, eye, 1024) {
+                for corner in corners {
+                    let p = ndc(cascade.matrix, corner);
+                    assert!(p.z > 0.0 && p.z < 1.0, "sun {sun:?}, {p:?}");
+                }
+            }
+            let far = sun_cascades(sun, eye, 1024)[CASCADES - 1];
             for corner in corners {
-                let p = ndc(matrix, corner);
-                assert!(p.x > -1.0 && p.x < 1.0, "sun {sun:?}, {p:?}");
-                assert!(p.y > -1.0 && p.y < 1.0, "sun {sun:?}, {p:?}");
-                assert!(p.z > 0.0 && p.z < 1.0, "sun {sun:?}, {p:?}");
+                assert!(inside(far.matrix, corner), "sun {sun:?}, {corner:?}");
             }
         }
     }

@@ -31,9 +31,9 @@ pub const ACTOR_SHADOW_LIGHTS: usize = 8;
 /// past the limit, so lights near it do not swap back and forth.
 const ACTOR_SHADOW_MARGIN: usize = 2;
 /// How far a prop, tree or pad casts a shadow, for invalidating tiles.
-const OBJECT_REACH: f32 = 10.0;
+pub const OBJECT_REACH: f32 = 10.0;
 /// More object changes than this at once invalidate everything.
-const MAX_OBJECT_EDITS: usize = 64;
+pub const MAX_OBJECT_EDITS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LightConfig {
@@ -166,10 +166,57 @@ pub struct FramePlan {
     pub settled: bool,
 }
 
+/// What the objects that cast shadows looked like last time, to find which
+/// ones appeared, moved or went.
 #[derive(Default)]
-struct ObjectDigest {
+pub struct ObjectDigest {
     hash: u64,
     casters: HashMap<u32, (ObjectKind, Vec3, f32)>,
+}
+
+impl ObjectDigest {
+    /// The positions, old and new, of every shadow-casting object that
+    /// changed since the last call, or `None` when nothing did.
+    pub fn update(&mut self, objects: &[WorldObject]) -> Option<Vec<Vec3>> {
+        let casters = || objects.iter().filter(|o| o.kind != ObjectKind::Light);
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for o in casters() {
+            let words = [
+                u64::from(o.id),
+                o.kind as u64,
+                u64::from(o.position.x.to_bits()),
+                u64::from(o.position.y.to_bits()),
+                u64::from(o.position.z.to_bits()),
+                u64::from(o.rotation.to_bits()),
+            ];
+            for word in words {
+                hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        if hash == self.hash {
+            return None;
+        }
+        self.hash = hash;
+        let mut dirty = Vec::new();
+        let mut next = HashMap::new();
+        for o in casters() {
+            let now = (o.kind, o.position, o.rotation);
+            match self.casters.get(&o.id) {
+                Some(&before) if before == now => {}
+                Some(&(_, position, _)) => dirty.extend([position, o.position]),
+                None => dirty.push(o.position),
+            }
+            next.insert(o.id, now);
+        }
+        dirty.extend(
+            self.casters
+                .iter()
+                .filter(|(id, _)| !next.contains_key(id))
+                .map(|(_, &(_, position, _))| position),
+        );
+        self.casters = next;
+        Some(dirty)
+    }
 }
 
 pub struct LightSet {
@@ -205,6 +252,11 @@ impl LightSet {
     }
 
     /// Whether any light may shadow moving actors, so their vertices are needed.
+    /// The largest tile any light's shadow may use: a quality choice that
+    /// changes detail, never which lights are shadowed.
+    pub fn set_max_tile_class(&mut self, class: TileClass) {
+        self.config.max_tile_class = class;
+    }
     pub fn shadows_actors(&self) -> bool {
         self.tracked.values().any(|t| {
             t.desc.shadow == ShadowMode::Dynamic
@@ -473,44 +525,9 @@ impl LightSet {
     /// Props, trees and pads cast into cached tiles: an object that appears,
     /// moves or disappears invalidates the lights around it.
     fn sync_objects(&mut self, objects: &[WorldObject]) {
-        let casters = || objects.iter().filter(|o| o.kind != ObjectKind::Light);
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for o in casters() {
-            let words = [
-                u64::from(o.id),
-                o.kind as u64,
-                u64::from(o.position.x.to_bits()),
-                u64::from(o.position.y.to_bits()),
-                u64::from(o.position.z.to_bits()),
-                u64::from(o.rotation.to_bits()),
-            ];
-            for word in words {
-                hash = (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        if hash == self.objects.hash {
+        let Some(dirty) = self.objects.update(objects) else {
             return;
-        }
-        self.objects.hash = hash;
-        let mut dirty = Vec::new();
-        let mut next = HashMap::new();
-        for o in casters() {
-            let now = (o.kind, o.position, o.rotation);
-            match self.objects.casters.get(&o.id) {
-                Some(&before) if before == now => {}
-                Some(&(_, position, _)) => dirty.extend([position, o.position]),
-                None => dirty.push(o.position),
-            }
-            next.insert(o.id, now);
-        }
-        dirty.extend(
-            self.objects
-                .casters
-                .iter()
-                .filter(|(id, _)| !next.contains_key(id))
-                .map(|(_, &(_, position, _))| position),
-        );
-        self.objects.casters = next;
+        };
         if dirty.len() > MAX_OBJECT_EDITS {
             self.atlas.invalidate_all();
         } else {
@@ -878,6 +895,40 @@ mod tests {
             .filter(|l| l.gpu.packed[0] >> 1 & 3 == 0)
             .count();
         assert_eq!(unshadowed, 6);
+    }
+
+    #[test]
+    fn the_largest_shadow_tile_never_changes_which_lights_are_lit_or_shadowed() {
+        // More lights than the atlas holds at any tile size, nearest ahead.
+        let positions = line(240, 0.5);
+        let drawn = |class: TileClass, change_midway: bool| {
+            let mut scene = Scene::new(&positions);
+            scene.set.set_max_tile_class(class);
+            if change_midway {
+                // Start at the other end of the range, then switch.
+                scene.set.set_max_tile_class(TileClass::Large);
+                scene.settle();
+                scene.set.set_max_tile_class(class);
+                for _ in 0..180 {
+                    scene.frame();
+                }
+            }
+            scene.settle();
+            let plan = scene.frame();
+            let shadowed: Vec<_> = plan
+                .lights
+                .iter()
+                .map(|l| (l.id, l.gpu.packed[0] >> 1 & 3))
+                .collect();
+            (plan.stats.shadowed, plan.stats.over_budget, shadowed)
+        };
+        let reference = drawn(TileClass::Large, false);
+        assert!(reference.0 > 100 && reference.1 > 0, "{:?}", reference.0);
+        for class in [TileClass::Medium, TileClass::Small] {
+            for midway in [false, true] {
+                assert_eq!(drawn(class, midway), reference, "{class:?}, {midway}");
+            }
+        }
     }
 
     #[test]

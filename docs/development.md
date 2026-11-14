@@ -170,27 +170,77 @@ uses face centers and can show ordering artifacts for overlapping views of large
 faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
 
 The scene renders in linear HDR, with a filmic exposure/tonemapping pass before
-egui. Settings include bloom (zero disables it), anti-aliasing, render scale
-(50–100%), exposure, and vsync. Anti-aliasing offers Off, 2×, 4× and 8× MSAA,
-each only where the adapter supports that count for both `Rgba16Float` (with
-resolve) and `Depth32Float`, and Auto, the default. Auto takes 4× while the
-scene has at most 2560×1440 pixels, 2× up to 3840×2160, and none above that, and
-never 8×; it follows from throughput measurements at 4K
-(see [renderer](tracking/renderer.md)). A saved choice the adapter can't run
-uses the next lower count it can, and saved settings that say `on` mean 4×.
-Render scale affects only the scene; egui stays at output resolution. Vsync off
-selects Mailbox, then Immediate if available, otherwise Fifo. The surface
-requests one frame of latency, clamped by the backend. Local movement and remote
-player poses interpolate between 60 Hz steps; mouse look remains immediate.
+egui. Settings include quality, bloom (zero disables it), anti-aliasing, render
+scale (50–100%), shadow detail, exposure, and vsync.
 
-Lighting is dynamic. The sun shadow window follows the player in six-metre,
-texel-aligned light-space steps; its static geometry cache is kept until geometry
-or the window changes, and actors draw over a fresh copy each frame. Every light
-node is a warm omnidirectional point light with a 12 metre range and static
-shadows (`light_from_object` in `lighting.rs`). Spot lights, other colors, ranges,
-and dynamic or no shadows exist in the renderer, but nothing places them until
-object properties do. Moving actors cast shadows from the eight most important
-shadowed lights, whatever their own mode.
+Quality is Auto (the default), a fixed level, or Custom. A level sets render
+scale, anti-aliasing and shadow detail, and nothing else:
+
+| Level | Render scale | Anti-aliasing | Sun cascades | Largest light tile |
+| --- | ---: | --- | ---: | ---: |
+| Low | 75% | Off | 512² | 128² |
+| Medium | 100% | 2× | 1024² | 256² |
+| High | 100% | 4× | 1024² | 512² |
+| Ultra | 100% | 8× | 2048² | 512² |
+
+A count the adapter doesn't support falls to the next lower one it does. Levels
+change detail only: every level lights and shadows the same lights, and the same
+lights shadow players, because the shadow atlas gives every light that fits at
+its smallest tile size a tile before any light gets a larger one, whatever the
+largest size allowed. Changing the scale, the anti-aliasing or the shadow detail
+by hand makes the quality Custom, which keeps those three choices. Settings
+saved before quality existed load as Auto, or as Custom when they hold a scale
+or an anti-aliasing choice other than the old defaults.
+
+Auto starts at High and moves one level at a time, judging frames against the
+display's refresh interval (the window's monitor, read every few seconds). Where
+timestamp queries exist, it takes the GPU's time for each frame: it steps down
+when the median of 60 frames is over 90% of the interval, and up when the median
+of 360 frames is under 50% and the slowest tenth under 70%, so a step up has
+room to cost half as much again without bouncing back. Without timestamps it
+uses the time between frames, which on a display presenting in step shows only a
+missed refresh: it steps down when the median passes 115% of the interval and
+tries a level up after 1800 steady frames (30 seconds at 60 Hz). A step up that
+fails makes the next wait twice as long, up to sixteen times the first. A change
+rebuilds the scene targets or the sun's maps, so Auto ignores the next 30
+frames. Without a known refresh rate (no window, or an unreadable monitor) Auto
+stays where it is. F3 shows what is running.
+
+Anti-aliasing offers Off, 2×, 4× and 8× MSAA, each only where the adapter
+supports that count for both `Rgba16Float` (with resolve) and `Depth32Float`,
+and Auto. That Auto, a choice within Custom, takes 4× while the scene has at
+most 2560×1440 pixels, 2× up to 3840×2160, and none above that, and never 8×; it
+follows from throughput measurements at 4K (see
+[renderer](tracking/renderer.md)). A saved choice the adapter can't run uses the
+next lower count it can, and saved settings that say `on` mean 4×. Render scale
+affects only the scene; egui stays at output resolution. Vsync off selects
+Mailbox, then Immediate if available, otherwise Fifo. The surface requests one
+frame of latency, clamped by the backend. Local movement and remote player poses
+interpolate between 60 Hz steps; mouse look remains immediate.
+
+Lighting is dynamic. The sun's shadow has three cascades, square windows centred
+on the eye that reach 15, 42 and 150 metres in every direction, in maps of 512²,
+1024² or 2048² texels (3, 8 and 29 cm a texel at 1024²). A window depends on
+where the eye is, never on where it looks, and moves in whole steps of 64 texels
+with its depth origin snapped the same way, so a stationary shadow doesn't crawl
+and a cached map stays valid until the eye leaves its step (`sun_cascades` in
+`lighting.rs`). The scene shader takes the shadow from the nearest cascade that
+holds the point and blends into the next across the nearer one's outer tenth;
+past the last cascade the sun is unshadowed. Each cascade is a whole array
+layer. The near two keep their static geometry in a cache, and a copy of it is
+drawn over with the moving actors each frame; the far cascade has no actors and
+is its own cache. A rebuilt chunk is compared with the mesh it replaces (a 4 × 4
+× 4 fingerprint of its triangles, `render/changes.rs`), and each cascade clears
+the texels the differing triangles reach, by drawing, and redraws them under a
+scissor rectangle (`render/sun.rs`). An object that appears, moves or goes does
+the same around its position. A cascade whose window moved, or that too many
+changes reached, redraws whole. The cascades use 20 MiB at 1024² (3 working
+layers and 2 cached layers of 32-bit depth), 5 MiB at 512² and 80 MiB at 2048².
+Every light node is a warm omnidirectional point light with a 12 metre range and
+static shadows (`light_from_object` in `lighting.rs`). Spot lights, other
+colors, ranges, and dynamic or no shadows exist in the renderer, but nothing
+places them until object properties do. Moving actors cast shadows from the
+eight most important shadowed lights, whatever their own mode.
 
 Each frame the lights in view, at most 256 by importance, are culled by a
 compute pass into a 16 × 9 × 24 grid of view clusters, and one shared WGSL
@@ -304,13 +354,23 @@ passes apart from the sun's, and how many lights reach each cluster that has any
 The render clock is fixed at 60 Hz. The supplied imported poses expect a **copy** of
 the library's `the_cube1m` at `.local/the_cube1m.json`. Supply your own pose
 manifest for other worlds. The tool refuses to replace existing PNGs.
-`--settings FILE` accepts a JSON object with `scale`, `msaa` (`"auto"`, `"off"`,
-`"x2"`, `"x4"` or `"x8"`; `"on"` means 4×), `bloom`, `exposure` and `vsync`;
-omitted fields take the normal defaults. `--brute-force` evaluates every light
+`--settings FILE` accepts a JSON object with `quality` (`"auto"`, `"low"`,
+`"medium"`, `"high"`, `"ultra"` or `"custom"`), `scale`, `msaa` (`"auto"`, `"off"`,
+`"x2"`, `"x4"` or `"x8"`; `"on"` means 4×) and `shadows` (`"low"` to `"ultra"`),
+which Custom reads, `bloom`, `exposure` and `vsync`; omitted fields take the
+normal defaults. A file that names `scale` or `msaa` without `quality` is Custom. `--brute-force` evaluates every light
 at every fragment (for comparing with the clusters), `--pages N` sets the shadow
 atlas size, `--over-budget unshadowed` keeps lights that no tile can hold,
 `--actor-lights N` sets how many of the most important shadowed lights shadow
 actors, and `--node-shadows off|static|dynamic` sets what light nodes cast.
+A pose can also name a `block_edit` cell: after the pose's frames the tool
+changes that cell and changes it back six times, and the report's `block_edit`
+gives the GPU time of the sun's static passes (`sun cascade 1` to `3`) and the
+number of shadow maps rendered in the frame after each edit. `--display-hz HZ`
+tells the renderer the display's refresh rate, so that Auto quality judges
+frames against it (the report's `auto_level_changes` lists the frame and level
+index at each change, 0 for Low; leave `--throughput` off, since the levels
+would change under it). Without it, Auto stays at High in captures.
 Measurements include CPU submission, completed-frame median/p95 and individual
 GPU pass medians. They exclude simulation, presentation and PNG readback; they
 do not prove perceived smoothness on a monitor.
@@ -337,8 +397,10 @@ done
 
 The native GPU regressions run explicitly with
 `cargo test -p sauerteig-client --lib gpu_ -- --ignored --test-threads=1` on a host
-with GPU access. They check that cached shadows match fresh ones after edits, that
-clusters built by the compute pass match the CPU's and give the same picture as a
+with GPU access. They check that cached shadows match fresh ones after edits, that a
+one-block edit redraws a small part of the sun's cascades and every cascade
+matches a fresh render after edits, moved props, walking and each quality
+level, that clusters built by the compute pass match the CPU's and give the same picture as a
 brute-force render, that every sample count the adapter offers draws the same
 scene, that a wall stops the next corridor's lights, and that spot lights and
 actor overlays draw. Normal workspace tests leave these hardware-dependent

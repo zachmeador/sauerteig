@@ -1,4 +1,5 @@
 pub(crate) mod atlas;
+mod changes;
 pub(crate) mod clusters;
 pub(crate) mod culling;
 mod device;
@@ -6,25 +7,33 @@ mod lights;
 pub(crate) mod lightset;
 mod post;
 mod props;
+mod quality;
 pub mod settings;
 mod shaders;
 mod shadows;
+mod sun;
 mod timing;
 mod volumes;
+use changes::Fingerprint;
 use post::{PostProcess, HDR_FORMAT};
-use settings::RenderSettings;
-use shadows::{CachedShadow, ShadowAtlasGpu};
+use quality::{AutoQuality, Measure};
+use settings::{Quality, QualityLevel, RenderSettings, Resolved};
+use shadows::ShadowAtlasGpu;
+use sun::SunShadows;
 
 pub use self::lightset::OverBudget;
 use self::{
     culling::{Bounds, Frustum},
     lights::{ClusterView, LightGpu},
-    lightset::{FrameInput, LightConfig, LightSet, LightingStats, TileJob, View},
+    lightset::{
+        FrameInput, LightConfig, LightSet, LightingStats, ObjectDigest, TileJob, View,
+        MAX_OBJECT_EDITS, OBJECT_REACH,
+    },
     props::{instance_layout, PropRenderer, ShadowTarget, TileView},
     shaders::LightLayout,
     volumes::VolumeRenderer,
 };
-use crate::lighting::{sun_shadow_matrix, LightDesc, ShadowMode};
+use crate::lighting::{sun_cascades, LightDesc, ShadowMode, CASCADES};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3};
 use sauerteig_core::{ChunkKey, Mesh, World, WorldObject, CHUNK_SIZE};
@@ -54,6 +63,9 @@ pub struct RendererOptions {
     /// Advance light fades and residency by this much each frame, not by the
     /// clock, so captures repeat.
     pub fixed_frame_time: Option<f32>,
+    /// The display's refresh rate, in hertz, instead of the window's monitor's.
+    /// Captures set it to let Auto quality judge frames against a display.
+    pub display_hz: Option<f32>,
 }
 
 #[repr(C)]
@@ -80,7 +92,8 @@ impl GpuVertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct CameraUniform {
     view_proj: [[f32; 4]; 4],
-    light_view_proj: [[f32; 4]; 4],
+    cascades: [[[f32; 4]; 4]; CASCADES],
+    cascade_texel: [f32; 4],
     eye_time: [f32; 4],
     sun: [f32; 4],
     fog: [f32; 4],
@@ -198,12 +211,17 @@ pub struct Renderer {
     settings: RenderSettings,
     sample_counts: Vec<u32>,
     present_modes: Vec<wgpu::PresentMode>,
-    shadow: wgpu::TextureView,
-    shadow_texture: wgpu::Texture,
-    sun_cache: CachedShadow,
-    geometry_revision: u64,
-    /// Shadow maps rendered by the last frame: the sun's window and atlas faces.
+    sun: SunShadows,
+    sun_objects: ObjectDigest,
+    auto: AutoQuality,
+    /// What the scene targets and shadow maps were built for.
+    applied: Resolved,
+    window: Option<Arc<Window>>,
+    display: DisplayClock,
+    /// Shadow maps rendered by the last frame: the sun's cascades and atlas faces.
     pub shadow_updates: usize,
+    /// Texels the last frame drew into the sun's cascades, cleared or redrawn.
+    pub sun_texels: u64,
     camera_buffer: wgpu::Buffer,
     pub materials: crate::materials::Materials,
     identity_instance: wgpu::Buffer,
@@ -223,9 +241,12 @@ pub struct Renderer {
     shadow_cost: ShadowCost,
     pipeline: Vec<wgpu::RenderPipeline>,
     two_sided_pipeline: Vec<wgpu::RenderPipeline>,
-    shadow_pipeline: wgpu::RenderPipeline,
     sky_pipeline: Vec<wgpu::RenderPipeline>,
     chunks: BTreeMap<ChunkKey, GpuMesh>,
+    /// Where each chunk's triangles are, to find what an edit changed.
+    prints: BTreeMap<ChunkKey, Fingerprint>,
+    /// Time spent fingerprinting meshes since the renderer was created, in ms.
+    fingerprint_ms: f64,
     objects: Option<GpuMesh>,
     dynamic: GpuMesh,
     pub egui: egui_wgpu::Renderer,
@@ -234,6 +255,52 @@ pub struct Renderer {
     pub adapter_name: String,
     /// The adapter's name with its graphics API and driver.
     pub adapter_description: String,
+}
+
+/// What the display and the frame loop say about timing, which Auto quality
+/// judges frames against.
+struct DisplayClock {
+    /// The refresh interval a capture asked for, in milliseconds.
+    fixed: Option<f32>,
+    refresh: Option<f32>,
+    calls: u32,
+    last_draw: Option<std::time::Instant>,
+    /// The timed frame whose GPU time Auto last took.
+    gpu_serial: u64,
+}
+impl DisplayClock {
+    /// Re-read the monitor's refresh rate this often, in frames, since the
+    /// window can move to another display.
+    const RECHECK: u32 = 240;
+
+    fn new(hz: Option<f32>) -> Self {
+        Self {
+            fixed: hz
+                .filter(|hz| hz.is_finite() && *hz > 0.0)
+                .map(|hz| 1000.0 / hz),
+            refresh: None,
+            calls: 0,
+            last_draw: None,
+            gpu_serial: 0,
+        }
+    }
+
+    /// The display's refresh interval in milliseconds, if known.
+    fn refresh_ms(&mut self, window: Option<&Window>) -> Option<f32> {
+        if self.fixed.is_some() {
+            return self.fixed;
+        }
+        if self.calls.is_multiple_of(Self::RECHECK) {
+            self.refresh = window
+                .and_then(|window| window.current_monitor())
+                .and_then(|monitor| monitor.refresh_rate_millihertz())
+                .map(|millihertz| 1_000_000.0 / millihertz as f32)
+                // Anything outside 24 to 1000 Hz is a driver's placeholder.
+                .filter(|ms| (1.0..=41.7).contains(ms));
+        }
+        self.calls = self.calls.wrapping_add(1);
+        self.refresh
+    }
 }
 
 /// Shadow faces can be cheap or very costly, depending on the geometry around
@@ -419,11 +486,17 @@ impl Renderer {
         let timing = timing::GpuTiming::new(&device, &queue);
         let sample_counts = device::adapter_sample_counts(&adapter, request.features);
         let settings = RenderSettings::default();
-        let post = PostProcess::new(&device, width, height, format, settings, &sample_counts);
+        let auto = AutoQuality::default();
+        let applied = settings.resolved(auto.level());
+        let post = PostProcess::new(
+            &device,
+            width,
+            height,
+            format,
+            settings.with_resolved(applied),
+            &sample_counts,
+        );
         let present_modes = caps.map_or_else(|| vec![wgpu::PresentMode::Fifo], |c| c.present_modes);
-        let shadow_texture = shadows::depth_texture(&device, 2048, 1, "sun working shadows");
-        let shadow = shadow_texture.create_view(&Default::default());
-        let sun_cache = CachedShadow::new(&device, 2048);
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
             size: std::mem::size_of::<CameraUniform>() as u64,
@@ -471,13 +544,15 @@ impl Renderer {
             contents: bytemuck::cast_slice(&[[0.0f32; 4]]),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let shadow_module = shaders::module(&device, "shadow", light_layout);
         let atlas = ShadowAtlasGpu::new(
             &device,
             light_config.pages,
-            &shaders::module(&device, "shadow", light_layout),
+            &shadow_module,
             &[GpuVertex::layout(), instance_layout()],
         );
-        let light_gpu = LightGpu::new(&device, light_config, &shadow, &sampler, &atlas.array);
+        let sun = SunShadows::new(&device, applied.shadows.cascade_size(), &shadow_module);
+        let light_gpu = LightGpu::new(&device, light_config, sun.array(), &sampler, &atlas.array);
         let materials = crate::materials::Materials::new(&device, &queue)?;
         let props = PropRenderer::new(&device)?;
         let volumes = VolumeRenderer::new(
@@ -541,32 +616,6 @@ impl Renderer {
                 bind_group_layouts: &[&camera_layout],
                 push_constant_ranges: &[],
             });
-        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sun depth"),
-            layout: Some(&shadow_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow"),
-                buffers: &[GpuVertex::layout(), instance_layout()],
-                compilation_options: Default::default(),
-            },
-            fragment: None,
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                bias: wgpu::DepthBiasState {
-                    constant: 1,
-                    slope_scale: 0.0,
-                    clamp: 0.0,
-                },
-                ..depth_state()
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
         let sky = shaders::module(&device, "sky", light_layout);
         let sky_pipeline = sample_counts
             .iter()
@@ -617,11 +666,14 @@ impl Renderer {
             settings,
             sample_counts,
             present_modes,
-            shadow,
-            shadow_texture,
-            sun_cache,
-            geometry_revision: 0,
+            sun,
+            sun_objects: ObjectDigest::default(),
+            auto,
+            applied,
+            window,
+            display: DisplayClock::new(options.display_hz),
             shadow_updates: 0,
+            sun_texels: 0,
             camera_buffer,
             materials,
             identity_instance,
@@ -633,7 +685,12 @@ impl Renderer {
                 last: None,
                 fixed: options.fixed_frame_time,
             },
-            lights: LightSet::new(light_config, options.over_budget, options.node_shadows),
+            lights: {
+                let mut lights =
+                    LightSet::new(light_config, options.over_budget, options.node_shadows);
+                lights.set_max_tile_class(applied.shadows.max_tile_class());
+                lights
+            },
             light_gpu,
             atlas,
             extra_lights: Vec::new(),
@@ -644,9 +701,10 @@ impl Renderer {
             shadow_cost: ShadowCost::default(),
             pipeline,
             two_sided_pipeline,
-            shadow_pipeline,
             sky_pipeline,
             chunks: BTreeMap::new(),
+            prints: BTreeMap::new(),
+            fingerprint_ms: 0.0,
             objects: None,
             dynamic,
             egui,
@@ -658,16 +716,12 @@ impl Renderer {
     }
     pub fn apply_settings(&mut self, settings: RenderSettings) {
         let settings = settings.normalized();
-        if settings.scale != self.settings.scale || settings.msaa != self.settings.msaa {
-            self.post = PostProcess::new(
-                &self.device,
-                self.config.width,
-                self.config.height,
-                self.config.format,
-                settings,
-                &self.sample_counts,
-            );
+        if settings.quality != self.settings.quality && settings.quality == Quality::Auto {
+            // Auto starts over from its first level.
+            self.auto = AutoQuality::default();
         }
+        self.settings = settings;
+        self.apply_resolved();
         let mode = settings::present_mode(settings.vsync, &self.present_modes);
         if self.config.present_mode != mode {
             self.config.present_mode = mode;
@@ -675,13 +729,110 @@ impl Renderer {
                 surface.configure(&self.device, &self.config);
             }
         }
-        self.settings = settings;
     }
+
+    /// Rebuild what the current quality choice changed: the scene targets for a
+    /// new scale or anti-aliasing choice, the sun cascades for a new resolution,
+    /// and the largest shadow tile.
+    fn apply_resolved(&mut self) {
+        let wanted = self.settings.resolved(self.auto.level());
+        if wanted.scale != self.applied.scale || wanted.msaa != self.applied.msaa {
+            self.post = PostProcess::new(
+                &self.device,
+                self.config.width,
+                self.config.height,
+                self.config.format,
+                self.settings.with_resolved(wanted),
+                &self.sample_counts,
+            );
+        }
+        if wanted.shadows.cascade_size() != self.applied.shadows.cascade_size() {
+            self.sun.resize(&self.device, wanted.shadows.cascade_size());
+            self.light_gpu.set_sun(&self.device, self.sun.array());
+        }
+        if wanted.shadows.max_tile_class() != self.applied.shadows.max_tile_class() {
+            self.lights
+                .set_max_tile_class(wanted.shadows.max_tile_class());
+        }
+        self.applied = wanted;
+    }
+
+    /// Start Auto over from its first level, as a fresh capture wants.
+    pub fn reset_auto_quality(&mut self) {
+        self.auto = AutoQuality::default();
+        self.apply_resolved();
+    }
+
+    /// The level Auto has chosen, whether or not Quality is on Auto.
+    pub fn auto_level(&self) -> QualityLevel {
+        self.auto.level()
+    }
+
+    /// What is being drawn: "Auto (High)", "Ultra", "Custom".
+    pub fn quality_description(&self) -> String {
+        match self.settings.quality {
+            Quality::Auto => format!("Auto ({})", self.auto.level().label()),
+            other => other.label().to_owned(),
+        }
+    }
+
+    /// Chunk meshes, the memory their fingerprints take in bytes, and the time
+    /// spent making them so far in milliseconds.
+    pub fn fingerprint_stats(&self) -> (usize, usize, f64) {
+        (
+            self.chunks.len(),
+            self.prints.len() * std::mem::size_of::<Fingerprint>(),
+            self.fingerprint_ms,
+        )
+    }
+
+    /// Bytes of GPU memory the sun's cascades use at the current resolution.
+    pub fn sun_cascade_bytes(&self) -> u64 {
+        SunShadows::bytes(self.sun.size())
+    }
+
     pub fn render_description(&self) -> String {
         format!(
-            "{}x{} / {}x MSAA / {:?}",
-            self.post.size[0], self.post.size[1], self.post.samples, self.config.present_mode
+            "{}x{} / {}x MSAA / {:?} / sun {}x3 / quality {}",
+            self.post.size[0],
+            self.post.size[1],
+            self.post.samples,
+            self.config.present_mode,
+            self.sun.size(),
+            self.quality_description(),
         )
+    }
+
+    /// Judge the last frame against the display and let Auto move a level.
+    fn step_auto_quality(&mut self) {
+        let now = std::time::Instant::now();
+        let interval = self
+            .display
+            .last_draw
+            .replace(now)
+            .map(|last| (now - last).as_secs_f32() * 1000.0);
+        if self.settings.quality != Quality::Auto {
+            return;
+        }
+        let Some(budget) = self.display.refresh_ms(self.window.as_deref()) else {
+            return;
+        };
+        let changed = if self.timing.supported() {
+            // One sample for every frame whose timestamps have come back.
+            let serial = self.timing.latest_serial();
+            match self.timing.latest_span {
+                Some(span) if serial != self.display.gpu_serial => {
+                    self.display.gpu_serial = serial;
+                    self.auto.observe(span as f32, budget, Measure::GpuTime)
+                }
+                _ => None,
+            }
+        } else {
+            interval.and_then(|ms| self.auto.observe(ms, budget, Measure::Interval))
+        };
+        if changed.is_some() {
+            self.apply_resolved();
+        }
     }
     /// Lights drawn, shadowed and rendered this frame, for the debug overlay.
     pub fn lighting_description(&self) -> String {
@@ -805,30 +956,28 @@ impl Renderer {
             width,
             height,
             self.config.format,
-            self.settings,
+            self.settings.with_resolved(self.applied),
             &self.sample_counts,
         );
     }
     pub fn rebuild_all(&mut self, world: &World) {
-        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.sun.invalidate_all();
         self.lights.invalidate_all();
         self.chunks.clear();
+        self.prints.clear();
         self.rebuild_meshes(world, &world.chunk_keys());
         self.rebuild_volumes(world);
     }
     /// Treat every cached shadow as stale, as after an edit that touches
     /// everything, without rebuilding any geometry.
     pub fn invalidate_shadows(&mut self) {
-        self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        self.sun.invalidate_all();
         self.lights.invalidate_all();
     }
     pub fn rebuild_volumes(&mut self, world: &World) {
         self.volumes.rebuild(&self.device, world);
     }
     pub fn rebuild(&mut self, world: &World, keys: &[ChunkKey]) {
-        if !keys.is_empty() {
-            self.geometry_revision = self.geometry_revision.wrapping_add(1);
-        }
         self.rebuild_meshes(world, keys);
     }
     fn rebuild_meshes(&mut self, world: &World, keys: &[ChunkKey]) {
@@ -859,6 +1008,19 @@ impl Renderer {
                 dirty = dirty.union(mesh.bounds);
             }
             self.lights.invalidate_bounds(dirty);
+            // The sun redraws only where triangles differ from the old mesh's.
+            let started = std::time::Instant::now();
+            let print = Fingerprint::of(min, CHUNK_SIZE as f32, &gpu, &indices);
+            let old_print = self.prints.get(&key).copied().unwrap_or(Fingerprint::EMPTY);
+            if let Some(changed) = print.changed_since(&old_print, min, CHUNK_SIZE as f32) {
+                self.sun.invalidate_bounds(changed);
+            }
+            if print.is_empty() {
+                self.prints.remove(&key);
+            } else {
+                self.prints.insert(key, print);
+            }
+            self.fingerprint_ms += started.elapsed().as_secs_f64() * 1000.0;
             match mesh {
                 Some(mesh) => self.chunks.insert(key, mesh),
                 None => self.chunks.remove(&key),
@@ -867,8 +1029,8 @@ impl Renderer {
         self.triangles = self.chunks.values().map(|m| m.count as usize / 3).sum();
     }
     pub fn objects(&mut self, vertices: &[GpuVertex], indices: &[u32]) {
+        // The cascades learn which objects changed from the list each frame.
         self.objects = GpuMesh::new(&self.device, vertices, indices);
-        self.geometry_revision = self.geometry_revision.wrapping_add(1);
     }
     // These inputs borrow the frame's game and UI data directly; a second state
     // container would only duplicate the caller's existing ownership.
@@ -895,6 +1057,7 @@ impl Renderer {
             .map(|s| s.get_current_texture())
             .transpose()?;
         self.timing.begin(&self.device, &self.queue);
+        self.step_auto_quality();
         let underwater =
             world.volume_material_at(eye) == Some(sauerteig_core::VolumeMaterial::Water);
         let two_sided_terrain = culling::camera_intersects_terrain(world, eye);
@@ -908,11 +1071,12 @@ impl Renderer {
         let view_projection = proj * view;
         let camera_frustum = Frustum::new(view_projection);
         let sun = Vec3::new(-0.44, 0.76, 0.34).normalize();
-        let sun_projection = sun_shadow_matrix(sun, eye);
-        let sun_frustum = Frustum::new(sun_projection);
+        let cascades = sun_cascades(sun, eye, self.sun.size());
+        let cascade_frustums = cascades.map(|c| Frustum::new(c.matrix));
         let uniform = CameraUniform {
             view_proj: view_projection.to_cols_array_2d(),
-            light_view_proj: sun_projection.to_cols_array_2d(),
+            cascades: cascades.map(|c| c.matrix.to_cols_array_2d()),
+            cascade_texel: [cascades[0].texel, cascades[1].texel, cascades[2].texel, 0.0],
             eye_time: [eye.x, eye.y, eye.z, time],
             sun: [sun.x, sun.y, sun.z, 0.0],
             fog: if underwater {
@@ -975,7 +1139,7 @@ impl Renderer {
             })
             .collect();
         self.props
-            .prepare(&self.queue, objects, eye, &sun_frustum, &tile_views);
+            .prepare(&self.queue, objects, eye, &cascade_frustums, &tile_views);
         self.volumes
             .prepare(&self.queue, eye, direction, &camera_frustum);
         self.queue
@@ -1020,60 +1184,59 @@ impl Renderer {
             &screen,
         );
         self.shadow_updates = plan.jobs.len();
-        if self
-            .sun_cache
-            .stamp
-            .update(sun_projection, self.geometry_revision)
-        {
-            self.shadow_updates += 1;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sun static"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.sun_cache.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: self.timing.pass("sun static"),
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.camera_group, &[]);
-            pass.set_vertex_buffer(1, self.identity_instance.slice(..));
-            for mesh in self.chunks.values() {
-                if sun_frustum.intersects(mesh.bounds) {
-                    mesh.draw(&mut pass);
+        if let Some(changed) = self.sun_objects.update(objects) {
+            if changed.len() > MAX_OBJECT_EDITS {
+                self.sun.invalidate_all();
+            } else {
+                for position in changed {
+                    self.sun
+                        .invalidate_bounds(Bounds::around(position, OBJECT_REACH));
                 }
             }
-            if let Some(mesh) = &self.objects {
-                mesh.draw(&mut pass);
-            }
-            self.props.draw_shadow(&mut pass, ShadowTarget::Sun);
         }
-        self.sun_cache
-            .copy_to(&mut encoder, &self.shadow_texture, 0);
-        if shadow_index_count > 0 {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("sun actors"),
-                color_attachments: &[],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: self.timing.pass("sun actors"),
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.shadow_pipeline);
-            pass.set_bind_group(0, &self.camera_group, &[]);
-            pass.set_vertex_buffer(1, self.identity_instance.slice(..));
-            self.dynamic.draw_prefix(&mut pass, shadow_index_count);
+        let updates = self.sun.prepare(&self.queue, &cascades);
+        self.sun_texels = self.sun.texels(&updates);
+        {
+            let chunks = &self.chunks;
+            let objects_mesh = &self.objects;
+            let props = &self.props;
+            let identity = &self.identity_instance;
+            let size = self.sun.size();
+            self.shadow_updates += self.sun.render_static(
+                &mut encoder,
+                &mut self.timing,
+                &updates,
+                &mut |pass, i, rect| {
+                    pass.set_vertex_buffer(1, identity.slice(..));
+                    for mesh in chunks.values() {
+                        if cascade_frustums[i].intersects(mesh.bounds)
+                            && rect.is_none_or(|rect| {
+                                sun::texel_rect(cascades[i].matrix, mesh.bounds, size)
+                                    .is_some_and(|mesh_rect| mesh_rect.overlaps(rect))
+                            })
+                        {
+                            mesh.draw(pass);
+                        }
+                    }
+                    if let Some(mesh) = objects_mesh {
+                        mesh.draw(pass);
+                    }
+                    props.draw_shadow(pass, ShadowTarget::Cascade(i));
+                },
+            );
+        }
+        {
+            let dynamic = &self.dynamic;
+            let identity = &self.identity_instance;
+            self.sun.render_actors(
+                &mut encoder,
+                &mut self.timing,
+                shadow_index_count > 0,
+                &mut |pass| {
+                    pass.set_vertex_buffer(1, identity.slice(..));
+                    dynamic.draw_prefix(pass, shadow_index_count);
+                },
+            );
         }
         {
             let chunks = &self.chunks;

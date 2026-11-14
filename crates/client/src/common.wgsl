@@ -5,7 +5,9 @@ fn rotate_y(p: vec3<f32>, yaw: f32) -> vec3<f32> {
 }
 struct Camera {
     view_proj: mat4x4<f32>,
-    light_view_proj: mat4x4<f32>,
+    // The sun's three cascades, nearest first, and their texel sizes in metres.
+    cascades: array<mat4x4<f32>, 3>,
+    cascade_texel: vec4<f32>,
     eye_time: vec4<f32>,
     sun: vec4<f32>,
     fog: vec4<f32>,
@@ -35,7 +37,7 @@ struct LightParams {
 };
 // Camera and lighting bindings follow the reusable types.
 @group(0) @binding(0) var<uniform> camera: Camera;
-@group(1) @binding(0) var shadow_map: texture_depth_2d;
+@group(1) @binding(0) var shadow_map: texture_depth_2d_array;
 @group(1) @binding(1) var shadow_sampler: sampler_comparison;
 @group(1) @binding(2) var atlas: texture_depth_2d_array;
 @group(1) @binding(5) var<uniform> light_params: LightParams;
@@ -69,6 +71,13 @@ fn depth_gradient(matrix: mat4x4<f32>, clip: vec4<f32>, normal: vec3<f32>) -> ve
 const NORMAL_OFFSET: f32 = 1.5;
 const DEPTH_BIAS: f32 = 1.0;
 const TRANSPARENT_LIGHTS: u32 = 8u;
+// The sun: receiver offset along the normal in cascade texels (never under
+// 4 mm), the depth bias in clip depth, and how much of a cascade's edge fades
+// into the next one.
+const SUN_NORMAL_OFFSET: f32 = 0.13;
+const SUN_MIN_OFFSET: f32 = 0.004;
+const SUN_DEPTH_BIAS: f32 = 0.00003;
+const CASCADE_FADE: f32 = 0.1;
 // Irradiance below which a light is skipped, and above which its shadow takes
 // the full four taps. The sun adds about 0.85.
 const FAINT_LIGHT: f32 = 0.004;
@@ -295,4 +304,47 @@ fn shade_local_lights(frag: vec4<f32>, s: Surface, cap: u32) -> LightSum {
         }
     }
     return sum;
+}
+
+// The sun's light in one cascade: x is the fraction that reaches the point, y
+// is how far inside the cascade's window the point lies, from 0 at its edge
+// (or outside it) to 1 clear of the fade band.
+fn cascade_sample(index: u32, position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    let matrix = camera.cascades[index];
+    let texel_size = camera.cascade_texel[index];
+    let moved = position + normal * max(SUN_MIN_OFFSET, texel_size * SUN_NORMAL_OFFSET);
+    let clip = matrix * vec4<f32>(moved, 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let size = vec2<f32>(textureDimensions(shadow_map));
+    // The filter reaches one texel past the point; stay a texel clear of the edge.
+    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) - 2.0 / size.x;
+    if (edge <= 0.0 || ndc.z <= 0.0 || ndc.z >= 1.0) { return vec2<f32>(1.0, 0.0); }
+    let texel = 1.0 / size;
+    let gradient = depth_gradient(matrix, clip, normal);
+    let bias = SUN_DEPTH_BIAS + dot(abs(gradient), texel) * 0.5;
+    var sum = 0.0;
+    for (var x = -1; x <= 1; x += 1) {
+        for (var y = -1; y <= 1; y += 1) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            sum += textureSampleCompareLevel(shadow_map, shadow_sampler,
+                uv + offset, i32(index), ndc.z + dot(gradient, offset) - bias);
+        }
+    }
+    return vec2<f32>(sum / 9.0, smoothstep(0.0, CASCADE_FADE, edge));
+}
+
+// Fraction of the sun that reaches a point, from the nearest cascade that
+// holds it, blended into the next one across the nearer cascade's edge. Past
+// the last cascade, the sun is unshadowed.
+fn sun_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    var result = 0.0;
+    var remaining = 1.0;
+    for (var i = 0u; i < 3u; i += 1u) {
+        let s = cascade_sample(i, position, normal);
+        result += remaining * s.y * s.x;
+        remaining *= 1.0 - s.y;
+        if (remaining <= 0.0) { break; }
+    }
+    return result + remaining;
 }

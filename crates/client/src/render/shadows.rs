@@ -5,54 +5,6 @@ use super::{
 };
 use glam::Mat4;
 
-#[derive(Default)]
-pub(super) struct ShadowStamp {
-    matrix: Option<Mat4>,
-    revision: u64,
-}
-impl ShadowStamp {
-    pub fn update(&mut self, matrix: Mat4, revision: u64) -> bool {
-        let changed = self.matrix != Some(matrix) || self.revision != revision;
-        self.matrix = Some(matrix);
-        self.revision = revision;
-        changed
-    }
-}
-
-/// The sun's cached static map; actors draw over a copy of it each frame.
-pub(super) struct CachedShadow {
-    pub texture: wgpu::Texture,
-    pub depth: wgpu::TextureView,
-    pub stamp: ShadowStamp,
-}
-impl CachedShadow {
-    pub fn new(device: &wgpu::Device, size: u32) -> Self {
-        let texture = depth_texture(device, size, 1, "static shadow cache");
-        let depth = texture.create_view(&Default::default());
-        Self {
-            texture,
-            depth,
-            stamp: ShadowStamp::default(),
-        }
-    }
-    pub fn copy_to(&self, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture, layer: u32) {
-        encoder.copy_texture_to_texture(
-            self.texture.as_image_copy(),
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            self.texture.size(),
-        );
-    }
-}
-
 pub(super) fn depth_texture(
     device: &wgpu::Device,
     size: u32,
@@ -98,7 +50,7 @@ const PAGE_LABELS: [&str; 15] = [
 /// The most atlas pages: their sizes share one 32-bit table with the overlay's.
 pub(super) const MAX_PAGES: usize = PAGE_LABELS.len() - 1;
 /// Tile cameras are bound with dynamic offsets of this stride.
-const CAMERA_STRIDE: u64 = 256;
+pub(super) const CAMERA_STRIDE: u64 = 256;
 /// Atlas tiles and overlay tiles that can render in one frame.
 pub(super) const MAX_TILE_VIEWS: usize = 40;
 
@@ -343,17 +295,6 @@ impl ShadowAtlasGpu {
 mod tests {
     use super::*;
     use crate::render::atlas::TileClass;
-    use glam::Vec3;
-
-    #[test]
-    fn cached_shadows_invalidate_on_geometry_or_window_change() {
-        let mut stamp = ShadowStamp::default();
-        assert!(stamp.update(Mat4::IDENTITY, 0));
-        assert!(!stamp.update(Mat4::IDENTITY, 0));
-        assert!(stamp.update(Mat4::IDENTITY, 1));
-        assert!(stamp.update(Mat4::from_translation(Vec3::X), 1));
-        assert!(!stamp.update(Mat4::from_translation(Vec3::X), 1));
-    }
 
     #[test]
     fn tile_classes_tile_the_page_exactly() {

@@ -1,3 +1,4 @@
+use super::atlas::TileClass;
 use serde::{Deserialize, Serialize};
 
 // Auto's rule, from throughput measurements at 4K on an M5 Pro (docs/tracking/
@@ -71,14 +72,167 @@ impl Antialiasing {
     }
 }
 
+/// How much detail the sun's and the lights' shadows have: the sun cascades'
+/// resolution and the largest tile a light's shadow may use. It never changes
+/// which lights are shadowed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowDetail {
+    Low,
+    Medium,
+    #[default]
+    High,
+    Ultra,
+}
+impl ShadowDetail {
+    pub const ALL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::Ultra];
+
+    /// Texels along one side of each sun cascade.
+    pub fn cascade_size(self) -> u32 {
+        match self {
+            Self::Low => 512,
+            Self::Medium | Self::High => 1024,
+            Self::Ultra => 2048,
+        }
+    }
+
+    /// The largest atlas tile a light's shadow may use.
+    pub fn max_tile_class(self) -> TileClass {
+        match self {
+            Self::Low => TileClass::Small,
+            Self::Medium => TileClass::Medium,
+            Self::High | Self::Ultra => TileClass::Large,
+        }
+    }
+
+    pub fn label(self) -> String {
+        format!(
+            "{} (sun {}, lights {})",
+            match self {
+                Self::Low => "Low",
+                Self::Medium => "Medium",
+                Self::High => "High",
+                Self::Ultra => "Ultra",
+            },
+            self.cascade_size(),
+            self.max_tile_class().size(),
+        )
+    }
+}
+
+/// The fixed quality levels, lowest first. A level sets the render scale, the
+/// anti-aliasing count and the shadow detail, and nothing else: every level
+/// lights and shadows the same lights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityLevel {
+    Low,
+    Medium,
+    High,
+    Ultra,
+}
+
+/// What a level or a custom choice asks the renderer for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Resolved {
+    pub scale: f32,
+    pub msaa: Antialiasing,
+    pub shadows: ShadowDetail,
+}
+
+impl QualityLevel {
+    pub const ALL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::Ultra];
+    /// Where Auto begins.
+    pub const START: Self = Self::High;
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL[index.min(Self::ALL.len() - 1)]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Ultra => "Ultra",
+        }
+    }
+
+    pub fn resolved(self) -> Resolved {
+        let (scale, msaa, shadows) = match self {
+            Self::Low => (0.75, Antialiasing::Off, ShadowDetail::Low),
+            Self::Medium => (1.0, Antialiasing::X2, ShadowDetail::Medium),
+            Self::High => (1.0, Antialiasing::X4, ShadowDetail::High),
+            Self::Ultra => (1.0, Antialiasing::X8, ShadowDetail::Ultra),
+        };
+        Resolved {
+            scale,
+            msaa,
+            shadows,
+        }
+    }
+}
+
+/// The Quality setting: Auto, a fixed level, or the individual choices below.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    /// Moves between levels from measured frame times.
+    #[default]
+    Auto,
+    Low,
+    Medium,
+    High,
+    Ultra,
+    /// Render scale, shadow detail and anti-aliasing chosen by hand.
+    Custom,
+}
+impl Quality {
+    pub fn level(self) -> Option<QualityLevel> {
+        match self {
+            Self::Low => Some(QualityLevel::Low),
+            Self::Medium => Some(QualityLevel::Medium),
+            Self::High => Some(QualityLevel::High),
+            Self::Ultra => Some(QualityLevel::Ultra),
+            Self::Auto | Self::Custom => None,
+        }
+    }
+
+    pub const ALL: [Self; 6] = [
+        Self::Auto,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Ultra,
+        Self::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Custom => "Custom",
+            fixed => fixed.level().map_or("", QualityLevel::label),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "RawSettings")]
 pub struct RenderSettings {
     pub bloom: f32,
+    /// The anti-aliasing choice when `quality` is Custom.
     pub msaa: Antialiasing,
+    /// The render scale when `quality` is Custom.
     pub scale: f32,
     pub exposure: f32,
     pub vsync: bool,
+    pub quality: Quality,
+    /// The shadow detail when `quality` is Custom.
+    pub shadows: ShadowDetail,
 }
 impl Default for RenderSettings {
     fn default() -> Self {
@@ -88,6 +242,45 @@ impl Default for RenderSettings {
             scale: 1.0,
             exposure: 1.0,
             vsync: true,
+            quality: Quality::Auto,
+            shadows: ShadowDetail::High,
+        }
+    }
+}
+
+/// Saved settings as they come off disk. Files from before Quality existed
+/// have a scale and an anti-aliasing choice but no quality: those that differ
+/// from the old defaults were made by hand, so they load as Custom.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawSettings {
+    bloom: Option<f32>,
+    msaa: Option<Antialiasing>,
+    scale: Option<f32>,
+    exposure: Option<f32>,
+    vsync: Option<bool>,
+    quality: Option<Quality>,
+    shadows: Option<ShadowDetail>,
+}
+impl From<RawSettings> for RenderSettings {
+    fn from(raw: RawSettings) -> Self {
+        let defaults = Self::default();
+        let msaa = raw.msaa.unwrap_or(defaults.msaa);
+        let scale = raw.scale.unwrap_or(defaults.scale);
+        Self {
+            bloom: raw.bloom.unwrap_or(defaults.bloom),
+            msaa,
+            scale,
+            exposure: raw.exposure.unwrap_or(defaults.exposure),
+            vsync: raw.vsync.unwrap_or(defaults.vsync),
+            quality: raw
+                .quality
+                .unwrap_or(if msaa == defaults.msaa && scale == defaults.scale {
+                    Quality::Auto
+                } else {
+                    Quality::Custom
+                }),
+            shadows: raw.shadows.unwrap_or(defaults.shadows),
         }
     }
 }
@@ -106,6 +299,38 @@ impl RenderSettings {
             exposure: finite(self.exposure, 1.0, 0.25, 4.0),
             ..self
         }
+    }
+
+    /// These settings with the scale and anti-aliasing a resolved choice asks
+    /// for, as the scene targets are built from.
+    pub fn with_resolved(self, resolved: Resolved) -> Self {
+        Self {
+            scale: resolved.scale,
+            msaa: resolved.msaa,
+            shadows: resolved.shadows,
+            ..self
+        }
+    }
+
+    /// What the renderer should draw with: the chosen level's settings, Auto's
+    /// current level's, or the individual choices.
+    pub fn resolved(&self, auto: QualityLevel) -> Resolved {
+        match self.quality {
+            Quality::Auto => auto.resolved(),
+            Quality::Custom => Resolved {
+                scale: self.scale,
+                msaa: self.msaa,
+                shadows: self.shadows,
+            },
+            fixed => fixed
+                .level()
+                .map_or_else(Resolved::default, QualityLevel::resolved),
+        }
+    }
+}
+impl Default for Resolved {
+    fn default() -> Self {
+        QualityLevel::START.resolved()
     }
 }
 
@@ -217,5 +442,77 @@ mod tests {
             assert_eq!(load(&saved), choice);
         }
         assert_eq!(serde_json::to_string(&Antialiasing::X4).unwrap(), r#""x4""#);
+    }
+
+    #[test]
+    fn saved_settings_without_a_quality_keep_what_the_player_chose() {
+        let load = |text: &str| serde_json::from_str::<RenderSettings>(text).unwrap();
+        // Settings that only change what Quality doesn't govern stay Auto.
+        assert_eq!(
+            load(r#"{"bloom":0.1,"vsync":false}"#).quality,
+            Quality::Auto
+        );
+        assert_eq!(
+            load(r#"{"scale":1.0,"msaa":"auto"}"#).quality,
+            Quality::Auto
+        );
+        // A hand-picked scale or anti-aliasing count is Custom, with its values.
+        let scaled = load(r#"{"scale":0.8}"#);
+        assert_eq!((scaled.quality, scaled.scale), (Quality::Custom, 0.8));
+        let aa = load(r#"{"msaa":"x4"}"#);
+        assert_eq!((aa.quality, aa.msaa), (Quality::Custom, Antialiasing::X4));
+        assert_eq!(load(r#"{"msaa":"on"}"#).quality, Quality::Custom);
+        // A saved quality wins, and round trips.
+        for quality in Quality::ALL {
+            let saved = serde_json::to_string(&RenderSettings {
+                quality,
+                shadows: ShadowDetail::Ultra,
+                ..Default::default()
+            })
+            .unwrap();
+            let back = load(&saved);
+            assert_eq!(back.quality, quality);
+            assert_eq!(back.shadows, ShadowDetail::Ultra);
+        }
+        assert_eq!(
+            load(r#"{"quality":"high","scale":0.6}"#).quality,
+            Quality::High
+        );
+    }
+
+    #[test]
+    fn levels_get_stronger_and_a_choice_by_hand_is_custom() {
+        let costs: Vec<_> = QualityLevel::ALL.iter().map(|l| l.resolved()).collect();
+        let samples = |r: &Resolved| r.msaa.samples(1, &[1, 2, 4, 8]);
+        for pair in costs.windows(2) {
+            assert!(pair[0].scale <= pair[1].scale);
+            assert!(samples(&pair[0]) <= samples(&pair[1]));
+            assert!(pair[0].shadows.cascade_size() <= pair[1].shadows.cascade_size());
+            assert!(pair[0].shadows.max_tile_class() <= pair[1].shadows.max_tile_class());
+        }
+        let settings = RenderSettings {
+            quality: Quality::Ultra,
+            scale: 0.6,
+            msaa: Antialiasing::Off,
+            ..Default::default()
+        };
+        // A fixed level ignores the individual fields; Custom uses them.
+        assert_eq!(
+            settings.resolved(QualityLevel::Low),
+            QualityLevel::Ultra.resolved()
+        );
+        let custom = RenderSettings {
+            quality: Quality::Custom,
+            ..settings
+        };
+        assert_eq!(custom.resolved(QualityLevel::Ultra).scale, 0.6);
+        let auto = RenderSettings {
+            quality: Quality::Auto,
+            ..settings
+        };
+        assert_eq!(
+            auto.resolved(QualityLevel::Medium),
+            QualityLevel::Medium.resolved()
+        );
     }
 }

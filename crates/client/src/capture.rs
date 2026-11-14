@@ -62,6 +62,11 @@ struct Pose {
     speed: f32,
     #[serde(default = "default_dwell")]
     dwell: usize,
+    /// A cell to change and change back, one block at a time, after the pose's
+    /// frames: the report gives the GPU time of the sun's shadow passes in the
+    /// frame after each edit.
+    #[serde(default)]
+    block_edit: Option<[i32; 3]>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -195,6 +200,11 @@ fn is_shadow_pass(label: &str) -> bool {
         .any(|prefix| label.starts_with(prefix))
 }
 
+/// The sun's passes that draw static geometry, not the actors over it.
+fn is_sun_static_pass(label: &str) -> bool {
+    label.starts_with("sun static") || label.starts_with("sun cascade")
+}
+
 /// The atlas's tile and overlay passes alone, without the sun's window.
 fn is_atlas_pass(label: &str) -> bool {
     label.starts_with("shadow")
@@ -241,6 +251,9 @@ pub fn run() -> Result<(), String> {
                     "unshadowed" => OverBudget::Unshadowed,
                     _ => return Err("Use --over-budget fade or unshadowed".into()),
                 }
+            }
+            "--display-hz" => {
+                options.display_hz = Some(value.parse().map_err(|_| "Invalid refresh rate")?)
             }
             "--poses" => poses = Some(PathBuf::from(value)),
             "--output" => output = Some(PathBuf::from(value)),
@@ -305,6 +318,62 @@ pub fn run() -> Result<(), String> {
         settings.normalized(),
         options,
     ))
+}
+
+/// Change one cell and change it back, `EDIT_REPEATS` times each way, drawing
+/// the frame after every edit. Returns the GPU time of the sun's static passes
+/// in those frames, and how many shadow maps they rendered.
+fn measure_block_edit(
+    renderer: &mut Renderer,
+    scene: &mut Scene,
+    mesh: &Geometry,
+    pose: &Pose,
+    context: &egui::Context,
+    size: [u32; 2],
+    pos: [i32; 3],
+) -> Result<serde_json::Value, String> {
+    const EDIT_REPEATS: usize = 6;
+    let original = scene.world.get(pos);
+    let changed = if original.is_some() {
+        None
+    } else {
+        Some(Cell::solid(2))
+    };
+    let mut sun_ms = Vec::new();
+    let mut maps = Vec::new();
+    for edit in 0..EDIT_REPEATS * 2 {
+        let cell = if edit % 2 == 0 { changed } else { original };
+        let dirty = scene.world.apply_edits(&[CellEdit { pos, cell }]);
+        renderer.rebuild(&scene.world, &dirty);
+        let shot = Shot {
+            pose,
+            world: &scene.world,
+            objects: &scene.objects,
+            mesh,
+            context,
+            size,
+        };
+        shot.draw(renderer)?;
+        maps.push(renderer.shadow_updates as f64);
+        let total = renderer.gpu_times().map(|times| {
+            times
+                .iter()
+                .filter(|(label, _)| is_sun_static_pass(label))
+                .map(|(_, ms)| ms)
+                .sum::<f64>()
+        });
+        sun_ms.extend(total);
+        for _ in 0..SETTLE_LIMIT {
+            if renderer.lighting_settled() {
+                break;
+            }
+            shot.draw(renderer)?;
+        }
+    }
+    Ok(serde_json::json!({
+        "cell": pos, "edits": EDIT_REPEATS * 2, "sun_static_gpu_ms": summary(&sun_ms),
+        "shadow_maps_rendered": summary(&maps),
+    }))
 }
 
 /// Throughput mode: draw `frames` frames back to back, wait once, and repeat
@@ -456,12 +525,20 @@ async fn capture(
     let mut scene = Scene::from((World::empty(), Vec::new()));
     for pose in poses {
         if loaded != pose.world {
+            let loading = Instant::now();
             scene = load_world(&pose.world)?;
             renderer.rebuild_all(&scene.world);
             let mesh = Geometry::objects(&scene.objects);
             renderer.objects(&mesh.vertices, &mesh.indices);
             renderer.set_extra_lights(scene.lights.clone());
             loaded.clone_from(&pose.world);
+            let (chunks, bytes, ms) = renderer.fingerprint_stats();
+            println!(
+                "loaded {} in {:.0} ms: {chunks} chunk meshes, fingerprints {:.1} MiB made in {ms:.0} ms",
+                pose.world,
+                loading.elapsed().as_secs_f64() * 1000.0,
+                bytes as f64 / 1048576.0,
+            );
         }
         let mut mesh = Geometry::default();
         let mut actors = pose.actors.clone();
@@ -501,6 +578,7 @@ async fn capture(
         let mut used = Vec::new();
         let mut plan_ms = Vec::new();
         let mut settle_frames = 0;
+        renderer.reset_auto_quality();
         for frame in 0..warmup {
             let (_, frame_ms) = shot.draw(&mut renderer)?;
             if frame == 0 {
@@ -516,6 +594,7 @@ async fn capture(
         let settled = renderer.lighting_settled();
         let (cameras, jumps) = camera_frames(pose, frames);
         let mut jump_settle: Vec<Option<usize>> = vec![None; jumps.len()];
+        let mut quality_changes = vec![(0, renderer.auto_level().index())];
         for (index, &(eye, look_at)) in cameras.iter().enumerate() {
             let (submitted, frame_ms) = shot.draw_from(&mut renderer, eye, look_at)?;
             if renderer.lighting_settled() {
@@ -524,6 +603,13 @@ async fn capture(
                 if let Some(last) = last.filter(|&last| jump_settle[last].is_none()) {
                     jump_settle[last] = Some(index - jumps[last] + 1);
                 }
+            }
+            let level = renderer.auto_level().index();
+            if quality_changes
+                .last()
+                .is_some_and(|&(_, last)| last != level)
+            {
+                quality_changes.push((index, level));
             }
             static_updates.push(renderer.shadow_updates);
             elapsed.push(frame_ms);
@@ -559,6 +645,18 @@ async fn capture(
             None
         };
         renderer.save_capture(&output.join(format!("{}.png", pose.name)))?;
+        let block_edit = match pose.block_edit {
+            Some(pos) => Some(measure_block_edit(
+                &mut renderer,
+                &mut scene,
+                &mesh,
+                pose,
+                &context,
+                [width, height],
+                pos,
+            )?),
+            None => None,
+        };
         let lit_clusters: Vec<f64> = renderer
             .cluster_counts()
             .into_iter()
@@ -596,7 +694,8 @@ async fn capture(
             "cache_hit_rate": (used_total > 0.0).then(|| 1.0 - rendered_total / used_total),
             "lighting_plan_cpu_ms": summary(&plan_ms),
             "lights_per_lit_cluster": summary(&lit_clusters), "lit_clusters": lit_clusters.len(),
-            "throughput_ms_per_frame": throughput_ms,
+            "throughput_ms_per_frame": throughput_ms, "block_edit": block_edit,
+            "auto_level_changes": quality_changes,
         });
         println!("{}", serde_json::to_string(&report).unwrap());
         reports.push(report);
@@ -605,6 +704,7 @@ async fn capture(
         "adapter_description": renderer.adapter_description,
         "material_texture_bytes": renderer.materials.texture_bytes, "width": width, "height": height,
         "frames": frames, "warmup": warmup, "settings": settings, "effective": renderer.render_description(),
+        "sun_cascade_bytes": renderer.sun_cascade_bytes(),
         "sample_counts": renderer.sample_counts(), "brute_force": options.brute_force,
         "over_budget": format!("{:?}", options.over_budget),
         "timing": "headless serial submit + GPU completion; excludes PNG readback, UI generation, simulation and presentation",
@@ -622,6 +722,7 @@ mod tests {
     use crate::{
         lighting::{LightDesc, ShadowMode},
         render::clusters::ClusterGrid,
+        render::settings::Quality,
     };
 
     const SIZE: [u32; 2] = [321, 181];
@@ -767,6 +868,7 @@ mod tests {
 
         for settings in [
             RenderSettings {
+                quality: Quality::Custom,
                 scale: 0.5,
                 msaa: crate::render::settings::Antialiasing::Off,
                 bloom: 0.0,
@@ -787,6 +889,154 @@ mod tests {
             assert!(pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[1] > p[0]));
         }
+    }
+
+    /// A renderer built from nothing but this scene, drawn until settled.
+    fn from_scratch(
+        world: &World,
+        objects: &[WorldObject],
+        settings: RenderSettings,
+        eye: Vec3,
+        look_at: Vec3,
+    ) -> Vec<u8> {
+        let mut renderer = headless(RendererOptions::default());
+        renderer.apply_settings(settings);
+        renderer.rebuild_all(world);
+        let mesh = Geometry::objects(objects);
+        renderer.objects(&mesh.vertices, &mesh.indices);
+        settled(&mut renderer, world, objects, None, eye, look_at)
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; run explicitly with --ignored"]
+    fn gpu_sun_cascades_match_fresh_renders_after_edits_moves_and_level_changes() {
+        let eye = Vec3::new(0.0, 3.0, 7.0);
+        let look_at = Vec3::new(0.0, 2.0, -2.0);
+        let mut renderer = headless(RendererOptions::default());
+        let Scene {
+            mut world,
+            mut objects,
+            ..
+        } = load(&mut renderer, "materials");
+        let before = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(
+            before,
+            from_scratch(&world, &objects, RenderSettings::default(), eye, look_at)
+        );
+        frame(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(renderer.sun_texels, 0, "nothing changed, nothing redrawn");
+
+        // One block redraws a small part of the cascades, and the result is
+        // what a renderer that never saw the old block draws.
+        let dirty = world.apply_edits(&[CellEdit {
+            pos: [2, 1, 0],
+            cell: Some(Cell::solid(2)),
+        }]);
+        renderer.rebuild(&world, &dirty);
+        frame(&mut renderer, &world, &objects, None, eye, look_at);
+        let whole = 3 * 1024 * 1024;
+        println!("one block redrew {} of {whole} texels", renderer.sun_texels);
+        assert!(renderer.sun_texels > 0);
+        assert!(renderer.sun_texels < whole / 3, "{}", renderer.sun_texels);
+        let edited = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_ne!(edited, before, "the block must change the picture");
+        assert_eq!(
+            edited,
+            from_scratch(&world, &objects, RenderSettings::default(), eye, look_at)
+        );
+
+        // Removing it again, and a prop that moves, redraw their old and new
+        // places.
+        let dirty = world.apply_edits(&[CellEdit {
+            pos: [2, 1, 0],
+            cell: None,
+        }]);
+        renderer.rebuild(&world, &dirty);
+        let removed = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_eq!(removed, before);
+        objects[1].position.x += 2.5;
+        frame(&mut renderer, &world, &objects, None, eye, look_at);
+        assert!(renderer.sun_texels > 0 && renderer.sun_texels < whole / 3);
+        let moved = settled(&mut renderer, &world, &objects, None, eye, look_at);
+        assert_ne!(moved, before);
+        assert_eq!(
+            moved,
+            from_scratch(&world, &objects, RenderSettings::default(), eye, look_at)
+        );
+
+        // Walking far enough moves the windows, and they redraw whole.
+        let walked = eye + Vec3::new(9.0, 1.0, -3.0);
+        frame(&mut renderer, &world, &objects, None, walked, look_at);
+        assert!(renderer.sun_texels >= 1024 * 1024);
+        let after = settled(&mut renderer, &world, &objects, None, walked, look_at);
+        assert_eq!(
+            after,
+            from_scratch(&world, &objects, RenderSettings::default(), walked, look_at)
+        );
+
+        // Each fixed level draws what a renderer started at that level does.
+        // The eye is near the lamp, whose shadow tiles then ask for the
+        // largest size at every level that allows it, so the tile sizes'
+        // hysteresis cannot make two histories differ.
+        let near = Vec3::new(1.0, 5.0, -1.0);
+        for quality in [
+            Quality::Low,
+            Quality::Ultra,
+            Quality::Medium,
+            Quality::High,
+            Quality::Auto,
+        ] {
+            let settings = RenderSettings {
+                quality,
+                ..Default::default()
+            };
+            renderer.apply_settings(settings);
+            // Tiles of a new size wait out their residency before they change.
+            for _ in 0..90 {
+                frame(&mut renderer, &world, &objects, None, near, look_at);
+            }
+            let pixels = settled(&mut renderer, &world, &objects, None, near, look_at);
+            let fresh = from_scratch(&world, &objects, settings, near, look_at);
+            println!("{quality:?}: {} bytes differ", differing(&pixels, &fresh));
+            assert_eq!(pixels, fresh, "{quality:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU; run explicitly with --ignored"]
+    fn gpu_actors_shadow_the_near_cascades_and_nothing_stays_behind() {
+        let eye = Vec3::new(0.0, 3.0, 7.0);
+        let look_at = Vec3::new(0.0, 2.0, -2.0);
+        let mut renderer = headless(RendererOptions::default());
+        let scene = load(&mut renderer, "materials");
+        let empty = settled(
+            &mut renderer,
+            &scene.world,
+            &scene.objects,
+            None,
+            eye,
+            look_at,
+        );
+        let actor = |x| Some(Vec3::new(x, 1.0, 1.0));
+        let there = frame(
+            &mut renderer,
+            &scene.world,
+            &scene.objects,
+            actor(-2.0),
+            eye,
+            look_at,
+        );
+        assert_eq!(renderer.sun_texels, 0, "an actor never redraws a cache");
+        assert_ne!(there, empty);
+        let gone = frame(
+            &mut renderer,
+            &scene.world,
+            &scene.objects,
+            None,
+            eye,
+            look_at,
+        );
+        assert_eq!(gone, empty, "the actor's shadow must not stay in the cache");
     }
 
     #[test]
@@ -876,6 +1126,7 @@ mod tests {
         let mut images = Vec::new();
         for choice in Antialiasing::choices(&counts) {
             renderer.apply_settings(RenderSettings {
+                quality: Quality::Custom,
                 msaa: choice,
                 ..Default::default()
             });

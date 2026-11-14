@@ -18,10 +18,9 @@ struct VertexOutput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
-    @location(3) light_clip: vec4<f32>,
-    @location(4) emission: f32,
-    @location(5) uv: vec2<f32>,
-    @location(6) @interpolate(flat) material: u32,
+    @location(3) emission: f32,
+    @location(4) uv: vec2<f32>,
+    @location(5) @interpolate(flat) material: u32,
 };
 @vertex fn vs_main(v: VertexInput) -> VertexOutput {
     let position = rotate_y(v.position,v.instance.w) + v.instance.xyz;
@@ -33,14 +32,8 @@ struct VertexOutput {
     o.uv = v.uv;
     o.material = v.material;
     o.color = v.color;
-    // A small world-space offset avoids self-shadow acne without pushing
-    // contact shadows centimetres away as a large depth-space bias did.
-    o.light_clip = camera.light_view_proj * vec4<f32>(position + normal * 0.012, 1.0);
     o.emission = v.emission;
     return o;
-}
-@vertex fn vs_shadow(v: VertexInput) -> @builtin(position) vec4<f32> {
-    return camera.light_view_proj * vec4<f32>(rotate_y(v.position,v.instance.w) + v.instance.xyz, 1.0);
 }
 @fragment fn fs_main(v: VertexOutput) -> @location(0) vec4<f32> {
     let geometric_normal = normalize(v.normal);
@@ -73,26 +66,7 @@ struct VertexOutput {
     let specular = mix(vec3<f32>(0.025), color * 0.25, metallic);
     let roughness_power = mix(180.0, 4.0, roughness * roughness);
     let sun = normalize(camera.sun.xyz);
-    let light_ndc = v.light_clip.xyz / v.light_clip.w;
-    let uv = light_ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    var visibility = 1.0;
-    if (all(uv > vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) && light_ndc.z > 0.0 && light_ndc.z < 1.0) {
-        var sum = 0.0;
-        let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map));
-        let gradient = depth_gradient(camera.light_view_proj, v.light_clip, geometric_normal);
-        let bias = 0.00003 + dot(abs(gradient), texel) * 0.5;
-        for (var x = -1; x <= 1; x += 1) {
-            for (var y = -1; y <= 1; y += 1) {
-                let offset = vec2<f32>(f32(x), f32(y)) * texel;
-                sum += textureSampleCompareLevel(shadow_map, shadow_sampler,
-                    uv + offset, light_ndc.z + dot(gradient, offset) - bias);
-            }
-        }
-        // Fade the bounded camera-following shadow window before its edge.
-        // Distant terrain remains sunlit instead of acquiring a moving hard seam.
-        let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-        visibility = mix(1.0, sum / 9.0, smoothstep(0.0, 0.08, edge));
-    }
+    let visibility = sun_visibility(v.position, geometric_normal);
     let ambient = mix(vec3<f32>(0.045, 0.055, 0.070), vec3<f32>(0.105, 0.13, 0.155), n.y * 0.5 + 0.5);
     var lit = color * (ambient * ao + vec3<f32>(0.85, 0.88, 0.90) * max(dot(n, sun), 0.0) * visibility);
     let view = normalize(camera.eye_time.xyz - v.position);

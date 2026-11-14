@@ -67,7 +67,10 @@ pub(super) struct LightGpu {
     layout: LightLayout,
     pub bind_layout: wgpu::BindGroupLayout,
     pub group: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
+    atlas: wgpu::TextureView,
     lights: wgpu::Buffer,
+    masks: wgpu::Buffer,
     params: wgpu::Buffer,
     cull: Cull,
     pub count: usize,
@@ -104,7 +107,7 @@ impl LightGpu {
                     0,
                     wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                 ),
@@ -148,9 +151,41 @@ impl LightGpu {
             std::mem::size_of::<LightParams>() as u64,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         );
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = Self::bind(
+            device,
+            &bind_layout,
+            [sun, atlas],
+            sampler,
+            [&lights, &masks, &params],
+        );
+        let cull = Cull::new(device, config, layout, &params, &masks);
+        Self {
+            config,
+            layout,
+            bind_layout,
+            group,
+            sampler: sampler.clone(),
+            atlas: atlas.clone(),
+            lights,
+            masks,
+            params,
+            cull,
+            count: 0,
+            last_views: Vec::new(),
+            last_scale: Vec2::ONE,
+        }
+    }
+
+    fn bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        [sun, atlas]: [&wgpu::TextureView; 2],
+        sampler: &wgpu::Sampler,
+        [lights, masks, params]: [&wgpu::Buffer; 3],
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lights and shadows"),
-            layout: &bind_layout,
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -177,20 +212,18 @@ impl LightGpu {
                     resource: params.as_entire_binding(),
                 },
             ],
-        });
-        let cull = Cull::new(device, config, layout, &params, &masks);
-        Self {
-            config,
-            layout,
-            bind_layout,
-            group,
-            lights,
-            params,
-            cull,
-            count: 0,
-            last_views: Vec::new(),
-            last_scale: Vec2::ONE,
-        }
+        })
+    }
+
+    /// Point the scene shaders at new sun cascade maps.
+    pub fn set_sun(&mut self, device: &wgpu::Device, sun: &wgpu::TextureView) {
+        self.group = Self::bind(
+            device,
+            &self.bind_layout,
+            [sun, &self.atlas],
+            &self.sampler,
+            [&self.lights, &self.masks, &self.params],
+        );
     }
 
     /// Write this frame's lights and parameters.

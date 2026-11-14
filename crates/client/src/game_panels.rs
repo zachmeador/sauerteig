@@ -1,5 +1,5 @@
 use super::*;
-use crate::render::settings::Antialiasing;
+use crate::render::settings::{Antialiasing, Quality, QualityLevel, ShadowDetail};
 
 impl Game {
     pub(super) fn poll_storage(&mut self) {
@@ -139,6 +139,7 @@ impl Game {
         ctx: &egui::Context,
         window: &Window,
         sample_counts: &[u32],
+        auto_level: QualityLevel,
     ) {
         if self.show_settings {
             let mut open = true;
@@ -170,23 +171,63 @@ impl Game {
                         ui.separator();
                         let before = self.preferences.render;
                         let render = &mut self.preferences.render;
+                        // A level, or Auto's current one, supplies the values
+                        // shown below. Changing one of them by hand makes the
+                        // quality Custom, starting from what was shown.
+                        let current = render.resolved(auto_level);
+                        let mut shown = current;
+                        let mut quality = render.quality;
+                        egui::ComboBox::from_label("Quality")
+                            .selected_text(match quality {
+                                Quality::Auto => format!("Auto ({})", auto_level.label()),
+                                other => other.label().to_owned(),
+                            })
+                            .show_ui(ui, |ui| {
+                                for choice in Quality::ALL {
+                                    ui.selectable_value(&mut quality, choice, choice.label());
+                                }
+                            });
+                        if quality != render.quality {
+                            render.quality = quality;
+                            if let Some(level) = quality.level() {
+                                render.scale = level.resolved().scale;
+                                render.msaa = level.resolved().msaa;
+                                render.shadows = level.resolved().shadows;
+                            } else {
+                                render.scale = current.scale;
+                                render.msaa = current.msaa;
+                                render.shadows = current.shadows;
+                            }
+                            shown = render.resolved(auto_level);
+                        }
                         let choices = Antialiasing::choices(sample_counts);
-                        let unsupported = !choices.contains(&render.msaa);
+                        let unsupported = !choices.contains(&shown.msaa);
                         egui::ComboBox::from_label("Anti-aliasing")
                             .selected_text(if unsupported {
-                                format!("{} (not supported here)", render.msaa.label())
+                                format!("{} (not supported here)", shown.msaa.label())
                             } else {
-                                render.msaa.label().to_owned()
+                                shown.msaa.label().to_owned()
                             })
                             .show_ui(ui, |ui| {
                                 for choice in choices {
-                                    ui.selectable_value(&mut render.msaa, choice, choice.label());
+                                    ui.selectable_value(&mut shown.msaa, choice, choice.label());
                                 }
                             });
+                        egui::ComboBox::from_label("Shadow detail")
+                            .selected_text(shown.shadows.label())
+                            .show_ui(ui, |ui| {
+                                for choice in ShadowDetail::ALL {
+                                    ui.selectable_value(&mut shown.shadows, choice, choice.label());
+                                }
+                            });
+                        ui.add(egui::Slider::new(&mut shown.scale, 0.5..=1.0).text("Render scale"));
+                        if shown != render.resolved(auto_level) {
+                            render.quality = Quality::Custom;
+                            render.scale = shown.scale;
+                            render.msaa = shown.msaa;
+                            render.shadows = shown.shadows;
+                        }
                         ui.checkbox(&mut render.vsync, "Vsync");
-                        ui.add(
-                            egui::Slider::new(&mut render.scale, 0.5..=1.0).text("Render scale"),
-                        );
                         ui.add(egui::Slider::new(&mut render.bloom, 0.0..=0.2).text("Bloom"));
                         ui.add(
                             egui::Slider::new(&mut render.exposure, 0.25..=4.0).text("Exposure"),

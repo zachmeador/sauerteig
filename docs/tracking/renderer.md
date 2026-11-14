@@ -12,10 +12,17 @@ measured on named hardware, not assumed.
 
 ## Current behavior
 
-- **Stages 1 and 2 and N1 are in place.** The scene renders in linear HDR with
-  bloom, filmic tonemapping, MSAA (Off, 2×, 4×, 8× where the adapter supports
-  them, and Auto), render scaling, motion interpolation, and per-pass GPU
-  timings in F3.
+- **Stages 1, 2 and 2b and N1 are in place.** The scene renders in linear HDR
+  with bloom, filmic tonemapping, MSAA (Off, 2×, 4×, 8× where the adapter
+  supports them, and Auto), render scaling, motion interpolation, and per-pass
+  GPU timings in F3.
+- **Quality levels** (Low, Medium, High, Ultra, Custom, and Auto, the default)
+  set render scale, anti-aliasing and shadow detail, and nothing else: every
+  level lights and shadows the same lights. Auto moves between levels from GPU
+  frame time against the display's refresh interval.
+- **The sun** has three cascades centred on the eye, reaching 15, 42 and 150 m,
+  that don't shimmer as the eye moves or turns. A rebuilt chunk or object
+  redraws only the texels it touches in each cascade.
 - **Lights.** Every light node in view is a clustered point light, up to 256
   ranked by range over distance. A cached atlas shadows up to 149 point lights,
   and lights it can't hold fade out rather than leak through walls, so
@@ -58,9 +65,9 @@ look on the 144 Hz 4K monitor.
 - **Shared shader code.** One WGSL module is assembled into each shader, and all
   five validate with Naga.
 - **Cached shadows.**
-  - The sun window (192 m, moving in 6 m steps) keeps a static-geometry shadow
-    cache, as local lights did until stage 2.
-  - Any geometry or object rebuild invalidates the sun's.
+  - The sun kept a static-geometry shadow cache in a single 192 m window, as
+    local lights did until stage 2; 2b replaced it with three cascades, and any
+    geometry or object rebuild redrew the whole window until then.
   - Moving actors are drawn over a copy each frame.
 - **Back-face culling** on opaque terrain.
   - Terrain falls back to two-sided drawing when the camera is inside geometry.
@@ -82,9 +89,6 @@ Gaps:
   throughput at 4K, within 6.06 ms (measured 2026-11-12). They are limited by
   geometry more than pixels: [octree](octree.md) O1a leaves out hidden faces,
   and the [large-worlds](large-worlds.md) track handles distance.
-- **Sun shadow invalidation is coarse.** Any geometry rebuild invalidates its
-  cache. Stage 2 keys local light caches by tile and version; the sun's cascades
-  (stage 2b) should too.
 - **Untested hardware paths:** adapters without timestamps or MSAA, and non-Fifo
   native presentation.
 
@@ -139,8 +143,8 @@ Gaps:
     target, and some earlier sessions missed it.
   - An edit storm at 4K has a 4.16 ms p99 for atlas updates, against a 3 ms
     target.
-- **The sun's static pass costs 7–9 ms** on the M3 Pro whenever its window or
-  geometry changes. Stage 2b's cascades address it.
+- **The sun's static pass cost 7–9 ms** on the M3 Pro whenever its window or
+  geometry changed. Stage 2b's cascades and chunk-scoped redraws replaced it.
 - **The actor overlay's 15 tiles run out** with four or more actors in a
   crowded, lit room. The lowest-ranked of the eight lights then drop actor
   shadows on some faces. N2 replaces the overlay.
@@ -487,10 +491,8 @@ to a scratch branch, runs the job, and passes on its logs.
 
 ### Stage 2b: sun cascades and quality tiers
 
-State: waits for N1, which reworks anti-aliasing and removes the lighting
-paths, so that "tier" means only the quality levels below. Wave 1: it starts
-when N1 merges, runs beside the rest of wave 1, and may still be open in wave
-2. N2 waits for it.
+State: merged on 2026-11-14. The maintainer hasn't seen it in the app, and
+nobody has run it on a reference machine or on Vulkan or DirectX 12 hardware.
 
 - **Decided:**
   - Quality tiers vary detail only: render scale, shadow resolution (atlas
@@ -537,17 +539,26 @@ when N1 merges, runs beside the rest of wave 1, and may still be open in wave
   `capture.rs`; when two of these are open at once, the second to merge
   rebases onto the first.
 - **Acceptance:**
-  - [ ] On the M5 Pro, a one-block edit inside the sun's range on a copy of
-    the_cube1m re-renders only part of a cascade. Record the sun passes' GPU
-    time for that frame before and after.
+  - [x] On the M5 Pro, a one-block edit inside the sun's range on a copy of
+    the_cube1m re-renders only part of a cascade: 3.05 ms of sun passes before
+    and 0.18 ms after beside the spawn, 3.5 to 4.3 ms before and 0.95 ms after
+    in the tower. See the results below.
   - [ ] Captures of the arena, materials and imported poses show sharper near
     shadows, with no gaps or doubled shadows at cascade boundaries. Flying
-    across the_cube1m in the app shows no shimmering at cascade edges.
-  - [ ] At every level, F3 shows the same lights drawn and shadowed on
-    imported-spawn, lightroom-center and lightroom-actors-16.
+    across the_cube1m in the app shows no shimmering at cascade edges. *Not
+    observed in the app.* The session looked at stills of the arena, materials
+    and imported poses from before and after and saw no seams, but none was
+    placed on a cascade boundary on purpose, and nobody could fly.
+  - [x] At every level, F3 shows the same lights drawn and shadowed on
+    imported-spawn, lightroom-center and lightroom-actors-16. Checked from the
+    capture report's lighting counts at all four levels (table below); F3
+    itself was not looked at.
   - [ ] On the M5 Pro at 4K and 165 Hz, Auto steps down where the default
     level misses 6.06 ms and steps back up afterwards, without flickering.
-  - [ ] The lowest level's GPU throughput on the M5 Pro at 1280×800 and
+    *Not observed in a live window.* The capture tool drove Auto along
+    imported-flight and a longer path at 4K and 165 Hz and did exactly that
+    (see below), but with serial frames, not a presented window.
+  - [x] The lowest level's GPU throughput on the M5 Pro at 1280×800 and
     1920×1080 is recorded for the scenes below, for comparison with a
     tester's.
   - [ ] **Needs a tester** ([platforms](platforms.md) stage 3): on a reference
@@ -556,15 +567,226 @@ when N1 merges, runs beside the rest of wave 1, and may still be open in wave
     Use the benchmark world's capture poses and the capture tool's lighting
     scenes (lightroom, corridor, waterglass, lamphall), and record the
     machine, its system, backend and driver, and the capture report. The check
-    stays open until someone runs it.
-  - [ ] Tests: cascade matrices don't move while the eye moves within a texel
+    stays open until someone runs it. No tester was available.
+  - [x] Tests: cascade matrices don't move while the eye moves within a texel
     or turns; cached cascades match fresh renders after edits, actor moves
     and level changes, extending the GPU test in `capture.rs` that compares
     cached shadows with fresh ones; Auto's choices, with hysteresis. The GPU
-    tests pass on the M5 Pro, and in N1b's job once it exists.
-- **Record at the end:** sun pass times before and after; cascade memory;
-  each level's settings and M5 Pro throughput; what Auto did along the
-  imported-flight path; the tester's results, or that none were available.
+    tests pass on the M5 Pro; N1b's job doesn't exist yet. Test names are in
+    the results.
+
+#### 2b results
+
+Measured and written on 2026-11-14 on the maintainer's M5 Pro (Apple M5 Pro,
+Metal), release builds. Other sessions were compiling throughout, so the
+one-minute load average at the start of each measured invocation is given.
+
+- **What changed.**
+  - `sun_cascades` in `lighting.rs` replaces `sun_shadow_matrix`. Each cascade
+    is a square window centred on the eye that reaches 15, 42 and 150 m in
+    every direction, so it depends on the eye's position and never on where the
+    eye looks. It moves in steps of 64 texels, with its depth origin snapped
+    the same way, which keeps a cached map valid while the eye walks inside a
+    step, and each window is the split divided by 1 − 64/size wide, so the
+    circle of the split fits however the eye sits in its step. At 1024² that
+    is 3.1, 8.8 and 31 cm a texel.
+  - `render/sun.rs` holds the maps, the three cascades' caches and the planner.
+    The working maps are one three-layer depth array that the shaders sample;
+    the near two cascades draw into a two-layer cache that is copied, layer by
+    layer, over their working layers each frame, and the moving actors draw
+    over the copy. The far cascade draws straight into its working layer.
+    Every copy is a whole layer, which DirectX 12 allows for depth.
+  - A rebuilt chunk marks the texels its changed triangles reach in each
+    cascade, and the planner turns them into at most four scissor rectangles
+    (one around everything past four). A cascade whose window moved, or that
+    256 changes reached, redraws whole. An edit clears its rectangles by
+    drawing a far-depth triangle and redraws what overlaps them.
+  - `render/changes.rs` finds where a chunk's mesh changed. See the choice
+    below.
+  - Objects: the sun diffs the object list each frame (`ObjectDigest`, shared
+    with the atlas) and marks 10 m around each object that appeared, moved or
+    went. `Renderer::objects` no longer invalidates anything by itself.
+  - `common.wgsl` has `sun_visibility`, which samples one cascade with the
+    3 × 3 filter and a receiver-plane depth gradient as before, offsets the
+    receiver along its normal by 0.13 texels of that cascade (4 mm at least),
+    and blends front to back across each cascade's outer tenth. `world.wgsl`
+    no longer computes a light position in the vertex stage, and the single sun
+    pipeline and its `vs_shadow` are gone.
+  - `render/settings.rs`: `Quality` (Auto, Low, Medium, High, Ultra, Custom),
+    `QualityLevel`, `ShadowDetail` and `RenderSettings::resolved`. Saved
+    settings gained `quality` and `shadows`; a file without `quality` loads as
+    Auto when it has the old default scale and anti-aliasing, and as Custom
+    otherwise, so nobody's saved choice is overridden.
+  - `render/quality.rs` is Auto's arithmetic, without a GPU.
+    `render/timing.rs` also reports the span of a frame's timed passes. The
+    Settings menu has Quality, Anti-aliasing, Shadow detail and Render scale;
+    choosing a level fills the three, and changing one by hand shows Custom.
+    F3's render line shows the sun's size and the quality.
+  - `render/lightset.rs`: `set_max_tile_class`, so a level's shadow detail
+    bounds the atlas's largest tile. `capture.rs`: `block_edit` poses,
+    `--display-hz`, the report's `auto_level_changes`, `sun_cascade_bytes`
+    and the chunk fingerprint figures.
+- **Choices where the order was open.**
+  - **Cascades centred on the eye, not fitted to the view's slice.** A fitted
+    window moves when the eye turns, which the test requires it not to, and the
+    research's 3, 8 and 29 cm a texel come out of the eye-centred circles.
+  - **Changed regions come from a fingerprint, not from chunk bounds.** The
+    order asked for the old and new bounds of each rebuilt chunk, and the first
+    version did that. It made the tower edit slower, 4.0 ms to 6.0 ms: a
+    chunk of the_cube1m is about 250 KB of vertices (2392 chunk meshes), so
+    every chunk a rectangle touches is drawn whole in all three cascades, and
+    the rectangle of an 8 m chunk touches a column of them. Now each rebuilt
+    chunk is fingerprinted from its triangles' positions on a 4 × 4 × 4 grid
+    of 2 m cells, 512 bytes, and only the cells whose sum changed count. It
+    reads the vertices the mesher produced, so octree O1a and its new mesh keys
+    don't touch it, and a triangle that reaches outside its chunk's cube is
+    tracked separately. Fingerprints take 1.2 MiB for the_cube1m and 23 ms of
+    its 1.8 s load.
+  - **Shadow detail changes only the largest atlas tile** (128², 256² or 512²).
+    The atlas gives every light that fits at the smallest size a tile before
+    any light gets a larger one, so the number of shadowed lights doesn't depend
+    on it; a test in `render/lightset.rs` checks that with 240 lights,
+    including a change at run time.
+  - **Levels.** Auto starts at High, which is about what the default was.
+    Low is the only level below full scale; the others differ in anti-aliasing
+    and shadow detail. The levels were not tuned beyond the measurements below.
+  - **Actors cast into the near two cascades only** (to 42 m), as the order
+    says.
+  - **Auto needs a known refresh rate.** With no window, or a monitor that
+    reports none, it stays put, so captures stay at High unless `--display-hz`
+    is given. It reads the window's monitor every 240 frames.
+- **Sun passes for a one-block edit** (3840×2160, GPU time of the sun's static
+  passes in the frame after the edit, median of six edits and six undos; the
+  edit toggles a cell of a copy of the_cube1m; three alternating rounds of
+  before and after, load average 3.8 to 8.3):
+
+  | Edit | Before | After | Maps rendered in the frame |
+  | --- | ---: | ---: | --- |
+  | beside the spawn, cell 96, 14, 32 | 3.04–3.07 ms | 0.18–0.19 ms | 1 → 3 |
+  | in the tower, cell −25, 59, 30 | 3.46–4.30 ms | 0.92–0.96 ms | 7 → 9 |
+
+  "Before" is main at 1564597 with the same capture harness. The after frames
+  render three cascade rectangles rather than one window; the GPU test
+  `gpu_sun_cascades_match_fresh_renders_after_edits_moves_and_level_changes`
+  counts 16,124 texels redrawn of 3,145,728 for one block in the materials
+  scene. The M3 Pro's 7–9 ms for the old pass isn't comparable.
+- **Cascade memory** (one three-layer working array and a two-layer cache of
+  32-bit depth, `sun_cascade_bytes`): 5 MiB at 512², 20 MiB at 1024², 80 MiB at
+  2048². The single window it replaces held 32 MiB (2048², map and cache), so
+  High is 12 MiB lighter and Ultra 48 MiB heavier. The 132 MiB of fixed memory
+  in the N1 results becomes 120 MiB at High (the sun's 32 MiB becomes 20),
+  105 MiB at Low and 180 MiB at Ultra.
+- **Levels and 4K throughput** (3840×2160, release, `--throughput 120 --runs
+  5`, `--frames 1 --warmup 10`; milliseconds a frame, median over three
+  alternating rounds with the range of the rounds' medians; load average 2.7
+  to 3.8 at the start of each invocation). Budget 6.06 ms at 165 Hz. "Main" is
+  1564597 at its defaults, which at 4K are 2× MSAA, scale 1 and one 2048²
+  sun window.
+
+  | Level | Scale, AA, sun, tile | arena-yard | imported-spawn | imported-overlook | lightroom-center |
+  | --- | --- | ---: | ---: | ---: | ---: |
+  | Main | 100%, 2×, 2048² | 2.39 (2.38–2.43) | 5.77 (5.61–5.88) | 8.75 (8.45–8.77) | 9.05 (8.72–9.22) |
+  | Low | 75%, Off, 512², 128² | 1.49 (1.43–1.52) | 4.42 (4.20–4.49) | 5.79 (5.57–5.80) | 5.39 (5.16–5.48) |
+  | Medium | 100%, 2×, 1024², 256² | 2.45 (2.42–2.51) | 5.40 (5.19–5.53) | 8.49 (8.17–8.60) | 9.29 (9.26–9.47) |
+  | High | 100%, 4×, 1024², 512² | 2.60 (2.59–2.63) | 5.58 (5.57–5.59) | 8.93 (8.86–8.93) | 9.50 (9.19–9.51) |
+  | Ultra | 100%, 8×, 2048², 512² | 2.75 (2.71–2.83) | 6.14 (5.93–6.19) | 9.72 (9.59–9.77) | 9.75 (9.49–9.79) |
+
+  Differences under about 0.2 ms are noise on this machine. At 4K every level
+  fits 6.06 ms on arena-yard. imported-spawn fits at every level but Ultra
+  (6.14 ms), though Medium and High are over the 5.45 ms (90%) at which Auto
+  steps down. imported-overlook and lightroom-center miss at Medium, High and
+  Ultra and fit only at Low (5.79 and 5.39 ms). On Metal the levels cost
+  mostly pixels (Low's 0.56×) and shadow detail, not anti-aliasing.
+- **Lowest level, for a tester to compare** (Low; milliseconds a frame, median
+  over three rounds, release, `--throughput 120 --runs 5`; High beside it;
+  load average 2.2 to 3.2). Low draws at 75% of the window, which is 1440×810
+  and 960×600 here.
+
+  | Scene | 1920×1080 Low | 1920×1080 High | 1280×800 Low | 1280×800 High |
+  | --- | ---: | ---: | ---: | ---: |
+  | arena-yard | 0.47 | 0.76 | 0.33 | 0.48 |
+  | imported-spawn | 3.36 | 3.83 | 3.25 | 3.56 |
+  | imported-overlook | 3.29 | 4.22 | 2.91 | 3.40 |
+  | lightroom-center | 1.53 | 2.70 | 0.99 | 1.49 |
+  | corridor-view | 1.01 | 1.41 | 0.64 | 0.98 |
+  | waterglass-view | 0.95 | 1.42 | 0.65 | 1.03 |
+  | lamphall-actor | 1.06 | 1.34 | 0.52 | 0.98 |
+
+  The imported poses barely drop with the window: the_cube1m is limited by
+  geometry (vertex work), not pixels, and the M5 Pro is far faster than the
+  minimum specification. These are an M5 Pro's numbers, not a prediction for a
+  Steam Deck.
+- **Same lights at every level** (1920×1080, capture report): imported-spawn
+  draws and shadows 149 of 339 (333 in view, 107 over the atlas's budget, 8
+  shadow actors); lightroom-center and lightroom-actors-16 draw and shadow 44
+  of 64 in view; at Low, Medium, High and Ultra alike.
+- **Auto along the imported-flight path** (capture tool, `--display-hz`, GPU
+  time per frame from timestamps, serial frames, levels listed as the one at
+  the start of the measured frames, then each change with its frame):
+
+  | Display and size | imported-flight (788 frames) |
+  | --- | --- |
+  | 165 Hz, 3840×2160 | Medium, then Low at frame 25 and no more |
+  | 165 Hz, 1920×1080 | Medium, no change |
+  | 60 Hz, 3840×2160 | High, then Ultra at frame 251 |
+
+  Auto starts each pose at High, so at 4K and 165 Hz it had already left High
+  during the settling frames before the walk began. A longer path from the same
+  world, overlook for 900 frames, then a view of the sky for 900, then the
+  overlook again (2,700 frames), at 165 Hz and 4K: Medium, Low at 36, Medium at
+  1282, High at 1696, Medium at 1830 and Low at 1924. That is a step down while
+  the view is heavy, one level up about 380 frames after the view cleared
+  (the window it needs is 360 frames), another about 410 frames later, and two
+  steps down within 125 frames of the heavy view returning, with no change in
+  between. At 1080p and 165 Hz the same path went High, then Ultra at 1222.
+  The frame-interval path (no timestamps) was only unit-tested.
+- **Redraws while walking** (imported-flight at 4K, High, 788 frames, GPU time
+  of each cascade's pass in the frames it ran): cascade 1 in 110 frames (0.38
+  ms median, 2.2 ms at most), cascade 2 in 38 frames (2.3 ms, 3.9 ms at most),
+  cascade 3 in 11 frames (3.5 ms, 5.1 ms at most). The single window redrew
+  every 6 m for 3 to 4 ms where the edit table measured it. All three
+  cascades can redraw in one frame.
+- **Checks run** from the worktree `renderer-sun-quality`, after
+  `. ./scripts/env.sh`:
+  - `cargo fmt --all`;
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+  - `cargo test --workspace --locked` (205 client tests pass, 8 ignored);
+  - `cargo test -p sauerteig-client --lib gpu_ --locked -- --ignored
+    --test-threads=1` (8 pass on the M5 Pro, including
+    `gpu_sun_cascades_match_fresh_renders_after_edits_moves_and_level_changes`
+    and `gpu_actors_shadow_the_near_cascades_and_nothing_stays_behind`);
+  - the captures above with `target/release/capture` and `block_edit` poses.
+  - New unit tests, in `lighting.rs`:
+    `every_cascade_holds_the_ball_around_the_eye_that_it_promises`,
+    `cascade_windows_move_in_whole_steps_and_ignore_where_the_eye_looks` and
+    `the_far_cascade_holds_the_whole_world_with_positive_depth_and_padding`;
+    the planner's in `render/sun.rs`; the fingerprint's in `render/changes.rs`;
+    Auto's in `render/quality.rs` (steady, down, up, a spike, convergence from
+    every start, failed tries thinning out, frame intervals); the settings
+    tests for old files and levels; and in `render/lightset.rs`
+    `the_largest_shadow_tile_never_changes_which_lights_are_lit_or_shadowed`.
+- **Not observed:**
+  - the Settings menu, F3, a level change or Auto in a running window, and the
+    monitor's refresh rate as winit reports it;
+  - flying across the_cube1m for shimmering, and any cascade boundary placed on
+    purpose in a still;
+  - Auto's frame-interval path on real hardware, and any adapter other than the
+    M5 Pro;
+  - the cascade memory against Metal's own allocation;
+  - the lowest level on a reference machine.
+- **Gaps.**
+  - **Shadows 42 to 96 m away are coarser than before** at High and below:
+    31 cm a texel at 1024² against the old window's 9.4 cm (16 cm at Ultra).
+    The old window had finer texels at that range and coarser near the eye.
+  - **A cascade whose window steps redraws whole**, and the far one costs 3 to
+    5 ms when it does (see above). Spreading that over frames, or scrolling the
+    cache, would flatten the spike; depth copies must be whole subresources.
+  - Actors cast no sun shadow past 42 m, and the sun is unshadowed past 150 m
+    (the far plane is 180 m).
+  - Low at 4K takes 5.79 ms on imported-overlook, under 6.06 ms but over the
+    5.45 ms at which Auto steps down. Low is the lowest level, so Auto stays.
+- **Record at the end:** the tester's results, or that none were available:
+  none were.
 
 ### N2: every light shadowed
 

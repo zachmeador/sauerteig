@@ -35,6 +35,9 @@ pub(super) struct GpuTiming {
     /// Time from the first shadow page pass starting to the last ending, in the
     /// same frame as `latest`. Passes can overlap, so this is not their sum.
     pub latest_shadow_span: Option<f64>,
+    /// Time from the first timed pass of the frame starting to the last ending:
+    /// what the GPU took for the frame, as far as the passes show.
+    pub latest_span: Option<f64>,
 }
 impl GpuTiming {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
@@ -76,6 +79,7 @@ impl GpuTiming {
             latest_serial: 0,
             latest: BTreeMap::new(),
             latest_shadow_span: None,
+            latest_span: None,
         }
     }
     pub fn supported(&self) -> bool {
@@ -118,7 +122,14 @@ impl GpuTiming {
                     let values: &[u64] = bytemuck::cast_slice(&data);
                     let mut sample = BTreeMap::new();
                     let mut span: Option<(u64, u64)> = None;
+                    let mut whole: Option<(u64, u64)> = None;
                     for (i, label) in slot.labels.iter().enumerate() {
+                        if values[i * 2] <= values[i * 2 + 1] {
+                            let (start, end) = (values[i * 2], values[i * 2 + 1]);
+                            whole = Some(
+                                whole.map_or((start, end), |(s, e)| (s.min(start), e.max(end))),
+                            );
+                        }
                         if label.starts_with("shadow page") && values[i * 2] <= values[i * 2 + 1] {
                             let (start, end) = (values[i * 2], values[i * 2 + 1]);
                             span = Some(
@@ -138,6 +149,8 @@ impl GpuTiming {
                         self.latest = sample;
                         self.latest_serial = slot.serial;
                         self.latest_shadow_span = span
+                            .map(|(start, end)| (end - start) as f64 * self.period / 1_000_000.0);
+                        self.latest_span = whole
                             .map(|(start, end)| (end - start) as f64 * self.period / 1_000_000.0);
                     }
                     drop(data);
