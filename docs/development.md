@@ -189,6 +189,20 @@ transparent regions and large visible water surfaces in runtime checks: sorting
 uses face centers and can show ordering artifacts for overlapping views of large
 faces. An underwater eye adds blue-green distance fog and a subtle screen tint.
 
+Every player sees the same distance, whatever the quality level: from the eye to
+the far side of the world's box (`view_distance` in `render.rs`), rounded up to
+64 m and never under 256 m. Until worlds carry their own fog, above water the fog
+only thickens from three quarters of that distance, up to 85% where the world
+ends, so nothing pops at the edge; underwater keeps its exponential fog. The
+scene's depth is reversed (1 at the 6 cm near plane, 0 at the view distance, a
+`GreaterEqual` test and a clear to 0) so a 32-bit float keeps surfaces apart at
+kilometres: the smallest depth step is about 1 m at 1 km and 9 m at 3 km with
+the ordinary mapping, and 0.06 mm and 0.2 mm reversed. Shadow maps keep the
+ordinary depth. The light clusters' last slice ends at the view distance, so
+every light in view is lit however far it is, and props draw out to it. Sun
+shadows are the exception: the cascades reach about 150 m, and the sun is
+unshadowed beyond.
+
 The scene renders in linear HDR, with a filmic exposure/tonemapping pass before
 egui. Settings include quality, bloom (zero disables it), anti-aliasing, render
 scale (50–100%), shadow detail, exposure, and vsync.

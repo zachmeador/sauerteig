@@ -1080,7 +1080,7 @@ mod tests {
         );
         let (gpu, spheres, scale) = renderer.cluster_readback();
         assert!(spheres.len() >= 30, "{} lights", spheres.len());
-        let grid = ClusterGrid::CLUSTERED;
+        let grid = renderer.cluster_grid();
         let lights = |factor: f32| -> Vec<glam::Vec4> {
             spheres
                 .iter()
@@ -1295,7 +1295,7 @@ mod tests {
         let (all, renderer) = lightfield_pixels(RendererOptions::default());
         let (_, spheres, scale) = renderer.cluster_readback();
         // Count what reaches the clusters: some must hold far more than 16.
-        let grid = ClusterGrid::CLUSTERED;
+        let grid = renderer.cluster_grid();
         let lights: Vec<_> = spheres.iter().map(|&s| glam::Vec4::from_array(s)).collect();
         let masks = grid.build_masks(scale, &lights);
         let words = ClusterGrid::mask_words(lights.len());

@@ -32,11 +32,16 @@ pub struct ClusterView {
     pub size: Vec2,
     /// Projection x and y scales.
     pub scale: Vec2,
+    /// How far the last slice reaches, in metres: the camera's view distance.
+    pub far: f32,
 }
 
 impl LightParams {
     pub fn new(config: &LightConfig, view: ClusterView, count: usize, brute_force: bool) -> Self {
-        let grid = config.grid;
+        let grid = ClusterGrid {
+            far: view.far,
+            ..config.grid
+        };
         Self {
             grid: [grid.dims[0], grid.dims[1], grid.dims[2], count as u32],
             depth: [grid.near, grid.split, grid.ratio(), grid.inv_log_ratio()],
@@ -82,6 +87,7 @@ pub(super) struct LightGpu {
     /// View-space spheres and projection scale of the last upload.
     pub last_views: Vec<[f32; 4]>,
     last_scale: Vec2,
+    last_far: f32,
 }
 
 fn make_buffer(
@@ -198,6 +204,7 @@ impl LightGpu {
             count: 0,
             last_views: Vec::new(),
             last_scale: Vec2::ONE,
+            last_far: ClusterGrid::CLUSTERED.far,
         }
     }
 
@@ -336,11 +343,20 @@ impl LightGpu {
         }
         self.last_views = views;
         self.last_scale = view.scale;
+        self.last_far = view.far;
+    }
+
+    /// The grid of the last frame, whose last slice ended at the view distance.
+    pub fn grid(&self) -> ClusterGrid {
+        ClusterGrid {
+            far: self.last_far,
+            ..self.config.grid
+        }
     }
 
     /// How many of the last frame's lights reach each cluster.
     pub fn cluster_counts(&self) -> Vec<u32> {
-        let grid = self.config.grid;
+        let grid = self.grid();
         let spheres: Vec<_> = self
             .last_views
             .iter()

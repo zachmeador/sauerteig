@@ -2,7 +2,7 @@ struct SkyOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2
 @vertex fn vs_main(@builtin(vertex_index) index:u32) -> SkyOutput {
     var positions = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
     var o: SkyOutput;
-    o.position = vec4<f32>(positions[index], 0.99999, 1.0);
+    o.position = vec4<f32>(positions[index], 0.0, 1.0);
     o.uv = positions[index] * 0.5 + vec2<f32>(0.5);
     return o;
 }

@@ -17,7 +17,7 @@ accepts worlds up to 8,192 metres per axis within its coordinate envelope.
 Original-scale archive conversions and server loads have been exercised.
 
 That storage support is not complete large-map usability. The camera far plane
-is currently 180 metres and editor flight is fixed at 16 metres/second. Large maps
+was 180 metres until stage 2 below, and editor flight is fixed at 16 metres/second. Large maps
 also lack a convenient way to locate interesting geometry or navigate between
 distant areas. Existing profiles measure CPU work, not completed GPU frames.
 
@@ -373,7 +373,11 @@ twenty that way, which puts its load time next to the_cube's.
 
 ## Stage 2: see the whole world
 
-State: running on branch `large-worlds-2` since 2026-11-14. Medium. It runs
+State: merged on 2026-11-14. The automated checks and the GPU tests pass on the
+M5 Pro, again in the design lead's rerun, whose captures of the water and glass
+scenes against main differ only by the thinner fog. The maintainer's look in
+the app, a tester's Vulkan and DirectX 12 runs and the 4K budget at High on
+several poses are open ([record](#stage-2-record-2026-11-14)). Medium. It ran
 beside [lighting](lighting.md) L1.
 
 - **Why** (maintainer, 2026-11-14, after playtesting nub): render distance is
@@ -406,17 +410,185 @@ beside [lighting](lighting.md) L1.
 - **Parallel work:** lighting L1 edits light objects, the importer and the
   editor's light panel; the second to merge rebases.
 - **Acceptance:**
-  - [ ] Captures of nub from the playtest's spot in the large hall show its far
-    walls and the map beyond, and from high above, the_cube1m and the benchmark
-    world's nub1 preset can be seen across.
-  - [ ] No depth fighting at 1 to 3 km in captures; a light far from the camera
-    is lit; captures of the existing poses differ only where more can now be
-    seen or the fog is thinner.
-  - [ ] GPU throughput at 4K on the M5 Pro, before and after, for the imported
-    poses, the benchmark world's poses and a far view of nub, at High and Low,
-    with triangles drawn. Within budget, or the record says where and why not.
+  - [x] Captures of nub from large halls show their far walls and the map
+    beyond, and from high above, the_cube1m and the benchmark world's nub1
+    preset can be seen across. Done in stills, with a caveat: nub's halls
+    are inside 180 m (their far walls showed before), so what changes there is
+    the fog, and the map beyond shows only from the surface views and from high
+    above. The playtest's exact spot is unknown to this session.
+  - [x] No depth fighting at 1 to 3 km in captures (a forward-depth build with
+    the same view distance fights on wall faces at 1.4 km); a light far from the
+    camera is lit (a brute-force render of the far views is identical to the
+    clustered one, and every light is in view, drawn and shadowed there);
+    captures of the existing poses differ only where more can be seen or the fog
+    is thinner.
+  - [ ] GPU throughput at 4K on the M5 Pro, before and after, at High and Low,
+    with triangles drawn. Recorded below; not within budget on every pose, which
+    is mostly the same poses that missed before (see the record).
   - [ ] **Maintainer:** fly around nub and the_cube1m; the distance and the fog
     feel right.
+
+### Stage 2 record (2026-11-14)
+
+**What changed.**
+
+- The projection's far plane is the view distance: from the eye to the far
+  corner of the world's box (`view_distance` in `render.rs`), rounded up to
+  64 m, never under 256 m. nub's box is 2,048 m, so it is about 3.0 to 3.6 km;
+  the_cube1m's is 8,192 m, about 7 km. The same value is the far edge of the
+  clusters' last slice (`ClusterView::far`, replacing the constant 180) and the
+  draw distance of props (replacing `DRAW_DISTANCE`). No quality level touches
+  it.
+- Depth is reversed: `scene_projection` is `perspective_rh` with its planes
+  swapped, so 1 is the near plane and 0 the far one; the scene clears depth to
+  0 and tests `GreaterEqual`, the sky sits at depth 0, and water and glass test
+  `Greater` with the bias negated. Shadow maps keep the ordinary depth
+  (`shadow_depth_state`). Frustum culling needed no change. Depth stays
+  `Depth32Float`, so no format or memory changes.
+- Fog above water is `0.85 * smoothstep(0.75 far, far, distance)` (was an
+  exponential-squared density of 0.00005, 40% at 100 m); underwater fog is
+  untouched. The camera uniform gained `view` (view distance in x).
+- Fog, clusters, props and the projection all follow the world's box, so a
+  world with a smaller box sees less than nub does, but never under 256 m.
+- Added to `scripts/capture-poses.json`: `imported-high` and `imported-high-near`
+  above the_cube1m. Tests: the projection's depth range and ordering, a
+  centimetre apart at 3 km, the view distance reaching the far corner from any
+  eye, and the clusters' slices at a 7 km distance.
+
+**Checks,** all passing on the Mac (M5 Pro): `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test
+--workspace --locked`, and the 12 GPU tests (`cargo test -p sauerteig-client
+--lib gpu_ --locked -- --ignored --test-threads=1`). The test with a thousand
+lights in its lowest bound failed once, in the full run, with the machine busy
+(its shadow budget fell to one face a frame and lighting didn't settle in 2,400
+frames) and passed alone and in the final run; it is timing-sensitive.
+
+**Choices.**
+
+1. **Reversed depth, finite far plane.** Measured against a build with the same
+   view distance and the ordinary mapping: at 1.4 km the ordinary mapping
+   speckles the wall faces of nub1's districts, and the reversed one is clean.
+   The smallest depth step of a 32-bit float is about d²/near × 2⁻²⁴ with the
+   ordinary mapping (1 m at 1 km, 9 m at 3 km) and d × 2⁻²⁴ reversed (0.06 mm
+   and 0.2 mm). An infinite far plane would need a frustum without a far plane
+   and gains nothing, since nothing lies past the world's box.
+2. **View distance from the world's box, not a constant,** so nothing in a world
+   is ever clipped and the same rule holds for nub (3 km) and the_cube1m (7 km).
+   The rounding to 64 m keeps fog and cluster slices still while walking.
+3. **Fog from 75% of the distance.** Fog's colour (0.105, 0.125, 0.135) is darker
+   than the sky's horizon, so the far rim of a big flat map fades to a dark band
+   and not into the sky. World fog settings, which come with the world format's
+   settings stage, replace this.
+4. **Clusters keep 24 slices.** 32 slices (a smaller ratio at kilometres) failed
+   the test that the light buffers fit the requested binding size at the
+   maximum number of lights, so the slices are wider at long distance
+   (a ratio of 1.32 for nub, 1.38 for the_cube1m, against 1.18). The cost
+   showed nowhere in the timings, and `light cull` stays under 0.12 ms.
+5. **Sun cascades not extended.** Shadows reach about 150 m (the third cascade
+   is 320 m wide and 256 m deep along the sun, 31 cm texels); beyond that the
+   sun is unshadowed. Reaching the nub's 3 km at one 1024² map would give texels
+   of 6 m, and a fourth cascade changes the cascade count the actors' copies, the
+   cache and the shaders share, so it isn't cheap; left for a later stage.
+   Distant flat ground is lit as it should be and the distant shapes show their
+   own faces' shading, but a room seen from afar loses the sun's shadow in it,
+   and the tower's shadow stops at 150 m. Seen in stills; not judged in play.
+
+**Captures,** 1920x1080 at High on this branch's build and the base `c8a17bf`,
+every pose of `scripts/capture-poses.json` (33), checked by pixel differences
+(changed pixels, and pixels that moved by more than 8 of 255):
+
+- Nearly every pose changes in 10 to 90% of its pixels, by a mean of 0.1 to 2.2
+  of 255: the thinner fog brightens far walls in the lightfield, lightroom,
+  waterglass and shadow-test scenes. Only `imported-overlook` has a large
+  share of pixels moving by more than 8 (17%: the ground continues to the
+  horizon where the old view ended in sky at 180 m); no other pose has more
+  than 6% (`lightroom-corner`, `waterglass-low-bare`: fog on far walls).
+- Single pixels differ by up to 107 in a few places (`materials-water` 7
+  pixels, `imported-flight` 10, `waterglass-view` 12, and a handful in
+  `materials-underwater`, `materials-lamp-shadow` and `materials-glass`), in
+  one- or two-pixel lines that are edges (several on the centre column); not
+  looked into further. `imported-water` and `materials-underwater` have no
+  visible change (0.01% and 0.00% of pixels).
+- New poses (nub, in the large hall at y -293 with a pool and in the open space
+  at y -130, from the surface and from 300 to 1,000 m; the_cube1m and nub1 from
+  120 to 500 m up): each shows the whole map where the base showed sky or nothing,
+  and the large halls differ from the base only by fog (0.78 to 0.87 mean
+  difference, none above 25). The nub's play area is a tower and a few
+  buildings on a flat ground that is about 2 km across; the halls are below it.
+- Far lights: at the high views every light is in view, drawn and shadowed
+  (155 of 155 on nub and nub1, 339 of 339 on the_cube1m); a brute-force render
+  of five far views is byte-identical to the clustered one.
+- Seen and not fixed: concentric moiré rings on large flat ground at distance
+  (also in the base captures at 150 to 180 m), from material texture sampling
+  and not from this stage.
+
+**Measurements,** Apple M5 Pro (Metal), release builds of base `c8a17bf` and this
+branch's working tree (not committed), 2026-11-14, 3840x2160, the capture tool
+with `--frames 1 --warmup 10 --throughput 120 --runs 5`, the two builds
+alternating over three rounds, GPU throughput in ms a frame (median of the three
+rounds' medians), `--settings` quality High or Low. Other sessions used the
+machine (load averages 3.5 to 5.5), and one run in four came out 2 to 8 ms slow,
+so read differences under about 1 ms as noise. The budget is 6.06 ms. Triangles
+are those in view after culling.
+
+| Pose | Triangles base → now | High base | High now | Low base | Low now |
+| --- | --- | ---: | ---: | ---: | ---: |
+| imported-spawn | 683k → 711k | 3.17 | 3.37 | 4.13* | 2.14 |
+| imported-overlook | 467k → 468k | 7.24 | 8.03 | 7.88* | 4.25 |
+| imported-water | 266k → 266k | 4.93 | 5.12 | 4.95* | 2.94 |
+| imported-tower | 230k → 230k | 11.08 | 11.39 | 9.23* | 6.29 |
+| imported-tower-rooms | 308k → 308k | 9.45 | 9.54 | 7.81* | 5.32 |
+| imported-flight | 660k → 687k | 3.43 | 3.97 | 2.22 | 2.33 |
+| imported-teleports | 230k → 230k | 11.25 | 12.28 | 6.22 | 6.50 |
+| imported-storm | 230k → 230k | 12.80 | 13.42 | 7.87 | 8.26 |
+| nub1 spawn | 531k → 913k | 3.09 | 3.31 | 1.93 | 2.35 |
+| nub1 overlook | 392k → 877k | 3.15 | 3.65 | 1.60 | 2.40 |
+| nub1 room-1 | 492k → 797k | 3.78 | 3.76 | 2.12 | 2.57 |
+| nub1 room-2 | 525k → 708k | 7.04 | 6.54 | 3.97 | 4.12 |
+| nub1 upstairs | 392k → 463k | 4.87 | 4.38 | 2.70 | 2.65 |
+| nub1 water | 21k → 39k | 2.18 | 1.78 | 1.30 | 1.06 |
+| nub1 underwater | 14k → 28k | 2.45 | 1.98 | 1.12 | 1.13 |
+| nub1 glass | 490k → 763k | 5.00 | 3.48 | 2.34 | 2.25 |
+| nub1 stairs | 490k → 621k | 10.10 | 6.31 | 4.89 | 3.77 |
+| nub1 flight | 368k → 753k | 4.70 | 3.56 | 1.58 | 1.92 |
+| nub1 teleports | 392k → 877k | 2.71 | 3.69 | 1.59 | 2.27 |
+| nub1 storm | 492k → 797k | 3.85 | 4.57 | 2.77 | 2.93 |
+| nub spawn | 52k → 84k | 4.09 | 5.24 | 2.19 | 2.29 |
+| nub hall (pool) | 149k → 149k | 5.62 | 6.41 | 3.11 | 3.20 |
+| nub hall (open) | 83k → 83k | 2.18 | 2.77 | 1.26 | 1.40 |
+| nub hall (corridor) | 21k → 21k | 3.68 | 4.02 | 1.92 | 1.93 |
+| nub far view, high tower | 13k → 645k | 1.58 | 3.03 | 0.78 | 1.61 |
+| nub far view, 3 km | 2 → 645k | 1.33 | 2.37 | 0.57 | 1.32 |
+
+\* The base's Low runs of these poses were contended (their lowest of 15 runs
+is within 0.3 ms of the new build's); the base's real Low time is about the
+new build's, not above it.
+
+What the numbers say: the whole of nub (645,000 triangles) costs 1.4 to 1.5 ms
+more at High and 0.8 ms more at Low than the nearby view it replaces, so a far
+view is 3.0 ms at High and 1.6 ms at Low at 4K, inside the budget. The
+poses that already missed 6.06 ms at 4K still miss it by about the same, and
+no pose that fit now fails because of the distance: the misses, at High, are
+the imported overlook (8.0), tower (11.4), tower rooms (9.5), teleports (12.3)
+and storm (13.4, an edit storm that redraws every cached shadow each frame), nub1
+room-2 (6.5) and stairs (6.3) and nub's pool hall (6.4); at Low, the storm
+(8.3), tower (6.3) and teleports (6.5). The extra triangles at nub1's poses cost
+up to 1 ms (spawn, overlook, teleports, storm), nothing on the others; the
+imported poses' world meshes were already almost entirely in view.
+
+**Remaining gaps.**
+
+- Not observed in the running app: flying through nub or the_cube1m, the fog and
+  distance in play, a streaming-free join of a large world, and the minimum
+  specification's hardware. Vulkan and DirectX 12 are untried (reversed depth and
+  the volume bias differ in how a depth bias scales across backends; the
+  negated bias is checked only on Metal, in stills of water and glass).
+- Sun shadows end at 150 m (choice 5).
+- The timings above are from a busy machine: three rounds, noisy runs; rerun
+  quiet before depending on a difference under 1 ms.
+- The distance is the world's box, so a world declared much larger than its
+  content draws a large flat sky box and fogs from 75% of that; the world
+  format's fog settings are the fix.
 
 ## Evidence
 

@@ -14,6 +14,8 @@ pub struct ClusterGrid {
 }
 
 impl ClusterGrid {
+    /// The grid's shape; `far` is the default, and the renderer sets it each
+    /// frame to the view distance.
     pub const CLUSTERED: Self = Self {
         dims: [16, 9, 24],
         near: 0.06,
@@ -129,7 +131,13 @@ mod tests {
 
     #[test]
     fn slices_tile_the_depth_range_without_gaps() {
-        for grid in [ClusterGrid::CLUSTERED] {
+        for grid in [
+            ClusterGrid::CLUSTERED,
+            ClusterGrid {
+                far: 7_232.0,
+                ..ClusterGrid::CLUSTERED
+            },
+        ] {
             let mut previous = grid.near;
             for slice in 0..grid.dims[2] {
                 let (near, far) = grid.slice_depths(slice);

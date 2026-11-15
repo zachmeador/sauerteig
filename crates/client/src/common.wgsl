@@ -13,7 +13,10 @@ struct Camera {
     cascade_texel: vec4<f32>,
     eye_time: vec4<f32>,
     sun: vec4<f32>,
+    // Fog colour, and the density of underwater's exponential fog (zero above water).
     fog: vec4<f32>,
+    // How far the camera sees, in x.
+    view: vec4<f32>,
 };
 // One light: position and range; color times intensity times fade, and the
 // spot cone's scale; spot direction and cone offset; and flags (bit 0 spot,
@@ -115,7 +118,13 @@ struct LightSum {
 
 fn fog_factor(position: vec3<f32>) -> f32 {
     let distance = length(camera.eye_time.xyz - position);
-    return clamp(1.0 - exp(-distance * distance * camera.fog.w), 0.0, 0.85);
+    if (camera.fog.w > 0.0) {
+        return clamp(1.0 - exp(-distance * distance * camera.fog.w), 0.0, 0.85);
+    }
+    // In the air the fog only thickens near the view distance, where the world
+    // ends, so that nothing pops at the edge.
+    let far = camera.view.x;
+    return 0.85 * smoothstep(far * 0.75, far, distance);
 }
 fn apply_fog(color: vec3<f32>, position: vec3<f32>) -> vec3<f32> {
     return mix(color, camera.fog.rgb, fog_factor(position));

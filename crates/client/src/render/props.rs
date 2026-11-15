@@ -13,7 +13,6 @@ use glam::Vec3;
 use sauerteig_core::{ObjectKind, WorldObject};
 
 const MAX_INSTANCES_PER_KIND: usize = 1024;
-const DRAW_DISTANCE: f32 = 180.0;
 // Translation in xyz, followed by rotation around the y axis.
 type Transform = [f32; 4];
 
@@ -133,6 +132,7 @@ impl PropRenderer {
         queue: &wgpu::Queue,
         objects: &[WorldObject],
         eye: Vec3,
+        draw_distance: f32,
         sun_frustums: &[Frustum; CASCADES],
         tiles: &[TileView],
     ) {
@@ -145,7 +145,7 @@ impl PropRenderer {
                 .take(MAX_INSTANCES_PER_KIND)
             {
                 let distance = eye.distance_squared(object.position);
-                if distance > DRAW_DISTANCE * DRAW_DISTANCE {
+                if distance > draw_distance * draw_distance {
                     continue;
                 }
                 let lod = if distance < batch.lod_distance.powi(2) {

@@ -334,7 +334,7 @@ impl SunShadows {
                     slope_scale: 0.0,
                     clamp: 0.0,
                 },
-                ..super::depth_state()
+                ..super::shadow_depth_state()
             },
         );
         let clear_pipeline = depth_pipeline(
@@ -344,7 +344,7 @@ impl SunShadows {
             &[],
             wgpu::DepthStencilState {
                 depth_compare: wgpu::CompareFunction::Always,
-                ..super::depth_state()
+                ..super::shadow_depth_state()
             },
         );
         Self {

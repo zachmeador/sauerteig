@@ -193,14 +193,15 @@ impl VolumeRenderer {
                 "vs_main",
                 "fs_main",
                 &[VolumeVertex::layout()],
-                wgpu::CompareFunction::Less,
+                wgpu::CompareFunction::Greater,
                 // Imported material boxes can share a plane with differently
-                // tessellated terrain. Strict Less alone leaves interpolation
-                // rounding streaks; a small positive bias lets opaque terrain
-                // consistently win, including at grazing angles.
+                // tessellated terrain. Strict Greater alone leaves interpolation
+                // rounding streaks; a small bias away from the eye (depth is
+                // reversed, so negative) lets opaque terrain consistently win,
+                // including at grazing angles.
                 wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 1.0,
+                    constant: -2,
+                    slope_scale: -1.0,
                     clamp: 0.0,
                 },
                 // Highlights are added after the surface is weighted by its

@@ -41,7 +41,9 @@ use winit::window::Window;
 
 const FOV_Y: f32 = 78.0 * std::f32::consts::PI / 180.0;
 const NEAR_PLANE: f32 = 0.06;
-const FAR_PLANE: f32 = 180.0;
+/// The nearest the view distance goes: a small world still shows sky and fog
+/// out to here.
+const MIN_VIEW_DISTANCE: f32 = 256.0;
 /// GPU time a frame may spend rendering shadow faces, at the measured cost.
 const SHADOW_BUDGET_MS: f64 = 1.5;
 
@@ -94,6 +96,8 @@ pub(crate) struct CameraUniform {
     eye_time: [f32; 4],
     sun: [f32; 4],
     fog: [f32; 4],
+    /// The view distance in x; the rest is spare.
+    view: [f32; 4],
 }
 pub struct GpuMesh {
     vertex: wgpu::Buffer,
@@ -1141,11 +1145,10 @@ impl Renderer {
             world.volume_material_at(eye) == Some(sauerteig_core::VolumeMaterial::Water);
         let two_sided_terrain = culling::camera_intersects_terrain(world, eye);
         let view = Mat4::look_to_rh(eye, direction, Vec3::Y);
-        let proj = Mat4::perspective_rh(
-            FOV_Y,
+        let view_distance = view_distance(world.bounds(), eye);
+        let proj = scene_projection(
             self.config.width as f32 / self.config.height as f32,
-            NEAR_PLANE,
-            FAR_PLANE,
+            view_distance,
         );
         let view_projection = proj * view;
         let camera_frustum = Frustum::new(view_projection);
@@ -1161,8 +1164,9 @@ impl Renderer {
             fog: if underwater {
                 [0.022, 0.105, 0.13, 0.0025]
             } else {
-                [0.105, 0.125, 0.135, 0.00005]
+                [0.105, 0.125, 0.135, 0.0]
             },
+            view: [view_distance, 0.0, 0.0, 0.0],
         };
         self.visible_world_triangles = self
             .chunks
@@ -1217,8 +1221,14 @@ impl Renderer {
                 range: job.range,
             })
             .collect();
-        self.props
-            .prepare(&self.queue, objects, eye, &cascade_frustums, &tile_views);
+        self.props.prepare(
+            &self.queue,
+            objects,
+            eye,
+            view_distance,
+            &cascade_frustums,
+            &tile_views,
+        );
         self.volumes
             .prepare(&self.queue, eye, direction, &camera_frustum);
         self.queue
@@ -1230,6 +1240,7 @@ impl Renderer {
             ClusterView {
                 size: Vec2::new(self.post.size[0] as f32, self.post.size[1] as f32),
                 scale: Vec2::new(proj.x_axis.x, proj.y_axis.y),
+                far: view_distance,
             },
             self.options.brute_force,
         );
@@ -1396,7 +1407,7 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.post.depth,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(0.0),
                         store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
@@ -1498,6 +1509,11 @@ impl Renderer {
 
 #[cfg(test)]
 impl Renderer {
+    /// The cluster grid of the last frame.
+    pub(crate) fn cluster_grid(&self) -> crate::render::clusters::ClusterGrid {
+        self.light_gpu.grid()
+    }
+
     /// The cluster masks the GPU wrote last frame, the light spheres they were
     /// built from, and the projection scales of that frame.
     pub(crate) fn cluster_readback(&self) -> (Vec<u32>, Vec<[f32; 4]>, Vec2) {
@@ -1527,12 +1543,105 @@ impl Renderer {
     }
 }
 
+/// The scene's depth: reversed, so that 1 is the near plane and 0 the far
+/// one, which keeps a 32-bit float's precision even to kilometres.
 fn depth_state() -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        depth_compare: wgpu::CompareFunction::GreaterEqual,
+        ..shadow_depth_state()
+    }
+}
+
+/// Shadow maps keep the ordinary depth, 0 at the near plane.
+fn shadow_depth_state() -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: wgpu::TextureFormat::Depth32Float,
         depth_write_enabled: true,
         depth_compare: wgpu::CompareFunction::LessEqual,
         stencil: Default::default(),
         bias: Default::default(),
+    }
+}
+
+/// How far the camera sees: to the far side of the world's box from the eye,
+/// and never less than `MIN_VIEW_DISTANCE`. Until worlds carry their own fog
+/// nothing in the world is ever past it, so the far plane cuts nothing.
+fn view_distance(bounds: sauerteig_core::WorldBounds, eye: Vec3) -> f32 {
+    let (min, max) = (bounds.world_min(), bounds.world_max());
+    let farthest = Vec3::select((eye - min).abs().cmpgt((eye - max).abs()), min, max);
+    // Rounded up in steps, so the distance, and the fog and clusters that
+    // follow it, don't change with every step the player takes.
+    let distance = ((farthest - eye).length() / 64.0).ceil() * 64.0;
+    distance.max(MIN_VIEW_DISTANCE)
+}
+
+/// The scene's projection. Depth is reversed (1 at the near plane, 0 at
+/// `far`): a float buffer then spends its precision where a perspective
+/// projection has squeezed the depth together, so surfaces stay apart at
+/// kilometres. `Mat4::perspective_rh` with its planes swapped gives that
+/// mapping.
+fn scene_projection(aspect: f32, far: f32) -> Mat4 {
+    Mat4::perspective_rh(FOV_Y, aspect, far, NEAR_PLANE)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use sauerteig_core::WorldBounds;
+
+    fn depth_of(projection: Mat4, distance: f32) -> f32 {
+        let clip = projection * Vec3::new(0.0, 0.0, -distance).extend(1.0);
+        clip.z / clip.w
+    }
+
+    #[test]
+    fn depth_runs_from_one_at_the_near_plane_to_zero_at_the_view_distance() {
+        let projection = scene_projection(16.0 / 9.0, 3_000.0);
+        assert!((depth_of(projection, NEAR_PLANE) - 1.0).abs() < 1.0e-5);
+        assert!(depth_of(projection, 3_000.0).abs() < 1.0e-5);
+        let mut previous = 2.0;
+        for distance in [0.1, 1.0, 10.0, 100.0, 1_000.0, 2_999.0] {
+            let depth = depth_of(projection, distance);
+            assert!(depth < previous && depth > 0.0, "{distance}: {depth}");
+            previous = depth;
+        }
+    }
+
+    #[test]
+    fn surfaces_a_centimetre_apart_stay_apart_at_three_kilometres() {
+        let projection = scene_projection(16.0 / 9.0, 4_000.0);
+        let near = depth_of(projection, 3_000.0);
+        let farther = depth_of(projection, 3_000.01);
+        assert!(near > farther, "{near} {farther}");
+    }
+
+    #[test]
+    fn the_view_distance_reaches_the_far_corner_in_steps() {
+        let bounds = WorldBounds {
+            min: [-1024, -1000, -1024],
+            max: [1024, 1048, 1024],
+        };
+        let corner = Vec3::new(1024.0, 1048.0, 1024.0);
+        let eye = Vec3::new(-1024.0, -1000.0, -1024.0);
+        let distance = view_distance(bounds, eye);
+        assert!(distance >= (corner - eye).length());
+        assert!(distance < (corner - eye).length() + 64.0);
+        assert_eq!(distance % 64.0, 0.0);
+        // Anywhere in the world, the far side is within it.
+        for eye in [Vec3::ZERO, Vec3::new(500.0, 20.0, -300.0), corner] {
+            let farthest = [-1024.0_f32, 1024.0]
+                .iter()
+                .flat_map(|&x| [-1000.0_f32, 1048.0].map(move |y| (x, y)))
+                .flat_map(|(x, y)| [-1024.0_f32, 1024.0].map(move |z| Vec3::new(x, y, z)))
+                .map(|c| c.distance(eye))
+                .fold(0.0, f32::max);
+            assert!(view_distance(bounds, eye) >= farthest, "{eye}");
+        }
+    }
+
+    #[test]
+    fn a_small_world_still_sees_the_minimum() {
+        let bounds = WorldBounds::default();
+        assert_eq!(view_distance(bounds, Vec3::ZERO), MIN_VIEW_DISTANCE);
     }
 }
