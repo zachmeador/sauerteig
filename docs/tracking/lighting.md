@@ -63,9 +63,13 @@ without N2. The numbers are in [renderer](renderer.md) under N2.
 
 ## L1: lights keep their range and colour
 
-State: running on branch `lighting-l1` since 2026-11-14. Medium. It runs before
-[octree](octree.md) O2, which reworks how objects travel in edits, and beside
-[large worlds](large-worlds.md) stage 2.
+State: on branch `lighting-l1`, held (design lead, 2026-11-14). Its light
+objects, editing and import are done and pass every check. Its falloff and
+brightness unit, chosen to imitate Sauerbraten's lightmaps, wait for the
+[lighting architecture](lighting-architecture.md), since imported lights at
+their original ranges made some views three to five times slower at 4K and the
+maintainer asked for lighting designed from first principles. Octree O2 waits
+for it, because both change objects in edits.
 
 - **Why** (maintainer, 2026-11-14, after playtesting nub): light distance is one
   of the two first concerns. A big room in nub that the original lit with one
